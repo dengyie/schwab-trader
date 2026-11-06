@@ -393,7 +393,11 @@ export class OrderBookManager {
       bids,
       asks,
       lastUpdateId: this.state.lastUpdateId,
-      localUpdateTime: this.state.localUpdateTime,
+      // Internal timestamps stay monotonic (performance.now) for staleness math;
+      // the snapshot carries a wall-clock epoch so the UI can render "最后更新".
+      localUpdateTime: this.state.localUpdateTime > 0
+        ? Date.now() - (performance.now() - this.state.localUpdateTime)
+        : 0,
       isStale: this.checkStale(),
       depth: Math.min(bids.length, asks.length),
     };
