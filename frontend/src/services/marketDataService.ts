@@ -1,0 +1,178 @@
+/**
+ * Market Data Service
+ * Professional Terminal Edition - US Equities & FastAPI Backend Integration
+ */
+
+import { handleApiError, logError } from '../utils/errorHandler';
+import { apiFetch } from './apiClient';
+
+export interface MarketTicker {
+  symbol: string;
+  price: number;
+  priceChange: number;
+  priceChangePercent: number;
+  high24h: number;
+  low24h: number;
+  volume24h: number;
+  quoteVolume24h: number;
+  openPrice: number;
+  trades24h: number;
+  lastUpdated: number;
+}
+
+export interface MarketSparkline {
+  symbol: string;
+  prices: number[];
+}
+
+export interface MarketIndicators {
+  symbol: string;
+  rsi14: number | null;
+  momentum: 'bullish' | 'bearish' | 'neutral';
+  volatility: number;
+}
+
+export const POPULAR_SYMBOLS = [
+  'SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA',
+  'AMD', 'AMZN', 'GOOGL', 'META', 'IWM', 'COIN',
+  'PLTR', 'NFLX',
+];
+
+const CATEGORY_MAP: Record<string, string[]> = {
+  'Indices': ['SPY', 'QQQ', 'IWM'],
+  'Mag 7': ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'GOOGL', 'META'],
+  'Semis': ['NVDA', 'AMD'],
+  'Growth': ['PLTR', 'COIN', 'NFLX'],
+};
+
+export const GET_SYMBOLS_BY_CATEGORY = (cat: string) => CATEGORY_MAP[cat] || POPULAR_SYMBOLS;
+
+let tickerCache: Map<string, MarketTicker> = new Map();
+let lastFetchTime = 0;
+const CACHE_TTL = 2000;
+
+export async function fetchAllTickers(): Promise<MarketTicker[]> {
+  const now = Date.now();
+  if (now - lastFetchTime < CACHE_TTL && tickerCache.size > 0) return Array.from(tickerCache.values());
+
+  try {
+    const response = await apiFetch('/market/tickers');
+    if (!response.ok) throw response;
+    const data: MarketTicker[] = await response.json();
+    
+    data.forEach((t) => {
+      tickerCache.set(t.symbol, t);
+    });
+
+    lastFetchTime = now;
+    return data.sort((a, b) => b.volume24h - a.volume24h);
+  } catch (error) {
+    logError(handleApiError(error));
+    return Array.from(tickerCache.values());
+  }
+}
+
+export async function fetchSparkline(symbol: string): Promise<MarketSparkline | null> {
+  try {
+    const response = await apiFetch(`/market/bars?symbol=${encodeURIComponent(symbol)}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return { symbol, prices: data.slice(-24).map((k: any) => parseFloat(k.close)) };
+  } catch {
+    return null;
+  }
+}
+
+export async function calculateIndicators(symbol: string): Promise<MarketIndicators | null> {
+  try {
+    const response = await apiFetch(`/market/model-context?symbol=${encodeURIComponent(symbol)}`);
+    if (response.ok) {
+      const data = await response.json();
+      const tech = data.technical_indicators || {};
+      const aiScore = data.ai_quant_score || {};
+      return {
+        symbol,
+        rsi14: tech.rsi_14 ?? 50,
+        momentum: aiScore.signal === 'BULLISH' ? 'bullish' : aiScore.signal === 'BEARISH' ? 'bearish' : 'neutral',
+        volatility: tech.volatility ?? 1.5,
+      };
+    }
+
+    // Fallback: calculate from bars
+    const barsResp = await apiFetch(`/market/bars?symbol=${encodeURIComponent(symbol)}`);
+    if (!barsResp.ok) return null;
+    const bars = await barsResp.json();
+    const closes = bars.map((k: any) => parseFloat(k.close));
+    const rsi = calculateRSI(closes, 14);
+    let momentum: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+    if (rsi) {
+      if (rsi > 60) momentum = 'bullish';
+      else if (rsi < 40) momentum = 'bearish';
+    }
+
+    return {
+      symbol,
+      rsi14: rsi,
+      momentum,
+      volatility: calculateVolatility(closes),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function calculateRSI(closes: number[], period: number): number | null {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const current = closes[i];
+    const prev = closes[i - 1];
+    if (current !== undefined && prev !== undefined) {
+      const diff = current - prev;
+      if (diff > 0) gains += diff; else losses -= diff;
+    }
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const current = closes[i];
+    const prev = closes[i - 1];
+    if (current !== undefined && prev !== undefined) {
+      const diff = current - prev;
+      avgGain = (avgGain * (period - 1) + (diff > 0 ? diff : 0)) / period;
+      avgLoss = (avgLoss * (period - 1) + (diff < 0 ? -diff : 0)) / period;
+    }
+  }
+  return avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+function calculateVolatility(closes: number[]): number {
+  const returns = [];
+  for (let i = 1; i < closes.length; i++) {
+    const current = closes[i];
+    const prev = closes[i - 1];
+    if (current !== undefined && prev !== undefined && prev !== 0) {
+      returns.push((current - prev) / prev);
+    }
+  }
+  if (returns.length === 0) return 0;
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => Math.pow(b - mean, 2), 0) / returns.length;
+  return Math.sqrt(variance) * 100;
+}
+
+export function formatVolume(v: number): string {
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(2) + 'K';
+  return v.toFixed(2);
+}
+
+export function formatPrice(p: number): string {
+  if (p >= 1000) return p.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (p >= 1) return p.toFixed(2);
+  return p.toFixed(4);
+}
+
+export function parseSymbol(s: string) {
+  return { base: s, quote: 'USD' };
+}
