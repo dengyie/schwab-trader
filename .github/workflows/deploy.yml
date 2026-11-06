@@ -1,0 +1,189 @@
+name: CI & Deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schwab-trader-production
+  cancel-in-progress: false
+
+jobs:
+  backend-tests:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: backend
+      - name: Run pytest
+        run: python -m pytest -q
+        working-directory: backend
+        env:
+          MARKET_DATA_PROVIDER: simulation
+          BROKER_PROVIDER: virtual
+
+  frontend-tests:
+    name: Frontend tests & build (vitest + tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run vitest
+        run: npm test
+      - name: Type-check & production build
+        run: npm run build
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 3
+
+  deploy:
+    name: Deploy to production VPS
+    needs: [backend-tests, frontend-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://trader.mangoqwq.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<CFG
+          Host deploy-target
+            HostName $SSH_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          CFG
+          chmod 600 ~/.ssh/config
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_HOST: ${{ secrets.VPS_HOST }}
+          SSH_USER: ${{ secrets.VPS_USER }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+
+      - name: Upload release to staging
+        run: |
+          stage="/opt/schwab-trader/.staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh -F "$HOME/.ssh/config" deploy-target "rm -rf '$stage' && mkdir -p '$stage/backend' '$stage/dist'"
+          rsync -az --delete -e "ssh -F $HOME/.ssh/config" \
+            --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
+            backend/ "deploy-target:$stage/backend/"
+          rsync -az --delete -e "ssh -F $HOME/.ssh/config" dist/ "deploy-target:$stage/dist/"
+
+      - name: Activate release (atomic swap, health gate, rollback)
+        run: |
+          ssh -F "$HOME/.ssh/config" deploy-target sh -s -- "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" <<'REMOTE'
+          set -eu
+          root=/opt/schwab-trader
+          stage="$root/.staging-$1-$2"
+          backup="$root/.backup-$(date +%Y%m%d-%H%M%S)"
+          live_backend="$root/backend"
+          live_dist="$root/frontend/dist"
+
+          test -d "$stage/backend" && test -d "$stage/dist"
+          mkdir -p "$backup"
+          rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
+            "$live_backend/" "$backup/backend/"
+          [ -d "$live_dist" ] && rsync -a "$live_dist/" "$backup/dist/" || true
+
+          rollback() {
+            rc=$?
+            trap - EXIT
+            if [ "$rc" -ne 0 ]; then
+              echo "Deploy failed (exit $rc); restoring $backup" >&2
+              rsync -a --delete --exclude '.venv' "$backup/backend/" "$live_backend/"
+              if [ -d "$backup/dist" ]; then
+                rsync -a --delete "$backup/dist/" "$live_dist/"
+              fi
+              sudo -n /usr/bin/systemctl restart schwab-trader.service || true
+              echo "Rollback finished; verify manually." >&2
+            fi
+            rm -rf "$stage"
+            exit "$rc"
+          }
+          trap rollback EXIT
+
+          rsync -a --delete --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
+            "$stage/backend/" "$live_backend/"
+          rsync -a --delete "$stage/dist/" "$live_dist/"
+
+          "$live_backend/.venv/bin/pip" install -q --disable-pip-version-check \
+            -r "$live_backend/requirements.txt"
+          sudo -n /usr/bin/systemctl restart schwab-trader.service
+
+          healthy=0
+          for i in $(seq 1 20); do
+            body=$(curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:8800/api/health || true)
+            case "$body" in
+              *'"status":"ok"'*) healthy=1; break ;;
+            esac
+            echo "health attempt $i failed: ${body:-no response}" >&2
+            sleep 3
+          done
+          [ "$healthy" -eq 1 ] || { echo "Backend never became healthy" >&2; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/api/portfolio)
+          [ "$code" = "401" ] || { echo "Auth gate broken: /api/portfolio returned $code without a token" >&2; exit 1; }
+
+          sudo -n /usr/bin/systemctl is-active schwab-trader.service
+          trap - EXIT
+          rm -rf "$backup"
+          echo "Release $1-$2 activated."
+          REMOTE
+
+      - name: Verify public production route
+        run: |
+          body=""
+          for i in $(seq 1 10); do
+            body=$(curl -fsS --connect-timeout 5 --max-time 8 https://trader.mangoqwq.com/api/health || true)
+            case "$body" in
+              *'"status":"ok"'*) break ;;
+            esac
+            echo "attempt $i: not healthy yet (${body:-no response})"
+            sleep 6
+          done
+          case "$body" in
+            *'"status":"ok"'*) echo "public health: $body" ;;
+            *) echo "Public health check failed"; exit 1 ;;
+          esac
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://trader.mangoqwq.com/api/portfolio)
+          [ "$code" = "401" ] || { echo "Public auth gate broken: got $code"; exit 1; }
+          echo "Public auth gate enforced (401)."
