@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useMarketStore, selectMetrics, selectDataConfidence } from '../../../store/marketStore';
 import { useTradingStore } from '../../../store/tradingStore';
-import { useWalletStore } from '../../../store/walletStore';
+import { useWalletStore, resolveAccountTotals } from '../../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../../store/watchlistStore';
 import { useI18n } from '../../../i18n';
 import { Icon } from '../../Icon';
@@ -20,8 +20,9 @@ export function TradeOverview({ onTradeClick }: TradeOverviewProps) {
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
   const positions = useTradingStore((state) => state.positions);
   const balances = useWalletStore((state) => state.balances);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
 
-  const baseAsset = selectedSymbol.replace('USDT', '');
+  const baseAsset = selectedSymbol.replace('/USD', '').replace('USDT', '');
   const currentPosition = positions.get(selectedSymbol);
 
   // Metrics processing
@@ -103,7 +104,7 @@ export function TradeOverview({ onTradeClick }: TradeOverviewProps) {
               </div>
               <div className={styles.posPnl}>
                 <span className={styles.pnlVal}>
-                  {positionInfo.pnl >= 0 ? '+' : ''}{positionInfo.pnl.toFixed(2)} USDT
+                  {positionInfo.pnl >= 0 ? '+' : ''}{positionInfo.pnl.toFixed(2)} USD
                 </span>
                 <span className={styles.pnlPct}>
                   ({positionInfo.pnlPercent >= 0 ? '+' : ''}{positionInfo.pnlPercent.toFixed(2)}%)
@@ -177,9 +178,9 @@ export function TradeOverview({ onTradeClick }: TradeOverviewProps) {
         </div>
         <div className={styles.balanceInfo}>
           <div className={styles.balanceMain}>
-            <span className={styles.balanceLabel}>{t.account?.available || 'Available USDT'}</span>
+            <span className={styles.balanceLabel}>{t.account?.available || 'Available'}</span>
             <span className={styles.balanceValue}>
-              ${(balances.find(b => b.asset === 'USDT')?.available || '0')}
+              ${resolveAccountTotals(brokerMetrics, balances.find(b => b.asset === 'USD')).cash.toFixed(2)}
             </span>
           </div>
           <div className={styles.balanceSub}>
