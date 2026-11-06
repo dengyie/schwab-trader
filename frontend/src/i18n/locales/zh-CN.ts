@@ -102,6 +102,9 @@ export const zhCN = {
     resyncingDesc: '正在重建 Order Book，数据可能不完整',
     stale: '已过期',
     staleDesc: '数据已过期，暂停交易操作',
+    closed: '已收盘',
+    closedDesc: '市场已收盘，暂无法下单',
+    marketClosed: '市场已收盘 · 显示收盘行情（下次开盘前数据不再变化）',
     metricsUncertain: '指标可能不准确',
     // 连接状态
     connected: '已连接',

@@ -74,6 +74,15 @@ def test_market_endpoints():
         assert "real_time_quote" in ctx
 
 
+def test_market_clock_endpoint():
+    """Session clock endpoint: auth-gated, and honest 503 when the broker
+    cannot be asked (virtual engine has no real market hour concept)."""
+    with TestClient(app) as client:
+        assert client.get("/api/market/clock").status_code == 401
+        # Virtual engine: clock unknown -> 503, never a fabricated session state
+        assert client.get("/api/market/clock", headers=AUTH).status_code == 503
+
+
 def test_order_submission_and_portfolio_rest():
     with TestClient(app) as client:
         # Initial portfolio check

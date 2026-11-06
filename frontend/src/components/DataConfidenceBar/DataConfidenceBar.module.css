@@ -34,6 +34,13 @@
   background: rgba(220, 38, 38, 0.08);
 }
 
+/* 收盘：不是故障，行情静止是预期行为 */
+.bar.closed {
+  border-bottom-color: var(--color-text-secondary);
+  background: var(--color-bg-secondary);
+  opacity: 0.9;
+}
+
 /* 左区：状态指示 */
 .statusSection {
   display: flex;
@@ -69,6 +76,7 @@
 .degraded .statusText { color: var(--color-warning); }
 .resyncing .statusText { color: #f97316; }
 .stale .statusText { color: var(--color-error); }
+.closed .statusText { color: var(--color-text-secondary); }
 
 .statusReason {
   font-size: var(--font-size-xs);

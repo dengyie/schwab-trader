@@ -187,6 +187,14 @@ def create_api_router(
             raise HTTPException(status_code=404, detail=f"Quote not available for {sym}")
         return quote.model_dump(mode="json")
 
+    @router.get("/market/clock", dependencies=[Depends(require_auth)])
+    def get_market_clock() -> Dict[str, Any]:
+        """Trading-session clock so the UI can tell 'market closed' from 'feed broken'."""
+        clock = broker.get_market_clock()
+        if clock is None:
+            raise HTTPException(status_code=503, detail="Broker clock unavailable")
+        return clock
+
     @router.get("/market/model-context", dependencies=[Depends(require_auth)])
     def get_model_context(symbol: str = "SPY") -> Dict[str, Any]:
         """Provides AI/Quant model ready market summary and technical indicators."""

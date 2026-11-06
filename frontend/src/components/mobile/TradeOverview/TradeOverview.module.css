@@ -297,4 +297,5 @@
 .confidenceBadge.degraded { background: var(--color-warning-bg); color: var(--color-warning); }
 .confidenceBadge.resyncing { background: var(--color-info-bg); color: var(--color-info); }
 .confidenceBadge.stale { background: var(--color-negative-bg); color: var(--color-negative); }
+.confidenceBadge.closed { background: var(--color-bg-tertiary); color: var(--color-text-secondary); }
 

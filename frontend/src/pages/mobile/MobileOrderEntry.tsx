@@ -93,6 +93,11 @@ export function MobileOrderEntry({
       toast.warning(t.dataConfidence?.staleDesc || 'Data is stale');
       return;
     }
+    // 收盘时市价单无法成交：直接给出解释而不是让交易所报错
+    if (dataConfidence.level === 'closed' && type === 'market') {
+      toast.warning(t.dataConfidence?.closedDesc || 'Market closed');
+      return;
+    }
     if (!quantity || parseFloat(quantity) <= 0) {
       toast.warning(t.orderEntry?.invalidAmount || 'Invalid amount');
       return;
@@ -287,7 +292,7 @@ export function MobileOrderEntry({
       <button
         className={`${styles.submitBtn} ${side === 'buy' ? styles.buySubmit : styles.sellSubmit}`}
         onClick={handleSubmit}
-        disabled={dataConfidence.level === 'stale' || !quantity}
+        disabled={dataConfidence.level === 'stale' || (dataConfidence.level === 'closed' && type === 'market') || !quantity}
       >
         {side === 'buy'
           ? formatMessage(t.orderEntry?.placeBuyOrder || 'Buy {symbol}', { symbol: baseAsset })

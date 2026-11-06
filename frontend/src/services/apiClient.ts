@@ -91,6 +91,40 @@ export async function apiJson<T>(path: string, init: RequestInit = {}): Promise<
   return (await response.json()) as T;
 }
 
+/**
+ * GET a small piece of reference data that every request needs (session state,
+ * tradability). One in-flight request is shared by all callers, and the last
+ * answer is replayed after a failure so a network blip cannot flip the UI to
+ * "everything is broken".
+ */
+export function createPolledGetter<T>(
+  path: string,
+  ttlMs: number,
+  onFailure: (error: unknown) => T | null
+): () => Promise<T | null> {
+  let inFlight: Promise<T | null> | null = null;
+  let last: T | null = null;
+  let lastAt = 0;
+
+  return () => {
+    if (last !== null && Date.now() - lastAt < ttlMs) return Promise.resolve(last);
+    if (inFlight) return inFlight;
+
+    inFlight = apiJson<T>(path)
+      .then((data) => {
+        last = data;
+        lastAt = Date.now();
+        return data;
+      })
+      .catch((error) => onFailure(error) ?? last)
+      .finally(() => {
+        inFlight = null;
+      });
+
+    return inFlight;
+  };
+}
+
 /** Validate a candidate token against the backend before storing it. */
 export async function verifyToken(token: string): Promise<boolean> {
   try {

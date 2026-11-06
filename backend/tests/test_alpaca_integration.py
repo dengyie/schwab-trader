@@ -181,6 +181,55 @@ def test_alpaca_broker_initialization():
     assert "APCA-API-KEY-ID" in broker.headers
 
 
+class _FakeClockResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def _broker_with_clock(monkeypatch, response):
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    monkeypatch.setattr(broker.client, "get", lambda *a, **kw: response)
+    return broker
+
+
+def test_market_clock_parses_alpaca_payload(monkeypatch):
+    payload = {
+        "timestamp": "2026-11-06T21:00:00.1Z",
+        "is_open": False,
+        "next_open": "2026-11-09T14:30:00Z",
+        "next_close": "2026-11-09T21:00:00Z",
+    }
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, payload))
+    clock = broker.get_market_clock()
+    assert clock["is_open"] is False
+    assert clock["next_open"] == "2026-11-09T14:30:00Z"
+    assert clock["next_close"] == "2026-11-09T21:00:00Z"
+
+
+def test_market_clock_unavailable_returns_none(monkeypatch):
+    """A broker hiccup must mean 'unknown session', never 'market open'."""
+    # Non-200
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(403, {}))
+    assert broker.get_market_clock() is None
+
+    # Transport failure
+    def boom(*a, **kw):
+        raise ConnectionError("network down")
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    monkeypatch.setattr(broker.client, "get", boom)
+    assert broker.get_market_clock() is None
+
+    # Malformed JSON body
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, ValueError("bad json")))
+    assert broker.get_market_clock() is None
+
+
 @pytest.mark.skipif(
     os.getenv("ALPACA_LIVE_TESTS") != "1",
     reason="Live Alpaca test; opt in with ALPACA_LIVE_TESTS=1",

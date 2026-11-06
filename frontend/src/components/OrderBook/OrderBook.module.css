@@ -169,6 +169,11 @@
   border-color: var(--color-negative);
 }
 
+.container.closed {
+  border-color: var(--color-border-subtle);
+  opacity: 0.85;
+}
+
 /* 可信度徽章 */
 .confidenceBadge {
   display: flex;

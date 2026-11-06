@@ -7,6 +7,7 @@ import type {
   ConnectionStatus,
   DataConfidence,
   DataConfidenceLevel,
+  MarketClock,
   NetworkHealth,
   WorkerMessage,
   OrderBookUpdatePayload,
@@ -19,7 +20,7 @@ import { useI18n } from '../i18n';
 import { formatMessage } from '../i18n';
 import { useWalletStore } from './walletStore';
 import { useTradingStore } from './tradingStore';
-import { getToken } from '../services/apiClient';
+import { getToken, createPolledGetter } from '../services/apiClient';
 
 // ===== Store State =====
 interface MarketState {
@@ -28,6 +29,12 @@ interface MarketState {
   
   // Data Confidence - 诚实系统的核心
   dataConfidence: DataConfidence;
+
+  /**
+   * Broker session clock. A closed market is a normal state, not a fault:
+   * without it every evening looked like a broken feed.
+   */
+  marketClock: MarketClock | null;
   
   // Network Health - 网络质量评分
   networkHealth: NetworkHealth | null;
@@ -49,10 +56,18 @@ interface MarketState {
   subscribe: (symbol: string) => void;
   unsubscribe: () => void;
   clearLogs: () => void;
+  fetchMarketClock: () => Promise<void>;
 }
 
 const MAX_RECENT_TRADES = 50;
 const MAX_LOGS = 200;
+
+/** Session clock, deduped and TTL-cached (replays last good answer on failure). */
+const getMarketClock = createPolledGetter<MarketClock>(
+  '/market/clock',
+  30_000,
+  () => null
+);
 
 // 状态切换滞后配置（防止频繁切换）
 const LEVEL_UPGRADE_THRESHOLD = 2;   // 恢复到更好状态需要连续 2 次
@@ -63,6 +78,7 @@ let consecutiveLevelCounts: Record<DataConfidenceLevel, number> = {
   degraded: 0,
   resyncing: 0,
   stale: 0,
+  closed: 0,
 };
 // 上次状态变化时间，用于防止抖动
 let lastLevelChangeTime = 0;
@@ -99,10 +115,11 @@ const getInitialDataConfidence = (): DataConfidence => {
 };
 
 // 计算数据可信度（带滞后缓冲，防止频繁切换）
-function calculateConfidence(
+export function calculateConfidence(
   connectionStatus: ConnectionStatus,
   orderBook: OrderBook | null,
-  prevConfidence: DataConfidence
+  prevConfidence: DataConfidence,
+  marketClock: MarketClock | null
 ): DataConfidence {
   const now = Date.now();
   const { state, latencyMs, lastMessageTime, messageRate, gapCount } = connectionStatus;
@@ -121,6 +138,22 @@ function calculateConfidence(
     updateFrequencyOk: !hasReceivedData || timeSinceUpdate < CONFIDENCE_THRESHOLDS.DEGRADED_UPDATE_INTERVAL,
     queueHealthy: true,
   };
+
+  // 交易时段是权威事实，不是信号质量：券商时钟说已收盘，就直接进入收盘状态。
+  // 收盘时行情数据必然停更——绝不能把"安静的市场"误报成"坏掉的实时行情"。
+  if (marketClock?.is_open === false) {
+    // 收盘状态下成交数据也会停（消息速率归零），一切 micro-structure 指标
+    // 都来自收盘快照，不再可信。
+    return {
+      level: 'closed',
+      reason: t.dataConfidence.marketClosed,
+      canTrade: false,
+      canTrustMetrics: false,
+      lastLiveTime: prevConfidence.lastLiveTime,
+      degradedSince: prevConfidence.level !== 'live' ? prevConfidence.degradedSince : now,
+      details,
+    };
+  }
   
   // 确定原始可信度级别（不考虑滞后）
   let rawLevel: DataConfidenceLevel;
@@ -166,7 +199,7 @@ function calculateConfidence(
   
   // === 滞后缓冲逻辑（防止网络抖动导致的频繁切换） ===
   // 更新计数器
-  for (const l of ['live', 'degraded', 'resyncing', 'stale'] as DataConfidenceLevel[]) {
+  for (const l of ['live', 'degraded', 'resyncing', 'stale'] as const) {
     if (l === rawLevel) {
       consecutiveLevelCounts[l]++;
     } else {
@@ -237,6 +270,7 @@ export const useMarketStore = create<MarketState>()(
     // Initial state
     connectionStatus: initialConnectionStatus,
     dataConfidence: getInitialDataConfidence(),
+    marketClock: null,
     networkHealth: null,
     orderBook: null,
     metrics: null,
@@ -289,7 +323,8 @@ export const useMarketStore = create<MarketState>()(
                 const newConfidence = calculateConfidence(
                   updatedConnectionStatus,
                   data.orderBook,
-                  state.dataConfidence
+                  state.dataConfidence,
+                  state.marketClock
                 );
                 set({
                   orderBook: data.orderBook,
@@ -326,7 +361,8 @@ export const useMarketStore = create<MarketState>()(
                 const newConfidence = calculateConfidence(
                   data,
                   currentState.orderBook,
-                  currentState.dataConfidence
+                  currentState.dataConfidence,
+                  currentState.marketClock
                 );
                 set({ 
                   connectionStatus: data,
@@ -392,10 +428,12 @@ export const useMarketStore = create<MarketState>()(
         degraded: 0,
         resyncing: 0,
         stale: 0,
+        closed: 0,
       };
 
       // Reset state
       const t = useI18n.getState().t;
+      const marketClock = get().marketClock;
       set({
         orderBook: null,
         metrics: null,
@@ -406,8 +444,10 @@ export const useMarketStore = create<MarketState>()(
         },
         dataConfidence: {
           ...getInitialDataConfidence(),
-          level: 'stale',
-          reason: t.dataConfidence.establishingConnection,
+          level: marketClock?.is_open === false ? 'closed' : 'stale',
+          reason: marketClock?.is_open === false
+            ? t.dataConfidence.marketClosed
+            : t.dataConfidence.establishingConnection,
         },
       });
     },
@@ -438,12 +478,37 @@ export const useMarketStore = create<MarketState>()(
     clearLogs: () => {
       set({ logs: [] });
     },
+
+    /**
+     * Poll the broker session clock. Cheap (30s cache on the backend side too),
+     * but it decides whether "no ticks" means "market closed" or "feed broken".
+     * A failed fetch keeps the previous answer: an unknown clock must not
+     * silently relabel a closed market as degraded.
+     */
+    fetchMarketClock: async () => {
+      const clock = await getMarketClock();
+      if (!clock || clock.is_open === null) return;
+      if (get().marketClock?.is_open === clock.is_open) return;
+
+      set({ marketClock: clock });
+      // Session state changed: recompute confidence immediately instead of
+      // waiting for the next heartbeat.
+      set((state) => ({
+        dataConfidence: calculateConfidence(
+          state.connectionStatus,
+          state.orderBook,
+          state.dataConfidence,
+          clock
+        ),
+      }));
+    },
   }))
 );
 
 // ===== Selectors =====
 export const selectConnectionStatus = (state: MarketState) => state.connectionStatus;
 export const selectDataConfidence = (state: MarketState) => state.dataConfidence;
+export const selectMarketClock = (state: MarketState) => state.marketClock;
 export const selectNetworkHealth = (state: MarketState) => state.networkHealth;
 export const selectOrderBook = (state: MarketState) => state.orderBook;
 export const selectMetrics = (state: MarketState) => state.metrics;
@@ -463,7 +528,8 @@ useI18n.subscribe(
       const newConfidence = calculateConfidence(
         marketState.connectionStatus,
         marketState.orderBook,
-        marketState.dataConfidence
+        marketState.dataConfidence,
+        marketState.marketClock
       );
       useMarketStore.setState({ dataConfidence: newConfidence });
     } else {

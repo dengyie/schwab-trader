@@ -66,3 +66,12 @@ class BaseBroker(ABC):
     def reset(self, initial_capital: float = 100000.0) -> None:
         """Resets the broker state / paper ledger."""
         pass
+
+    def get_market_clock(self) -> Optional[dict]:
+        """
+        Trading-session clock: {"is_open": bool, "next_open": iso, "next_close": iso}.
+
+        Returns None when the broker cannot be asked. The market-data layer uses
+        this so a quiet market is not reported as a broken live feed.
+        """
+        return None

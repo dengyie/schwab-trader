@@ -238,6 +238,11 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (dataConfidence.level === 'stale') { toast.warning(t.dataConfidence.staleDesc); return; }
+    // 收盘时市价单无法成交；限价/条件单会被券商挂起等下次开盘
+    if (dataConfidence.level === 'closed' && type === 'market' && orderCategory === 'spot') {
+      toast.warning(t.dataConfidence.closedDesc);
+      return;
+    }
     if (dataConfidence.level === 'degraded' && !showDegradedConfirm) { setShowDegradedConfirm(true); return; }
     if (!quantity || parseFloat(quantity) <= 0) { toast.warning(t.orderEntry.invalidAmount); return; }
 
@@ -339,6 +344,8 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   // Validation for submit button
   const getIsSubmitDisabled = () => {
     if (dataConfidence.level === 'stale') return true;
+    // 收盘时市价单无法成交，保持禁用直到开盘
+    if (dataConfidence.level === 'closed' && type === 'market' && orderCategory === 'spot') return true;
     if (!quantity || parseFloat(quantity) <= 0) return true;
     
     if (orderCategory === 'spot') {
@@ -359,7 +366,10 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   
   const isSubmitDisabled = getIsSubmitDisabled();
   const estimatedPriceValue = type === 'market' && metrics ? metrics.mid : (type === 'limit' ? price : (triggerPrice || '—'));
-  const slippageEst = metrics?.slippageEst && metrics.slippageEst !== 'N/A' ? `${metrics.slippageEst}bp` : '—';
+  // 收盘时盘口是冻结快照，滑点预估没有意义
+  const slippageEst = dataConfidence.level === 'closed'
+    ? '—'
+    : (metrics?.slippageEst && metrics.slippageEst !== 'N/A' ? `${metrics.slippageEst}bp` : '—');
   const feeValue = total !== '0' ? (parseFloat(total) * 0.001).toFixed(2) : '0';
 
   // Get order type label

@@ -24,20 +24,22 @@ export function TradeOverview({ onTradeClick }: TradeOverviewProps) {
 
   const baseAsset = selectedSymbol.replace('/USD', '').replace('USDT', '');
   const currentPosition = positions.get(selectedSymbol);
+  const isClosed = dataConfidence?.level === 'closed';
 
   // Metrics processing
   const displayMetrics = useMemo(() => {
     if (!metrics) return [];
     return [
       { label: t.metrics?.midPrice || 'Mid', value: formatPrice(parseFloat(metrics.mid)) },
-      { label: t.metrics?.spread || 'Spread', value: `${(metrics.spreadBps || 0).toFixed(2)} bps` },
-      { label: t.metrics?.imbalance || 'Imbalance', value: `${((metrics.bidAskImbalance || 0) * 100).toFixed(1)}%`, 
-        trend: (metrics.bidAskImbalance || 0) > 0.1 ? 'up' : (metrics.bidAskImbalance || 0) < -0.1 ? 'down' : 'neutral' },
-      { label: t.metrics?.volatility || 'Volatility', value: (metrics.microVolatility || 0).toFixed(4) },
-      { label: t.metrics?.liquidityScore || 'Liquidity', value: `${(metrics.liquidityScore || 0).toFixed(0)}/100` },
-      { label: t.metrics?.slippageEst || 'Slippage', value: metrics.slippageEst === 'N/A' ? 'N/A' : `${metrics.slippageEst} bps` },
+      // 收盘状态下盘口是冻结快照，micro-structure 指标不再显示
+      { label: t.metrics?.spread || 'Spread', value: isClosed ? '—' : `${(metrics.spreadBps || 0).toFixed(2)} bps` },
+      { label: t.metrics?.imbalance || 'Imbalance', value: isClosed ? '—' : `${((metrics.bidAskImbalance || 0) * 100).toFixed(1)}%`, 
+        trend: isClosed ? 'neutral' : (metrics.bidAskImbalance || 0) > 0.1 ? 'up' : (metrics.bidAskImbalance || 0) < -0.1 ? 'down' : 'neutral' },
+      { label: t.metrics?.volatility || 'Volatility', value: isClosed ? '—' : (metrics.microVolatility || 0).toFixed(4) },
+      { label: t.metrics?.liquidityScore || 'Liquidity', value: isClosed ? '—' : `${(metrics.liquidityScore || 0).toFixed(0)}/100` },
+      { label: t.metrics?.slippageEst || 'Slippage', value: isClosed ? '—' : (metrics.slippageEst === 'N/A' ? 'N/A' : `${metrics.slippageEst} bps`) },
     ];
-  }, [metrics, t]);
+  }, [metrics, t, isClosed]);
 
   // Position processing
   const positionInfo = useMemo(() => {

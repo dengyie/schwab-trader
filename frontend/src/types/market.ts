@@ -126,7 +126,18 @@ export interface NetworkHealth {
 // ===== 数据可信度模型（Data Confidence Model）=====
 // 这是"诚实系统"的核心产品能力
 
-export type DataConfidenceLevel = 'live' | 'degraded' | 'resyncing' | 'stale';
+export type DataConfidenceLevel = 'live' | 'degraded' | 'resyncing' | 'stale' | 'closed';
+
+/**
+ * Authoritative trading-session clock from the broker (Alpaca /clock):
+ * tells the UI "market closed" apart from "quotes stopped = feed broken".
+ * is_open === null means the clock is unknown (fetch failed).
+ */
+export interface MarketClock {
+  is_open: boolean | null;
+  next_open: string | null;
+  next_close: string | null;
+}
 
 export interface DataConfidence {
   level: DataConfidenceLevel;

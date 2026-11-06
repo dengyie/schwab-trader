@@ -78,6 +78,9 @@ export function OrderBook({ onPriceClick, embedded = false, compact = false }: O
   const { level, reason } = dataConfidence;
   const isResyncing = level === 'resyncing';
   const isStale = level === 'stale';
+  // A closed market's top of book is a frozen closing snapshot; the "spread"
+  // between the last bid and ask of the session is meaningless, so hide it.
+  const isClosed = level === 'closed';
 
   useEffect(() => {
     prevOrderBookRef.current = orderBook;
@@ -147,13 +150,14 @@ export function OrderBook({ onPriceClick, embedded = false, compact = false }: O
           {/* Spread in center */}
           <div className={styles.embeddedSpread}>
             <div className={styles.spreadValue}>
-              <span className="tabular-nums">{formatPrice(String(spread))}</span>
-              <span className={styles.spreadBps}>({spreadBps.toFixed(2)} bps)</span>
+              <span className="tabular-nums">{isClosed ? '—' : formatPrice(String(spread))}</span>
+              <span className={styles.spreadBps}>({isClosed ? '—' : `${spreadBps.toFixed(2)} bps`})</span>
             </div>
             {level !== 'live' && (
               <div className={styles.confidenceIcon} title={reason}>
                 {isResyncing && <Icon name="refresh-cw" size="sm" className={styles.spinning} />}
                 {isStale && <Icon name="wifi-off" size="sm" />}
+                {isClosed && <Icon name="pause" size="sm" />}
                 {level === 'degraded' && <Icon name="alert-triangle" size="sm" />}
               </div>
             )}
@@ -199,6 +203,7 @@ export function OrderBook({ onPriceClick, embedded = false, compact = false }: O
             <div className={styles.confidenceIcon} title={reason}>
               {isResyncing && <Icon name="refresh-cw" size="sm" className={styles.spinning} />}
               {isStale && <Icon name="wifi-off" size="sm" />}
+              {isClosed && <Icon name="pause" size="sm" />}
               {level === 'degraded' && <Icon name="alert-triangle" size="sm" />}
             </div>
           )}
@@ -228,13 +233,14 @@ export function OrderBook({ onPriceClick, embedded = false, compact = false }: O
 
         <div className={styles.spreadSection}>
           <div className={styles.spreadValue}>
-            <span className="tabular-nums">{formatPrice(String(spread))}</span>
-            <span className={styles.spreadBps}>({spreadBps.toFixed(2)} bps)</span>
+            <span className="tabular-nums">{isClosed ? '—' : formatPrice(String(spread))}</span>
+            <span className={styles.spreadBps}>({isClosed ? '—' : `${spreadBps.toFixed(2)} bps`})</span>
           </div>
           {compact && level !== 'live' && (
             <div className={styles.confidenceIcon} title={reason}>
               {isResyncing && <Icon name="refresh-cw" size="xs" className={styles.spinning} />}
               {isStale && <Icon name="wifi-off" size="xs" />}
+              {isClosed && <Icon name="pause" size="xs" />}
               {level === 'degraded' && <Icon name="alert-triangle" size="xs" />}
             </div>
           )}

@@ -104,6 +104,9 @@ export const enUS: Locale = {
     resyncingDesc: 'Rebuilding order book, data may be incomplete',
     stale: 'Stale',
     staleDesc: 'Data expired, trading disabled',
+    closed: 'Closed',
+    closedDesc: 'Market closed, orders cannot fill',
+    marketClosed: 'Market closed · showing the closing session',
     metricsUncertain: 'Metrics may be inaccurate',
     // Connection states
     connected: 'Connected',
