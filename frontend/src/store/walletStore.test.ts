@@ -61,6 +61,31 @@ describe('WalletStore - broker portfolio sync', () => {
 
     expect(useWalletStore.getState().brokerMetrics?.positionValue).toBe(2000);
   });
+
+  it('clears positions the broker no longer reports (fully sold)', () => {
+    useWalletStore.getState().syncFromBackendPortfolio({
+      cash: 90000,
+      total_equity: 95000,
+      positions: {
+        SPY: { quantity: 2, avg_cost: 700, current_price: 710 },
+      },
+    });
+    expect(useWalletStore.getState().balances.find((b) => b.asset === 'SPY')?.total).toBe('2');
+
+    // After a sell the broker omits the symbol entirely; the row must zero out
+    // instead of keeping the last-known share count on screen forever.
+    useWalletStore.getState().syncFromBackendPortfolio({
+      cash: 91420,
+      total_equity: 91420,
+      positions: {},
+    });
+
+    const spy = useWalletStore.getState().balances.find((b) => b.asset === 'SPY');
+    expect(spy?.total).toBe('0');
+    expect(spy?.available).toBe('0');
+    // USD and the legacy USDT placeholder are never wiped by this path.
+    expect(useWalletStore.getState().balances.find((b) => b.asset === 'USD')?.total).toBe('91420.00');
+  });
 });
 
 describe('resolveAccountTotals - one account total for every panel', () => {

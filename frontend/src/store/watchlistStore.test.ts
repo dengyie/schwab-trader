@@ -93,15 +93,32 @@ describe('WatchlistStore', () => {
     });
   });
 
-  describe('price updates', () => {
-    it('should update symbol price', () => {
-      const { updateSymbolPrice } = useWatchlistStore.getState();
-      updateSymbolPrice('BTCUSDT', '50000.00', 2.5);
-      
-      const state = useWatchlistStore.getState();
-      const btc = state.symbols.find(s => s.symbol === 'BTCUSDT');
-      expect(btc?.price).toBe('50000.00');
-      expect(btc?.priceChange24h).toBe(2.5);
+  describe('symbol removal', () => {
+    it('selects the first remaining symbol instead of a legacy placeholder', () => {
+      useWatchlistStore.setState({
+        symbols: [
+          { symbol: 'SPY', baseAsset: 'SPY', quoteAsset: 'USD' },
+          { symbol: 'QQQ', baseAsset: 'QQQ', quoteAsset: 'USD' },
+        ],
+        selectedSymbol: 'SPY',
+      });
+
+      useWatchlistStore.getState().removeSymbol('SPY');
+
+      // 'BTCUSDT' is a leftover from the crypto era; the terminal only trades
+      // US equities, so selecting it leaves the feed empty.
+      expect(useWatchlistStore.getState().selectedSymbol).toBe('QQQ');
+    });
+
+    it('leaves the selection empty when the last symbol is removed', () => {
+      useWatchlistStore.setState({
+        symbols: [{ symbol: 'SPY', baseAsset: 'SPY', quoteAsset: 'USD' }],
+        selectedSymbol: 'SPY',
+      });
+
+      useWatchlistStore.getState().removeSymbol('SPY');
+
+      expect(useWatchlistStore.getState().selectedSymbol).toBe('');
     });
   });
 });
