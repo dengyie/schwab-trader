@@ -79,11 +79,13 @@ export function AccountOverviewCard() {
       if (qty.lte(0)) continue;
 
       let usdValue: number;
-      if (balance.asset === 'USDT') {
-        usdValue = qty.toNumber();
+      if (balance.asset === 'USD') {
+        // Cash (USD.total = broker equity, but allocation shows cash portion first)
+        usdValue = new Decimal(balance.available).toNumber();
+      } else if (balance.asset === 'USDT') {
+        continue; // legacy crypto placeholder, always zero
       } else {
-        const symbol = `${balance.asset}USDT`;
-        const price = prices[symbol];
+        const price = prices[balance.asset];
         if (!price) continue;
         usdValue = qty.mul(new Decimal(price)).toNumber();
       }

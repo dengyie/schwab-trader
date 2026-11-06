@@ -86,8 +86,23 @@ export interface TechnicalIndicators {
 
 export interface ModelContext {
   symbol: string;
+  /** Broker's live quote block (bid/ask/last/spread/timestamp). */
+  real_time_quote?: {
+    bid?: number | null;
+    ask?: number | null;
+    last?: number;
+    spread?: number | null;
+    timestamp?: string | null;
+  };
+  /** @deprecated legacy alias; prefer real_time_quote */
   latest_quote?: Quote;
   technical_indicators?: TechnicalIndicators;
+  current_position?: {
+    shares: number;
+    avg_cost: number;
+    unrealized_pnl: number;
+    unrealized_pnl_pct: number;
+  } | null;
   historical_bars_count?: number;
   timestamp?: string;
 }

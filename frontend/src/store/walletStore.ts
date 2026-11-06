@@ -41,9 +41,18 @@ const createEmptyBalances = (): WalletBalance[] =>
     total: asset === 'USD' ? '100000.00' : '0',
   }));
 
+export interface BrokerMetrics {
+  cash: number;
+  totalEquity: number;
+  positionValue: number | null;
+  unrealizedPnl: number | null;
+  realizedPnl: number | null;
+}
+
 interface WalletState {
   account: Account | null;
   balances: WalletBalance[];
+  brokerMetrics: BrokerMetrics | null;
   paymentMethods: PaymentMethod[];
   cryptoAddresses: CryptoAddress[];
   deposits: Deposit[];
@@ -92,6 +101,7 @@ export const useWalletStore = create<WalletState>()(
       (set, get) => ({
         account: null,
         balances: createEmptyBalances(),
+        brokerMetrics: null,
         paymentMethods: [],
         cryptoAddresses: [],
         deposits: [],
@@ -207,17 +217,34 @@ export const useWalletStore = create<WalletState>()(
           return true;
         },
 
-        syncFromBackendPortfolio: (data: { cash: number; total_equity: number; positions?: Record<string, any> }) => {
+        syncFromBackendPortfolio: (data: {
+          cash: number;
+          total_equity: number;
+          market_value?: number;
+          unrealized_pnl?: number;
+          realized_pnl?: number;
+          positions?: Record<string, any>;
+        }) => {
           const state = get();
-          const cashStr = (data.cash ?? 100000).toFixed(2);
-          const totalStr = (data.total_equity ?? data.cash ?? 100000).toFixed(2);
+          const cashStr = (data.cash ?? 0).toFixed(2);
+          const totalStr = (data.total_equity ?? data.cash ?? 0).toFixed(2);
 
+          // Broker equity already includes position market value, so only USD
+          // carries it. USDT is a legacy crypto placeholder and stays zero —
+          // writing equity into both currencies double-counted the account.
           const newBalances = state.balances.map(b => {
-            if (b.asset === 'USD' || b.asset === 'USDT') {
+            if (b.asset === 'USD') {
               return {
                 ...b,
                 available: cashStr,
                 total: totalStr,
+              };
+            }
+            if (b.asset === 'USDT') {
+              return {
+                ...b,
+                available: '0',
+                total: '0',
               };
             }
             if (data.positions && data.positions[b.asset]) {
@@ -232,7 +259,16 @@ export const useWalletStore = create<WalletState>()(
             return b;
           });
 
-          set({ balances: newBalances });
+          set({
+            balances: newBalances,
+            brokerMetrics: {
+              cash: data.cash ?? 0,
+              totalEquity: data.total_equity ?? data.cash ?? 0,
+              positionValue: data.market_value ?? ((data.total_equity ?? data.cash ?? 0) - (data.cash ?? 0)),
+              unrealizedPnl: data.unrealized_pnl ?? null,
+              realizedPnl: data.realized_pnl ?? null,
+            },
+          });
         },
 
         fetchPortfolio: async () => {
@@ -501,21 +537,11 @@ export const useWalletStore = create<WalletState>()(
 
         getTotalEquity: (prices) => {
           const s = get();
-          let total = new Decimal(0);
-          for (const b of s.balances) {
-            const qty = new Decimal(b.total);
-            if (qty.lte(0)) continue;
-            if (b.asset === 'USDT' || b.asset === 'USD') {
-              total = total.plus(qty);
-            } else {
-              const p = prices[`${b.asset}`] || prices[`${b.asset}USDT`];
-              if (p && !isNaN(parseFloat(p))) {
-                total = total.plus(qty.times(p));
-              }
-              // Skip assets without current price to avoid crashes
-            }
-          }
-          return total.toFixed(2);
+          // USD.total mirrors the broker's total_equity (cash + positions marked
+          // to market). Stock rows hold share counts, never currency, so they must
+          // not be added again here.
+          const usd = s.balances.find((b) => b.asset === 'USD');
+          return new Decimal(usd?.total ?? '0').toFixed(2);
         },
 
         getFilteredLedger: (filter) => {

@@ -32,9 +32,9 @@ export const enUS: Locale = {
   // Auth
   auth: {
     welcomeTitle: 'Welcome',
-    welcomeMessageZh: '尊敬的各位徐培原（Mike）的朋友们，欢迎来到我设计的比特币模拟交易所。\n\n为方便各位体验，我们已为你准备价值 30 万美元 的虚拟资金账户，并默认绑定一张"中国人名很行"无限额银行卡。\n\n祝你玩得开心，也玩得明白。',
-    welcomeMessageMobile: "Friends of Peiyuan 'Mike' Xu, welcome to my Bitcoin paper trading exchange. A $300,000 virtual account is ready for you, with an unlimited card from 'Chinese Renming Henxing Bank' pre-linked.",
-    welcomeMessageEn: "Dear friends of Peiyuan 'Mike' Xu, welcome to my paper trading simulator.\n\nFor your convenience, we have prepared a virtual account worth $300,000 USD, with an unlimited credit card from the prestigious 'Chinese Renming Henxing Bank' pre-linked.\n\nHave fun, and trade wisely.",
+    welcomeMessageZh: '欢迎使用 Schwab Trader Hub —— 美股模拟交易终端。\n\n行情来自 Alpaca IEX 实时数据（Bid/Ask/Latest Trade），账户资金由 Alpaca Paper Trading 托管，与真实市场同步更新。\n\n请输入服务端配置的访问令牌开始交易。',
+    welcomeMessageMobile: 'Welcome to Schwab Trader Hub, a US equities paper-trading terminal. Quotes are live Alpaca IEX data and the account is an Alpaca Paper Trading account.',
+    welcomeMessageEn: 'Welcome to Schwab Trader Hub, a US equities paper-trading terminal.\n\nQuotes stream from Alpaca IEX and the account is an Alpaca Paper Trading account.\n\nEnter the access token configured on the server to start trading.',
     login: 'Sign In',
     register: 'Register',
     createAccount: 'Create Account',
