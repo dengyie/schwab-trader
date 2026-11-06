@@ -12,16 +12,25 @@ interface MetricItemProps {
   tooltip?: string;
   colorClass?: string;
   isUncertain?: boolean;  // 是否受可信度影响
+  /**
+   * Micro-structure metrics (spread, slippage, imbalance, depth) are derived
+   * from the top of book. When the market is closed the top of book is a
+   * frozen closing snapshot, so a 700bp "spread" is an artifact, not a fact.
+   */
+  hideWhenClosed?: boolean;
   confidenceLevel?: DataConfidenceLevel;
 }
 
-function MetricItem({ label, value, unit, tooltip, colorClass, isUncertain, confidenceLevel }: MetricItemProps) {
+function MetricItem({ label, value, unit, tooltip, colorClass, isUncertain, hideWhenClosed, confidenceLevel }: MetricItemProps) {
   const { t } = useI18n();
   const [showTooltip, setShowTooltip] = useState(false);
   
   // 根据可信度决定显示方式
   const shouldDim = isUncertain && confidenceLevel && confidenceLevel !== 'live';
   const showUncertainIcon = shouldDim && (confidenceLevel === 'degraded' || confidenceLevel === 'resyncing');
+  const showPlaceholder =
+    (isUncertain && confidenceLevel === 'stale') ||
+    (hideWhenClosed && confidenceLevel === 'closed');
 
   return (
     <div 
@@ -44,9 +53,9 @@ function MetricItem({ label, value, unit, tooltip, colorClass, isUncertain, conf
       </div>
       <div className={styles.valueRow}>
         <span className={`${styles.value} ${colorClass ?? ''} tabular-nums`}>
-          {confidenceLevel === 'stale' && isUncertain ? '—' : value}
+          {showPlaceholder ? '—' : value}
         </span>
-        {unit && <span className={styles.unit}>{unit}</span>}
+        {unit && !showPlaceholder && <span className={styles.unit}>{unit}</span>}
       </div>
       
       {showTooltip && tooltip && (
@@ -105,7 +114,9 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
         <span className={styles.compactDivider}>|</span>
         <span className={styles.compactMetric}>
           <span className={styles.compactLabel}>Spread</span>
-          <span className={styles.compactValue}>{(metrics.spreadBps || 0).toFixed(1)} bps</span>
+          <span className={styles.compactValue}>
+            {level === 'closed' ? '—' : `${(metrics.spreadBps || 0).toFixed(1)} bps`}
+          </span>
         </span>
         <span className={styles.compactDivider}>|</span>
         <span className={styles.compactMetric}>
@@ -122,7 +133,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
         <span>{t.metrics?.title || 'Metrics'}</span>
         {!canTrustMetrics && (
           <span className={`${styles.confidenceBadge} ${styles[level]}`} title={dataConfidence?.reason}>
-            <Icon name={level === 'stale' ? 'pause' : 'zap'} size="sm" />
+            <Icon name={level === 'stale' || level === 'closed' ? 'pause' : 'zap'} size="sm" />
           </span>
         )}
       </div>
@@ -142,6 +153,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
           unit={t.orderBook?.spreadBps || 'bps'}
           tooltip={t.metrics?.spreadDesc}
           isUncertain={true}
+          hideWhenClosed
           confidenceLevel={level}
         />
 
@@ -152,6 +164,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
           colorClass={imbalanceClass}
           tooltip={t.metrics?.imbalanceDesc}
           isUncertain={true}
+          hideWhenClosed
           confidenceLevel={level}
         />
 
@@ -187,6 +200,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
           colorClass={liquidityClass}
           tooltip={t.metrics?.liquidityScoreDesc}
           isUncertain={true}
+          hideWhenClosed
           confidenceLevel={level}
         />
 
@@ -196,6 +210,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
           unit={metrics.slippageEst === 'N/A' ? '' : (t.orderBook?.spreadBps || 'bps')}
           tooltip={t.metrics?.slippageEstDesc}
           isUncertain={true}
+          hideWhenClosed
           confidenceLevel={level}
         />
       </div>

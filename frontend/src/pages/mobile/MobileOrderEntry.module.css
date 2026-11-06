@@ -295,3 +295,20 @@
   background: var(--color-negative);
   color: white;
 }
+
+/* ===== 数据可信度提示条 ===== */
+.warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+
+.warning.degraded { background: var(--color-warning-bg); }
+.warning.resyncing { background: rgba(249, 115, 22, 0.1); }
+.warning.stale { background: var(--color-negative-bg); }
+.warning.closed { background: var(--color-bg-tertiary); }

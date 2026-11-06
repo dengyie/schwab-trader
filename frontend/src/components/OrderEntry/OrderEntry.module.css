@@ -374,6 +374,11 @@
   background: var(--color-negative-bg);
 }
 
+/* 收盘不是故障：中性底色，避免误读成数据事故 */
+.confidenceWarning.closed {
+  background: var(--color-bg-tertiary);
+}
+
 .warningBar {
   position: absolute;
   left: 0;
@@ -393,6 +398,10 @@
 
 .confidenceWarning.stale .warningBar {
   background: var(--color-negative);
+}
+
+.confidenceWarning.closed .warningBar {
+  background: var(--color-text-secondary);
 }
 
 @keyframes barPulse {

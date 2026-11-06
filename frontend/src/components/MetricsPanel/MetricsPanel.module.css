@@ -160,6 +160,11 @@
   background: var(--color-negative-bg);
 }
 
+.confidenceBadge.closed {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+}
+
 .metricItem.uncertain {
   opacity: 0.7;
 }

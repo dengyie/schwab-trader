@@ -237,3 +237,18 @@ class AlpacaPaperBroker(BaseBroker):
         self.cached_portfolio = None
         self._last_order_status.clear()
         self._last_filled_qty.clear()
+
+    def get_market_clock(self) -> Optional[dict]:
+        """Alpaca trading clock: tells the UI 'market closed' vs 'feed degraded'."""
+        try:
+            resp = self.client.get(f"{self.base_url}/clock")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return {
+                "is_open": bool(data.get("is_open")),
+                "next_open": data.get("next_open"),
+                "next_close": data.get("next_close"),
+            }
+        except Exception:
+            return None

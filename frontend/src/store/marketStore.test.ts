@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useMarketStore } from './marketStore';
-import type { Trade } from '../types/market';
+import { useMarketStore, calculateConfidence } from './marketStore';
+import type { ConnectionStatus, DataConfidence, MarketClock } from '../types/market';
 
 describe('MarketStore - Real-time Incremental Data & Bar Stream', () => {
   beforeEach(() => {
@@ -101,5 +101,114 @@ describe('MarketStore - Real-time Incremental Data & Bar Stream', () => {
 
     unsubTrade();
     unsubBar();
+  });
+});
+
+describe('MarketStore - Session clock vs. broken feed', () => {
+  const connectedStatus = (lastMessageTime: number): ConnectionStatus => ({
+    state: 'connected',
+    latencyMs: 80,
+    // A closed market stops ticking: the last message is hours old.
+    lastMessageTime,
+    reconnectCount: 0,
+    gapCount: 0,
+    resyncCount: 0,
+    messageRate: 0,
+    isStale: false,
+  });
+
+  const livePrev: DataConfidence = {
+    level: 'live',
+    reason: '',
+    canTrade: true,
+    canTrustMetrics: true,
+    lastLiveTime: Date.now() - 1000,
+    degradedSince: 0,
+    details: {
+      wsConnected: true,
+      sequenceContinuous: true,
+      latencyOk: true,
+      updateFrequencyOk: true,
+      queueHealthy: true,
+    },
+  };
+
+  const orderBook = {
+    symbol: 'SPY',
+    bids: [{ price: '712.63', quantity: '100' }],
+    asks: [{ price: '764.24', quantity: '100' }],
+    lastUpdateId: 1,
+    localUpdateTime: 1,
+    isStale: false,
+    depth: 1,
+  };
+
+  const closedClock: MarketClock = {
+    is_open: false,
+    next_open: '2026-11-09T14:30:00Z',
+    next_close: '2026-11-09T21:00:00Z',
+  };
+
+  it('reports closed (not degraded) when the broker clock says the market is shut', () => {
+    const staleTimestamp = Date.now() - 3_600_000;
+    const confidence = calculateConfidence(
+      connectedStatus(staleTimestamp),
+      orderBook,
+      livePrev,
+      closedClock
+    );
+
+    expect(confidence.level).toBe('closed');
+    // Derived microstructure is meaningless on a frozen closing snapshot.
+    expect(confidence.canTrustMetrics).toBe(false);
+    expect(confidence.canTrade).toBe(false);
+    expect(confidence.reason).not.toMatch(/消息速率|message rate/i);
+  });
+
+  it('only degrades on silence when the clock says the market is open', () => {
+    const staleTimestamp = Date.now() - 3_600_000;
+    const confidence = calculateConfidence(
+      connectedStatus(staleTimestamp),
+      orderBook,
+      livePrev,
+      { is_open: true, next_open: null, next_close: null }
+    );
+
+    // Silence while open is a data problem, never a session state.
+    expect(confidence.level).not.toBe('closed');
+  });
+
+  it('returns to live once the market reopens', () => {
+    const closedPrev: DataConfidence = {
+      ...livePrev,
+      level: 'closed',
+      canTrade: false,
+      canTrustMetrics: false,
+    };
+    const freshStatus: ConnectionStatus = {
+      ...connectedStatus(Date.now()),
+      // A live session ticked recently: rate is healthy again.
+      messageRate: 5,
+    };
+    const openClock: MarketClock = { is_open: true, next_open: null, next_close: null };
+
+    // Upgrade threshold is two consecutive samples; the first call may still
+    // report 'closed' while the counters fill up.
+    calculateConfidence(freshStatus, orderBook, closedPrev, openClock);
+    const confidence = calculateConfidence(freshStatus, orderBook, closedPrev, openClock);
+
+    expect(confidence.level).toBe('live');
+    expect(confidence.canTrade).toBe(true);
+  });
+
+  it('falls back to normal judgement when the clock is unknown', () => {
+    const confidence = calculateConfidence(
+      connectedStatus(Date.now()),
+      orderBook,
+      livePrev,
+      null
+    );
+
+    expect(confidence.level).toBe('live');
   });
 });

@@ -34,6 +34,8 @@ export function DataConfidenceBar() {
       case 'degraded': return t.dataConfidence.degraded;
       case 'resyncing': return t.dataConfidence.resyncing;
       case 'stale': return t.dataConfidence.stale;
+      // 收盘是正常状态，不是故障：行情本就该静止
+      case 'closed': return t.dataConfidence.closed;
       default: return '';
     }
   };
