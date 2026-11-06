@@ -35,6 +35,13 @@ interface MarketState {
    * without it every evening looked like a broken feed.
    */
   marketClock: MarketClock | null;
+
+  /**
+   * Symbol the worker is currently subscribed to. Worker messages arrive
+   * asynchronously, so a late snapshot for the previous symbol must be dropped
+   * instead of being rendered under the newly selected one.
+   */
+  activeSymbol: string | null;
   
   // Network Health - 网络质量评分
   networkHealth: NetworkHealth | null;
@@ -271,6 +278,7 @@ export const useMarketStore = create<MarketState>()(
     connectionStatus: initialConnectionStatus,
     dataConfidence: getInitialDataConfidence(),
     marketClock: null,
+    activeSymbol: null,
     networkHealth: null,
     orderBook: null,
     metrics: null,
@@ -283,6 +291,10 @@ export const useMarketStore = create<MarketState>()(
     // Subscribe to a symbol
     subscribe: (symbol: string) => {
       let { worker } = get();
+
+      // Record the selection immediately: in-flight messages for the previous
+      // symbol must be identifiable even if the worker itself fails to start.
+      set({ activeSymbol: symbol });
 
       // Create worker if not exists
       if (!worker) {
@@ -315,6 +327,10 @@ export const useMarketStore = create<MarketState>()(
             switch (type) {
               case 'ORDERBOOK_UPDATE': {
                 const data = payload as OrderBookUpdatePayload;
+                // The worker swaps managers asynchronously on a symbol change.
+                // A snapshot for the outgoing symbol must never be rendered as
+                // if it belonged to the symbol the user just selected.
+                if (state.activeSymbol && data.orderBook?.symbol !== state.activeSymbol) break;
                 // 使用 payload 中的 lastMessageTime 更新 connectionStatus，确保 timeSinceUpdate 计算准确
                 const updatedConnectionStatus = {
                   ...state.connectionStatus,
@@ -336,7 +352,10 @@ export const useMarketStore = create<MarketState>()(
               }
               case 'TRADE_UPDATE': {
                 const data = payload as TradeUpdatePayload;
-                const newTrades = data.trades || [];
+                const newTrades = (data.trades || []).filter(
+                  (trade) => !state.activeSymbol || trade.symbol === state.activeSymbol
+                );
+                if (newTrades.length === 0 && (data.trades || []).length > 0) break;
                 set((state) => ({
                   recentTrades: [...newTrades, ...state.recentTrades].slice(0, MAX_RECENT_TRADES),
                   latestTrade: newTrades[0] || state.latestTrade,
@@ -438,6 +457,7 @@ export const useMarketStore = create<MarketState>()(
         orderBook: null,
         metrics: null,
         recentTrades: [],
+        latestTrade: null,
         connectionStatus: {
           ...initialConnectionStatus,
           state: 'connecting',
@@ -465,9 +485,11 @@ export const useMarketStore = create<MarketState>()(
       }
 
       set({
+        activeSymbol: null,
         orderBook: null,
         metrics: null,
         recentTrades: [],
+        latestTrade: null,
         connectionStatus: initialConnectionStatus,
         dataConfidence: getInitialDataConfidence(),
         networkHealth: null,

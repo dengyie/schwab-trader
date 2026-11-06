@@ -65,6 +65,9 @@ export function getWsUrl(): string {
   return token ? `${basePath}?token=${encodeURIComponent(token)}` : basePath;
 }
 
+/** Requests that hang on a half-open connection would otherwise spin forever. */
+const REQUEST_TIMEOUT_MS = 10_000;
+
 /**
  * Fetch a backend endpoint with the auth header attached.
  * 401 responses clear the stored token and notify the app so the login gate
@@ -72,7 +75,11 @@ export function getWsUrl(): string {
  */
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = authHeaders((init.headers as Record<string, string>) || {});
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers,
+    signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
 
   if (response.status === 401) {
     clearToken();
@@ -130,6 +137,7 @@ export async function verifyToken(token: string): Promise<boolean> {
   try {
     const response = await fetch(`${API_BASE}/auth/verify`, {
       headers: { 'X-Auth-Token': token },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     return response.ok;
   } catch {

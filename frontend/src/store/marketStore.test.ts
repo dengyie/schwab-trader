@@ -212,3 +212,13 @@ describe('MarketStore - Session clock vs. broken feed', () => {
     expect(confidence.level).toBe('live');
   });
 });
+
+describe('MarketStore - symbol isolation', () => {
+  it('records the active symbol immediately and clears it on unsubscribe', () => {
+    useMarketStore.getState().subscribe('QQQ');
+    expect(useMarketStore.getState().activeSymbol).toBe('QQQ');
+
+    useMarketStore.getState().unsubscribe();
+    expect(useMarketStore.getState().activeSymbol).toBeNull();
+  });
+});

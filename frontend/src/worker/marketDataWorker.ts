@@ -265,6 +265,10 @@ function sendOrderBookUpdate(): void {
   if (!orderBookManager || !orderBookManager.isInitialized) return;
 
   const orderBook = orderBookManager.getOrderBook();
+  // A symbol switch swaps the manager asynchronously; never let the previous
+  // symbol's snapshot cross into the main thread under the new symbol.
+  if (currentSymbol && orderBook.symbol !== currentSymbol) return;
+
   const metrics = orderBookManager.getMetrics();
   
   // 计算最新消息时间戳（转换为 Date.now() 格式）
@@ -480,12 +484,21 @@ async function fetchSnapshot(symbol: string): Promise<void> {
   log('info', 'orderbook', 'ob.snapshot_start', { symbol, url });
   
   try {
-    const response = await fetch(url, { headers: authHeaders() });
+    const response = await fetch(url, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(8_000),
+    });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     
     const quote = await response.json();
+    // The user may have switched symbols while this snapshot was in flight.
+    // Applying it would paint the old symbol's quote into the new manager.
+    if (currentSymbol !== symbol) {
+      log('warn', 'orderbook', 'ob.snapshot_discarded', { symbol, current: currentSymbol });
+      return;
+    }
     orderBookManager?.applyQuote(quote);
     
     addNetworkEvent('resync_complete', `quote: ${quote.last || quote.bid}`);

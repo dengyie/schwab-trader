@@ -212,6 +212,16 @@ export const useWalletStore = create<WalletState>()(
                 total: qty,
               };
             }
+            // The broker only reports open positions. A symbol it no longer
+            // lists was fully sold — keeping the last known quantity would leave
+            // a closed position on screen as if it were still held.
+            if (data.positions && b.asset !== 'USD' && b.asset !== 'USDT' && new Decimal(b.total || '0').gt(0)) {
+              return {
+                ...b,
+                available: '0',
+                total: '0',
+              };
+            }
             return b;
           });
 

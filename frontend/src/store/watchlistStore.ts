@@ -105,11 +105,17 @@ export const useWatchlistStore = create<WatchlistState>()(
       
       removeSymbol: (symbol) => {
         const { symbols, favorites, pinned, selectedSymbol } = get();
+        const remaining = symbols.filter(s => s.symbol !== symbol);
         set({
-          symbols: symbols.filter(s => s.symbol !== symbol),
+          symbols: remaining,
           favorites: favorites.filter(s => s !== symbol),
           pinned: pinned.filter(s => s !== symbol),
-          selectedSymbol: selectedSymbol === symbol ? 'BTCUSDT' : selectedSymbol,
+          // Never fall back to a legacy crypto placeholder: the terminal only
+          // speaks US equities, so handing TradePage 'BTCUSDT' leaves it with
+          // an empty feed. Select the first remaining symbol, if any.
+          selectedSymbol: selectedSymbol === symbol
+            ? (remaining[0]?.symbol ?? '')
+            : selectedSymbol,
         });
       },
       
