@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import Decimal from 'decimal.js';
 import { useTradingStore } from '../../store/tradingStore';
-import { useWalletStore, selectBalances } from '../../store/walletStore';
+import { useWalletStore, selectBalances, resolveAccountTotals } from '../../store/walletStore';
 import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 
@@ -64,6 +64,7 @@ function formatCrypto(value: string | number): string {
 export function Positions() {
   const { t } = useI18n();
   const balances = useWalletStore(selectBalances);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const positions = useTradingStore((state) => state.positions);
   const createOrder = useTradingStore((state) => state.createOrder);
   const metrics = useMarketStore(selectMetrics);
@@ -91,7 +92,6 @@ export function Positions() {
   const currentSymbol = orderBook?.symbol || selectedSymbol;
   
   const usdtBalance = balances.find(b => b.asset === 'USD' || b.asset === 'USDT');
-  const usdtTotal = new Decimal(usdtBalance?.total ?? '0');
 
   let positionEntries: [string, any][] = [];
   if (positions instanceof Map) {
@@ -100,7 +100,6 @@ export function Positions() {
     positionEntries = Object.entries(positions);
   }
   
-  let totalPositionValue = new Decimal(0);
   let totalUnrealizedPnl = new Decimal(0);
 
   const positionsWithPnl = positionEntries
@@ -131,7 +130,6 @@ export function Positions() {
       const unrealizedPnl = hasRealTimePrice ? qty.times(currentPrice.minus(avgEntry)) : new Decimal(0);
       const pnlPercent = hasRealTimePrice && avgEntry.gt(0) ? currentPrice.minus(avgEntry).div(avgEntry).times(100) : new Decimal(0);
 
-      totalPositionValue = totalPositionValue.plus(value);
       if (hasRealTimePrice) {
         totalUnrealizedPnl = totalUnrealizedPnl.plus(unrealizedPnl);
       }
@@ -146,8 +144,11 @@ export function Positions() {
       };
     });
 
-  const totalAccountValue = usdtTotal.plus(totalPositionValue);
-  const accountPnlPercent = totalUnrealizedPnl.div(totalAccountValue.gt(0) ? totalAccountValue : 1).times(100).toNumber();
+  // USD.total is the broker's equity, which already contains position value —
+  // adding totalPositionValue here printed the account twice (e.g. $104,038).
+  const { totalEquity: totalAccountValue } = resolveAccountTotals(brokerMetrics, usdtBalance);
+  const accountTotal = new Decimal(totalAccountValue);
+  const accountPnlPercent = totalUnrealizedPnl.div(accountTotal.gt(0) ? accountTotal : 1).times(100).toNumber();
 
   const handleReset = () => {
     resetAccount();
@@ -185,7 +186,9 @@ export function Positions() {
     setCloseConfirm(null);
   };
 
-  const activeBalances = balances.filter(b => new Decimal(b.total).gt(0) || b.asset === 'USDT');
+  // USDT is a retired crypto placeholder that always sits at 0; listing it under
+  // a stock account reads as a real (empty) balance, so it is skipped.
+  const activeBalances = balances.filter(b => b.asset !== 'USDT' && new Decimal(b.total).gt(0));
 
   return (
     <div className={styles.container}>

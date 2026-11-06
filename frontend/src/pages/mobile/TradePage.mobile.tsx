@@ -13,7 +13,8 @@ import { useHapticFeedback } from '../../hooks/useHapticFeedback';
 import { useMarketStore, selectOrderBook, selectMetrics } from '../../store/marketStore';
 import { formatVolume, formatPrice } from '../../services/marketDataService';
 import { useTradingStore } from '../../store/tradingStore';
-import { useWalletStore } from '../../store/walletStore';
+import { useWalletStore, resolveAccountTotals } from '../../store/walletStore';
+import type { BrokerMetrics } from '../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useI18n } from '../../i18n';
 import styles from './TradePage.mobile.module.css';
@@ -37,6 +38,7 @@ export function MobileTradePage() {
   const updateOrderBookForMatching = useTradingStore((state) => state.updateOrderBookForMatching);
   const positions = useTradingStore((state) => state.positions);
   const balances = useWalletStore((state) => state.balances);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics) as BrokerMetrics | null;
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
 
   const [activeTab, setActiveTab] = useState<ContentTab>('trade');
@@ -81,31 +83,28 @@ export function MobileTradePage() {
   };
 
   // Get current position and account info
-  const baseAsset = selectedSymbol.replace('USDT', '');
+  const baseAsset = selectedSymbol.replace('/USD', '').replace('USDT', '');
   const currentPosition = positions.get(selectedSymbol);
   
-  // Calculate total account value in USDT
+  // Calculate total account value
   const accountInfo = useMemo(() => {
     const currentPrice = metrics?.mid ? parseFloat(metrics.mid) : 0;
-    const usdtBal = balances.find(b => b.asset === 'USDT');
+    const usdBal = balances.find(b => b.asset === 'USD');
     const baseBal = balances.find(b => b.asset === baseAsset);
     
-    const usdtValue = usdtBal ? parseFloat(usdtBal.total) : 0;
-    const usdtAvailable = usdtBal ? parseFloat(usdtBal.available) : 0;
+    // USD is the only cash asset; USDT is a retired placeholder stuck at 0.
+    const { totalEquity, cash } = resolveAccountTotals(brokerMetrics, usdBal);
     const baseQty = baseBal ? parseFloat(baseBal.total) : 0;
     const baseValueInUsdt = baseQty * currentPrice;
     
-    // Total equity = USDT + (base asset * current price)
-    const totalEquity = usdtValue + baseValueInUsdt;
-    
     return {
       totalEquity,
-      usdtAvailable,
+      usdtAvailable: cash,
       baseQty,
       baseValueInUsdt,
       currentPrice,
     };
-  }, [balances, baseAsset, metrics?.mid]);
+  }, [balances, brokerMetrics, baseAsset, metrics?.mid]);
 
   // Subscribe to market data
   useEffect(() => {
@@ -304,9 +303,9 @@ export function MobileTradePage() {
             </span>
           </div>
 
-          {/* Available USDT */}
+          {/* Available cash */}
           <div className={styles.infoItem}>
-            <span className={styles.infoLabel}>{t.account?.available || 'Avail'} (USDT)</span>
+            <span className={styles.infoLabel}>{t.account?.available || 'Avail'} (USD)</span>
             <span className={`${styles.infoValue} tabular-nums`}>
               ${accountInfo.usdtAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </span>

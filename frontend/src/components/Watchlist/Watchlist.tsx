@@ -139,7 +139,7 @@ function WatchlistItem({
                 {symbol.baseAsset || '--'}
               </div>
             )}
-            {!isCollapsed && <div className={styles.symbolQuote}>/{symbol.quoteAsset || 'USD'}</div>}
+            {!isCollapsed && symbol.quoteAsset && symbol.quoteAsset !== 'USD' && <div className={styles.symbolQuote}>/{symbol.quoteAsset}</div>}
           </div>
           {position && parseFloat(position.quantity || '0') > 0 && (
             isCollapsed ? (

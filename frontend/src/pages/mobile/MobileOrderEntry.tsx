@@ -37,9 +37,9 @@ export function MobileOrderEntry({
   const balances = useWalletStore(selectBalances);
   const createOrder = useTradingStore((state) => state.createOrder);
 
-  const symbol = orderBook?.symbol ?? 'BTCUSDT';
-  const baseAsset = symbol.replace('USDT', '');
-  const quoteAsset = 'USDT';
+  const symbol = orderBook?.symbol ?? 'SPY';
+  const baseAsset = symbol.replace('/USD', '').replace('USDT', '');
+  const quoteAsset = 'USD';
   const baseBalance = balances.find(b => b.asset === baseAsset);
   const quoteBalance = balances.find(b => b.asset === quoteAsset);
 

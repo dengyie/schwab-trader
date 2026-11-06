@@ -1,6 +1,6 @@
 import { useMemo, useEffect } from 'react';
 import { useTradingStore } from '../../store/tradingStore';
-import { useWalletStore, selectBalances } from '../../store/walletStore';
+import { useWalletStore, selectBalances, resolveAccountTotals } from '../../store/walletStore';
 import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useI18n } from '../../i18n';
@@ -22,6 +22,7 @@ interface RiskRibbonProps {
 export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
   const { t } = useI18n();
   const balances = useWalletStore(selectBalances);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const performanceMetrics = useWalletStore((state) => state.performanceMetrics);
   const updatePerformanceMetrics = useWalletStore((state) => state.updatePerformanceMetrics);
   const positions = useTradingStore((state) => state.positions);
@@ -46,8 +47,10 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
   const riskMetrics = useMemo((): RiskMetrics | null => {
     if (!metrics) return null;
 
-    const usdtBalance = balances.find(b => b.asset === 'USD' || b.asset === 'USDT');
-    const usdtTotal = parseFloat(usdtBalance?.total ?? '0');
+    const usdBalance = balances.find(b => b.asset === 'USD');
+    // Broker equity already contains position value; adding it on top inflated
+    // the denominator and understated position size.
+    const accountEquity = resolveAccountTotals(brokerMetrics, usdBalance).totalEquity;
     
     let positionEntries: [string, any][] = [];
     if (positions instanceof Map) {
@@ -79,7 +82,7 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
     const currentPrice = parseFloat(metrics.mid);
     
     const positionValue = qty * currentPrice;
-    const totalValue = usdtTotal + positionValue;
+    const totalValue = accountEquity;
     const positionSizePercent = totalValue > 0 ? (positionValue / totalValue) * 100 : 0;
     
     const unrealizedPnlPercent = avgEntry > 0 ? ((currentPrice - avgEntry) / avgEntry) * 100 : 0;
@@ -92,7 +95,7 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
       volatilityRisk,
       hasRealTimePrice: currentPrice > 0,
     };
-  }, [balances, positions, metrics, currentSymbol]);
+  }, [balances, brokerMetrics, positions, metrics, currentSymbol]);
 
   if (!riskMetrics) return null;
 

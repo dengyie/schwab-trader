@@ -6,7 +6,9 @@ import { useMarketStore } from './marketStore';
 describe('TradingStore - Order Freeze & Cancellation', () => {
   beforeEach(() => {
     useWalletStore.getState().resetWallet();
-    useWalletStore.getState().grantInitialFunds();
+    // Fund the account the way production does: a broker portfolio snapshot.
+    // (The old createEmptyBalances placeholder grant was removed.)
+    useWalletStore.getState().syncFromBackendPortfolio({ cash: 100000, total_equity: 100000 });
     useTradingStore.setState({ orders: [], positions: new Map(), ocoOrders: [] });
     useMarketStore.setState({
       dataConfidence: {

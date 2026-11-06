@@ -46,7 +46,7 @@ function OrderRow({ order }: { order: PaperOrder }) {
         </div>
       </td>
       <td>
-        <span className={styles.symbol}>{order.symbol.replace('USDT', '')}</span>
+        <span className={styles.symbol}>{order.symbol.replace('/USD', '').replace('USDT', '')}</span>
       </td>
       <td className={styles.numericCell}>
         {order.price ? parseFloat(order.price).toFixed(2) : '—'}

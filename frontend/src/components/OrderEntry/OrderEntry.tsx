@@ -470,7 +470,7 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
                   </div>
                 </div>
                 <div className={styles.inputGroup}>
-                  <label className={styles.label}>Callback {trailingType === 'percent' ? '(%)' : '(USDT)'}</label>
+                  <label className={styles.label}>Callback {trailingType === 'percent' ? '(%)' : '(USD)'}</label>
                   <div className={styles.inputWrapper}>
                     <input type="text" inputMode="decimal" className={`input ${styles.input}`} value={trailingValue} onChange={(e) => setTrailingValue(e.target.value)} onFocus={handleInputFocus('trigger')} onBlur={handleInputBlur} placeholder={trailingType === 'percent' ? '1.0' : '100'} />
                     <span className={styles.inputSuffix}>{trailingType === 'percent' ? '%' : quoteAsset}</span>

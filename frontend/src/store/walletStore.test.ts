@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useWalletStore } from './walletStore';
+import { useWalletStore, resolveAccountTotals } from './walletStore';
 
 describe('WalletStore - broker portfolio sync', () => {
   beforeEach(() => {
@@ -60,5 +60,35 @@ describe('WalletStore - broker portfolio sync', () => {
     });
 
     expect(useWalletStore.getState().brokerMetrics?.positionValue).toBe(2000);
+  });
+});
+
+describe('resolveAccountTotals - one account total for every panel', () => {
+  it('reports broker equity as-is, never adding position value on top', () => {
+    // Regression: the Positions panel showed 104,038.53 for this account
+    // because it printed total_equity + market_value.
+    const totals = resolveAccountTotals(
+      { cash: 95846.87, totalEquity: 99947.97, positionValue: 4101.1, unrealizedPnl: -52.01, realizedPnl: 0 },
+      { available: '95846.87', total: '99947.97' },
+    );
+
+    expect(totals.totalEquity).toBe(99947.97);
+    expect(totals.cash).toBe(95846.87);
+  });
+
+  it('falls back to the USD balance before the broker snapshot lands', () => {
+    const totals = resolveAccountTotals(null, { available: '90000.00', total: '95000.00' });
+
+    expect(totals.totalEquity).toBe(95000);
+    expect(totals.cash).toBe(90000);
+  });
+
+  it('starts an unsynced account at zero instead of a placeholder balance', () => {
+    useWalletStore.getState().resetWallet();
+
+    const usd = useWalletStore.getState().balances.find((b) => b.asset === 'USD');
+    expect(usd?.available).toBe('0');
+    expect(usd?.total).toBe('0');
+    expect(resolveAccountTotals(null, usd)).toEqual({ totalEquity: 0, cash: 0 });
   });
 });

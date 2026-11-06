@@ -4,17 +4,17 @@ import { useI18n } from '../../i18n';
 import styles from './SymbolSelector.module.css';
 
 const POPULAR_SYMBOLS = [
-  'BTCUSDT',
-  'ETHUSDT',
-  'BNBUSDT',
-  'SOLUSDT',
-  'XRPUSDT',
+  'SPY',
+  'QQQ',
+  'AAPL',
+  'NVDA',
+  'TSLA',
 ];
 
 export function SymbolSelector() {
   const { t } = useI18n();
-  const [symbol, setSymbol] = useState('BTCUSDT');
-  const [inputValue, setInputValue] = useState('BTCUSDT');
+  const [symbol, setSymbol] = useState('SPY');
+  const [inputValue, setInputValue] = useState('SPY');
   const connectionStatus = useMarketStore(selectConnectionStatus);
   const subscribe = useMarketStore((state) => state.subscribe);
   const unsubscribe = useMarketStore((state) => state.unsubscribe);
@@ -64,7 +64,7 @@ export function SymbolSelector() {
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value.toUpperCase())}
           onKeyDown={handleKeyDown}
-          placeholder={t.symbolSelector?.placeholder || 'Symbol (e.g., BTCUSDT)'}
+          placeholder={t.symbolSelector?.placeholder || 'Symbol (e.g., SPY)'}
           disabled={isConnecting}
         />
         
@@ -94,7 +94,7 @@ export function SymbolSelector() {
             onClick={() => handleQuickSelect(sym)}
             disabled={isConnecting}
           >
-            {sym.replace('USDT', '')}
+            {sym}
           </button>
         ))}
       </div>
