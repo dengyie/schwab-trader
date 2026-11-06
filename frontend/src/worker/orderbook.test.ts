@@ -214,6 +214,54 @@ describe('OrderBookManager', () => {
     });
   });
 
+  describe('update timestamp semantics', () => {
+    it('publishes a wall-clock epoch, never a monotonic counter', () => {
+      manager.applySnapshot({
+        lastUpdateId: 100,
+        bids: [['50000.00', '1.0']] as [string, string][],
+        asks: [['50001.00', '1.0']] as [string, string][],
+      });
+
+      const orderBook = manager.getOrderBook();
+      const now = Date.now();
+
+      // performance.now() is milliseconds since page load (~1e5 on a long-lived
+      // tab). Treated as an epoch it renders 1970, which is what the UI showed.
+      expect(orderBook.localUpdateTime).toBeGreaterThan(1e12);
+      expect(orderBook.localUpdateTime).toBeLessThanOrEqual(now);
+      expect(now - orderBook.localUpdateTime).toBeLessThan(5_000);
+      expect(new Date(orderBook.localUpdateTime).getFullYear()).toBeGreaterThan(2020);
+    });
+
+    it('keeps staleness detection monotonic across repeated snapshots', () => {
+      manager.applySnapshot({
+        lastUpdateId: 100,
+        bids: [['50000.00', '1.0']] as [string, string][],
+        asks: [['50001.00', '1.0']] as [string, string][],
+      });
+
+      // Converting at the snapshot boundary must not corrupt internal state:
+      // checkStale still compares against performance.now().
+      expect(manager.checkStale()).toBe(false);
+      manager.processUpdate({
+        e: 'depthUpdate',
+        E: Date.now(),
+        s: 'BTCUSDT',
+        U: 101,
+        u: 101,
+        b: [['50000.00', '2.0']] as [string, string][],
+        a: [] as [string, string][],
+      } as never);
+      expect(manager.checkStale()).toBe(false);
+      expect(manager.getOrderBook().lastUpdateId).toBe(101);
+    });
+
+    it('reports 0 before the first update instead of a bogus epoch', () => {
+      const orderBook = manager.getOrderBook();
+      expect(orderBook.localUpdateTime).toBe(0);
+    });
+  });
+
   describe('stale detection', () => {
     it('should mark as stale when not initialized', () => {
       expect(manager.checkStale()).toBe(true);
