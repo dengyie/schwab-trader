@@ -10,7 +10,7 @@ import styles from './AccountRibbon.module.css';
 
 interface AccountMetrics {
   totalValue: Decimal;
-  availableUsdt: Decimal;
+  available: Decimal;
   positionValue: Decimal;
   unrealizedPnl: Decimal;
   unrealizedPnlPercent: number;
@@ -20,6 +20,7 @@ interface AccountMetrics {
 export function AccountRibbon() {
   const { t } = useI18n();
   const balances = useWalletStore(selectBalances);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const positions = useTradingStore((state) => state.positions);
   const metrics = useMarketStore(selectMetrics);
   const orderBook = useMarketStore(selectOrderBook);
@@ -29,12 +30,11 @@ export function AccountRibbon() {
   const currentSymbolMidPrice = metrics ? new Decimal(metrics.mid) : new Decimal(0);
 
   const accountMetrics = useMemo((): AccountMetrics => {
-    // Get USDT balance
-    const usdtBalance = balances.find(b => b.asset === 'USDT');
-    const usdtTotal = new Decimal(usdtBalance?.total ?? '0');
-    const usdtAvailable = new Decimal(usdtBalance?.available ?? '0');
+    const usdBalance = balances.find(b => b.asset === 'USD');
+    const usdEquity = new Decimal(usdBalance?.total ?? '0');
+    const usdAvailable = new Decimal(usdBalance?.available ?? '0');
 
-    // Calculate position values
+    // Calculate position values (fallback when the broker metrics are unknown)
     let positionEntries: [string, any][] = [];
     if (positions instanceof Map) {
       positionEntries = Array.from(positions.entries());
@@ -42,8 +42,8 @@ export function AccountRibbon() {
       positionEntries = Object.entries(positions);
     }
 
-    let totalPositionValue = new Decimal(0);
-    let totalUnrealizedPnl = new Decimal(0);
+    let derivedPositionValue = new Decimal(0);
+    let derivedUnrealizedPnl = new Decimal(0);
     let hasRealTimePrice = true;
 
     positionEntries
@@ -56,39 +56,49 @@ export function AccountRibbon() {
       .forEach(([symbol, pos]) => {
         const qty = new Decimal(pos.quantity || '0');
         const avgEntry = new Decimal(pos.avgEntryPrice || '0');
-        
+
         const isCurrentSymbol = symbol === currentSymbol;
         const currentPrice = isCurrentSymbol ? currentSymbolMidPrice : avgEntry;
         const hasPrice = isCurrentSymbol && currentSymbolMidPrice.gt(0);
-        
+
         const value = qty.times(currentPrice);
         const unrealizedPnl = hasPrice ? qty.times(currentPrice.minus(avgEntry)) : new Decimal(0);
 
         if (hasPrice) {
-          totalPositionValue = totalPositionValue.plus(value);
-          totalUnrealizedPnl = totalUnrealizedPnl.plus(unrealizedPnl);
+          derivedPositionValue = derivedPositionValue.plus(value);
+          derivedUnrealizedPnl = derivedUnrealizedPnl.plus(unrealizedPnl);
         } else {
-          totalPositionValue = totalPositionValue.plus(qty.times(avgEntry));
+          derivedPositionValue = derivedPositionValue.plus(qty.times(avgEntry));
           if (isCurrentSymbol) hasRealTimePrice = false;
         }
       });
 
-    const totalAccountValue = usdtTotal.plus(totalPositionValue);
-    const unrealizedPnlPercent = totalAccountValue.gt(0) 
-      ? totalUnrealizedPnl.div(totalAccountValue).times(100).toNumber() 
+    // Broker-reported figures win: they are the account's real mark-to-market,
+    // and they keep the header, the ribbon and the wallet page on one number.
+    const totalValue = brokerMetrics ? new Decimal(brokerMetrics.totalEquity) : usdEquity;
+    const available = brokerMetrics ? new Decimal(brokerMetrics.cash) : usdAvailable;
+    const positionValue = brokerMetrics?.positionValue != null
+      ? new Decimal(brokerMetrics.positionValue)
+      : derivedPositionValue;
+    const unrealizedPnl = brokerMetrics?.unrealizedPnl != null
+      ? new Decimal(brokerMetrics.unrealizedPnl)
+      : derivedUnrealizedPnl;
+
+    const unrealizedPnlPercent = totalValue.gt(0)
+      ? unrealizedPnl.div(totalValue).times(100).toNumber()
       : 0;
 
     return {
-      totalValue: totalAccountValue,
-      availableUsdt: usdtAvailable,
-      positionValue: totalPositionValue,
-      unrealizedPnl: totalUnrealizedPnl,
+      totalValue,
+      available,
+      positionValue,
+      unrealizedPnl,
       unrealizedPnlPercent,
       hasRealTimePrice,
     };
-  }, [balances, positions, currentSymbol, currentSymbolMidPrice]);
+  }, [balances, brokerMetrics, positions, currentSymbol, currentSymbolMidPrice]);
 
-  const formatUSDT = (value: Decimal): string => {
+  const formatMoney = (value: Decimal): string => {
     return value.toFixed(2);
   };
 
@@ -99,7 +109,7 @@ export function AccountRibbon() {
       <div className={styles.item}>
         <span className={styles.label}>{t.account?.totalValue || 'Total'}</span>
         <span className={`${styles.value} tabular-nums`}>
-          ${formatUSDT(accountMetrics.totalValue)}
+          ${formatMoney(accountMetrics.totalValue)}
         </span>
       </div>
 
@@ -108,7 +118,7 @@ export function AccountRibbon() {
       <div className={styles.item}>
         <span className={styles.label}>{t.account?.available || 'Available'}</span>
         <span className={`${styles.value} tabular-nums`}>
-          ${formatUSDT(accountMetrics.availableUsdt)}
+          ${formatMoney(accountMetrics.available)}
         </span>
       </div>
 
@@ -117,7 +127,7 @@ export function AccountRibbon() {
       <div className={styles.item}>
         <span className={styles.label}>{'Position'}</span>
         <span className={`${styles.value} tabular-nums`}>
-          ${formatUSDT(accountMetrics.positionValue)}
+          ${formatMoney(accountMetrics.positionValue)}
         </span>
       </div>
 
@@ -126,7 +136,7 @@ export function AccountRibbon() {
       <div className={styles.item}>
         <span className={styles.label}>{t.positions?.unrealizedPnL || 'Unrealized P&L'}</span>
         <span className={`${styles.value} ${styles.pnl} tabular-nums ${pnlIsPositive ? styles.positive : styles.negative}`}>
-          {pnlIsPositive ? '+' : ''}{formatUSDT(accountMetrics.unrealizedPnl)}
+          {pnlIsPositive ? '+' : ''}{formatMoney(accountMetrics.unrealizedPnl)}
           <span className={styles.pnlPercent}>
             ({pnlIsPositive ? '+' : ''}{accountMetrics.unrealizedPnlPercent.toFixed(2)}%)
           </span>

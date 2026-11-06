@@ -30,9 +30,9 @@ export const zhCN = {
   // 认证
   auth: {
     welcomeTitle: '欢迎',
-    welcomeMessageZh: '尊敬的各位徐培原（Mike）的朋友们，欢迎来到我设计的比特币模拟交易所。\n\n为方便各位体验，我们已为你准备价值 30 万美元 的虚拟资金账户，并默认绑定一张"中国人名很行"无限额银行卡。\n\n祝你玩得开心，也玩得明白。',
-    welcomeMessageMobile: '各位徐培原（Mike）的朋友们，欢迎来到我设计的比特币模拟交易所。已为你准备 30 万美元虚拟资金账户，并默认绑定"中国人名很行"无限额银行卡。',
-    welcomeMessageEn: "Dear friends of Peiyuan 'Mike' Xu, welcome to my paper trading simulator.\n\nFor your convenience, we have prepared a virtual account worth $300,000 USD, with an unlimited credit card from the prestigious 'Chinese Renming Henxing Bank' pre-linked.\n\nHave fun, and trade wisely.",
+    welcomeMessageZh: '欢迎使用 Schwab Trader Hub —— 美股模拟交易终端。\n\n行情来自 Alpaca IEX 实时数据（Bid/Ask/Latest Trade），账户资金由 Alpaca Paper Trading 托管，与真实市场同步更新。\n\n请输入服务端配置的访问令牌开始交易。',
+    welcomeMessageMobile: '欢迎使用 Schwab Trader Hub 美股模拟交易终端。行情为 Alpaca IEX 实时数据，账户为 Alpaca Paper Trading 模拟账户。',
+    welcomeMessageEn: 'Welcome to Schwab Trader Hub, a US equities paper-trading terminal.\n\nQuotes stream from Alpaca IEX and the account is an Alpaca Paper Trading account.\n\nEnter the access token configured on the server to start trading.',
     login: '登录',
     register: '注册',
     createAccount: '创建账户',
@@ -68,8 +68,8 @@ export const zhCN = {
 
   // 交易对选择
   symbolSelector: {
-    label: '交易对',
-    placeholder: '交易对 (例如: BTCUSDT)',
+    label: '标的',
+    placeholder: '代码 (例如: SPY)',
     popular: '热门',
     all: '全部',
   },
@@ -319,7 +319,7 @@ export const zhCN = {
     title: '当前挂单',
     noOrders: '暂无挂单',
     orderId: '订单ID',
-    symbol: '交易对',
+    symbol: '标的',
     side: '方向',
     type: '类型',
     price: '价格',
@@ -352,7 +352,7 @@ export const zhCN = {
   positions: {
     title: '当前持仓',
     noPositions: '暂无持仓',
-    symbol: '交易对',
+    symbol: '标的',
     side: '方向',
     amount: '数量',
     avgPrice: '均价',
@@ -366,7 +366,7 @@ export const zhCN = {
     closePosition: '市价平仓',
     marketClose: '市价全平',
     closeOrderSubmitted: '平仓订单已提交',
-    switchingSymbol: '正在切换交易对...',
+    switchingSymbol: '正在切换标的...',
     noMarketData: '无市场数据，请稍后重试',
     // 平仓确认弹窗
     confirmCloseTitle: '确认平仓',
@@ -513,12 +513,12 @@ export const zhCN = {
   // 自选列表
   watchlist: {
     title: '自选列表',
-    searchPlaceholder: '搜索交易对...',
+    searchPlaceholder: '搜索股票代码...',
     showAll: '显示全部',
     showFavorites: '只显示收藏',
     noResults: '未找到匹配的交易对',
     empty: '自选列表为空',
-    symbols: '个交易对',
+    symbols: '个标的',
     addToFavorites: '添加收藏',
     removeFromFavorites: '取消收藏',
     pin: '置顶',
@@ -814,7 +814,7 @@ export const zhCN = {
       expired: '已过期',
     },
     form: {
-      symbol: '交易对',
+      symbol: '标的',
       triggerType: '触发类型',
       priceAbove: '价格上涨至',
       priceBelow: '价格下跌至',

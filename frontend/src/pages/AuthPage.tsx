@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
-import { useWalletStore } from '../store/walletStore';
 import { useI18n } from '../i18n';
 import { Icon } from '../components/Icon';
 import { useIsMobile } from '../hooks/useMediaQuery';
@@ -13,8 +12,7 @@ export const AuthPage: React.FC = () => {
   const { t, locale } = useI18n();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
-  const { loginWithToken, isAuthenticated, isLoading, isInitialized, markAsInitialized } = useAuthStore();
-  const { grantInitialFunds, hasReceivedInitialGrant } = useWalletStore();
+  const { loginWithToken, isAuthenticated, isLoading } = useAuthStore();
 
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -26,16 +24,11 @@ export const AuthPage: React.FC = () => {
 
   useEffect(() => {
     if (isAuthenticated) {
-      // Grant initial funds if not already done
-      if (!isInitialized && !hasReceivedInitialGrant) {
-        const granted = grantInitialFunds();
-        if (granted) {
-          markAsInitialized();
-        }
-      }
+      // Account balances always come from the broker (/api/portfolio + WS
+      // snapshots). The old local "initial grant" fabricated money and is gone.
       navigate('/trade');
     }
-  }, [isAuthenticated, isInitialized, hasReceivedInitialGrant, grantInitialFunds, markAsInitialized, navigate]);
+  }, [isAuthenticated, navigate]);
 
   // Simulate system checks on mount
   useEffect(() => {

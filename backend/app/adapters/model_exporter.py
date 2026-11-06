@@ -115,7 +115,11 @@ class ModelFeatureExporter:
                 "latest_close": latest_close,
                 "rsi_14": latest_rsi,
                 "sma_20": latest_sma,
-                "trend": "BULLISH" if (latest_sma and latest_close > latest_sma) else "BEARISH"
+                "trend": (
+                    "BULLISH"
+                    if (latest_sma and latest_close > latest_sma)
+                    else "BEARISH" if (latest_sma and latest_close < latest_sma) else "NEUTRAL"
+                )
             },
             "current_position": {
                 "shares": position.quantity if position else 0,
