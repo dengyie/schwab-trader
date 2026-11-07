@@ -1,11 +1,16 @@
 """
 REST API Routes for Market Data, Portfolio State, Order Execution, and AI Model Context.
+
+Every market-data and order endpoint accepts symbols from any supported market
+(US / HK / JP / CN); canonicalisation and rule enforcement live in
+``app.core.markets`` so the HTTP layer stays thin.
 """
 from __future__ import annotations
-import re
+
 import time
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from app.models.trading import (
@@ -15,9 +20,14 @@ from app.engine.base_broker import BaseBroker
 from app.adapters.model_exporter import ModelFeatureExporter
 from app.core.auth import require_auth
 from app.core.config import settings
+from app.core.markets import (
+    MARKETS,
+    market_clock,
+    market_of,
+    market_payload,
+    resolve_symbol,
+)
 from app.core.timeframes import TIMEFRAME_SECONDS
-
-_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 
 class OrderRequest(BaseModel):
@@ -27,6 +37,8 @@ class OrderRequest(BaseModel):
     quantity: int
     price: Optional[float] = None
     stop_price: Optional[float] = None
+    # Optional hint for bare numeric codes (e.g. "0700" + market "HK").
+    market: Optional[str] = None
 
     @field_validator("side", mode="before")
     @classmethod
@@ -52,11 +64,11 @@ class ResetRequest(BaseModel):
     initial_capital: float = 100000.0
 
 
-def _normalize_symbol(symbol: str) -> str:
-    sym = (symbol or "").strip().upper()
-    if not _SYMBOL_RE.match(sym):
+def _normalize_symbol(symbol: str, market: Optional[str] = None) -> str:
+    ref = resolve_symbol(symbol, market)
+    if ref is None:
         raise HTTPException(status_code=400, detail=f"Invalid symbol: {symbol!r}")
-    return sym
+    return ref.symbol
 
 
 def _normalize_timeframe(timeframe: str) -> str:
@@ -67,6 +79,36 @@ def _normalize_timeframe(timeframe: str) -> str:
             detail=f"Unsupported timeframe {timeframe!r}; supported: {sorted(TIMEFRAME_SECONDS)}",
         )
     return tf
+
+
+def _normalize_market(code: Optional[str]) -> str:
+    market = MARKETS.get(code or "US")
+    if market is None:
+        raise HTTPException(status_code=400, detail=f"Unknown market: {code!r}")
+    return market.code
+
+
+def _position_payload(pos: Position, fx_rates: Dict[str, float]) -> Dict[str, Any]:
+    rate = fx_rates.get(pos.currency, 1.0)
+    return {
+        "symbol": pos.symbol,
+        "market": pos.market,
+        "currency": pos.currency,
+        "quantity": pos.quantity,
+        "avg_cost": pos.avg_cost,
+        "current_price": pos.current_price,
+        # Native-currency figures: what the position is worth on its own venue.
+        "market_value": pos.market_value,
+        "unrealized_pnl": pos.unrealized_pnl,
+        "unrealized_pnl_pct": pos.unrealized_pnl_pct,
+        "realized_pnl": pos.realized_pnl,
+        # Base-currency (USD) figures used for account totals.
+        "market_value_usd": pos.market_value_usd(rate),
+        "unrealized_pnl_usd": pos.unrealized_pnl_usd(rate),
+        "realized_pnl_usd": pos.realized_pnl_usd,
+        "cost_basis_usd": pos.cost_basis_usd,
+        "bought_on": pos.bought_on,
+    }
 
 
 def create_api_router(
@@ -87,9 +129,17 @@ def create_api_router(
 
     router = APIRouter(prefix="/api")
 
-    _cached_tickers: List[Dict[str, Any]] = []
-    _cached_tickers_ts: float = 0.0
-    _tickers_ttl: float = 5.0
+    _tickers_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+    _tickers_ttl = 5.0
+
+    def _fx_rates() -> Dict[str, float]:
+        getter = getattr(broker, "get_fx_rates", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                pass
+        return {"USD": 1.0}
 
     @router.get("/health")
     def health_check():
@@ -97,7 +147,8 @@ def create_api_router(
             "status": "ok",
             "service": "schwab-trader-hub",
             "market_data_provider": settings.market_data_provider,
-            "broker_provider": settings.broker_provider
+            "broker_provider": settings.broker_provider,
+            "markets": MARKETS.codes(),
         }
 
     @router.get("/auth/verify", dependencies=[Depends(require_auth)])
@@ -105,12 +156,27 @@ def create_api_router(
         """Token validity check used by the frontend login gate (401 if invalid)."""
         return {"ok": True}
 
-    # Market Data Endpoints
+    # Market catalog ------------------------------------------------------
+    @router.get("/markets", dependencies=[Depends(require_auth)])
+    def list_markets() -> Dict[str, Any]:
+        """Every supported market with its rules and current session state."""
+        return {
+            "base_currency": "USD",
+            "fx_rates": _fx_rates(),
+            "markets": [
+                {**market_payload(market), "clock": market_clock(market)}
+                for market in MARKETS.all()
+            ],
+        }
+
+    # Market Data Endpoints ----------------------------------------------
     @router.get("/market/bars", dependencies=[Depends(require_auth)])
-    def get_bars(symbol: str = "SPY", timeframe: str = "15m") -> List[Dict[str, Any]]:
+    def get_bars(
+        symbol: str = "SPY", timeframe: str = "15m", market: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         # Fetch multi-timeframe candles with in-memory TTL caching.
         # Never fabricate candles: an empty list tells the client data is unavailable.
-        sym = _normalize_symbol(symbol)
+        sym = _normalize_symbol(symbol, market)
         tf = _normalize_timeframe(timeframe)
         if hasattr(actual_feed, "get_bars"):
             bars = actual_feed.get_bars(sym, timeframe=tf)
@@ -119,32 +185,36 @@ def create_api_router(
         return ModelFeatureExporter.to_records(bars or [])
 
     @router.get("/market/tickers", dependencies=[Depends(require_auth)])
-    def get_tickers() -> List[Dict[str, Any]]:
-        nonlocal _cached_tickers, _cached_tickers_ts
-        now = time.time()
-        if _cached_tickers and (now - _cached_tickers_ts < _tickers_ttl):
-            # Instant memory return with thread-safe copy and updated tick prices
-            fresh_tickers: List[Dict[str, Any]] = []
-            for item in _cached_tickers:
+    def get_tickers(market: str = "US") -> List[Dict[str, Any]]:
+        """Catalog quotes for one market, with a short shared cache."""
+        code = _normalize_market(market)
+        market_def = MARKETS.require(code)
+
+        cached = _tickers_cache.get(code)
+        if cached and (time.time() - cached[0] < _tickers_ttl):
+            fresh: List[Dict[str, Any]] = []
+            for item in cached[1]:
                 sym = item["symbol"]
-                q = getattr(actual_feed, "latest_quotes", {}).get(sym)
-                last_p = getattr(actual_feed, "last_trade_prices", {}).get(sym)
-                current_p = q.last if (q and q.last > 0) else (last_p if (last_p and last_p > 0) else item["price"])
-                open_p = item.get("openPrice") or current_p
+                q = actual_feed.get_latest_quote(sym)
+                current_p = q.last if (q and q.last > 0) else item["price"]
+                prev = (q.prev_close if q and q.prev_close else None) or item.get("openPrice") or current_p
                 copy_item = dict(item)
                 copy_item["price"] = current_p
-                copy_item["priceChange"] = round(current_p - open_p, 2)
-                copy_item["priceChangePercent"] = round(((current_p - open_p) / open_p * 100.0) if open_p else 0.0, 2)
-                fresh_tickers.append(copy_item)
-            return fresh_tickers
+                copy_item["priceChange"] = round(current_p - prev, 6)
+                copy_item["priceChangePercent"] = round(
+                    ((current_p - prev) / prev * 100.0) if prev else 0.0, 2
+                )
+                copy_item["lastUpdated"] = int(time.time() * 1000)
+                fresh.append(copy_item)
+            return fresh
 
-        feed_symbols = getattr(actual_feed, "symbols", None)
-        symbols = list(feed_symbols) if feed_symbols else []
-        for s in ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN", "GOOGL", "META", "IWM", "COIN", "PLTR", "NFLX"]:
-            if s not in symbols:
-                symbols.append(s)
+        feed_symbols = getattr(actual_feed, "symbols", None) or []
+        symbols = list(market_def.catalog)
+        for sym in feed_symbols:
+            if market_of(sym).code == code and sym not in symbols:
+                symbols.append(sym)
 
-        tickers = []
+        tickers: List[Dict[str, Any]] = []
         now_ts = int(time.time() * 1000)
 
         for sym in symbols:
@@ -154,57 +224,71 @@ def create_api_router(
             if not last_price:
                 # No live quote and no historical bars: omit instead of inventing a price.
                 continue
-            open_price = bars[0].open if bars else last_price
-            high_24h = max([b.high for b in bars], default=last_price)
-            low_24h = min([b.low for b in bars], default=last_price)
-            vol_24h = sum([b.volume for b in bars]) if bars else 0.0
-            price_change = round(last_price - open_price, 2)
-            pct_change = round((price_change / open_price * 100.0) if open_price else 0.0, 2)
+            prev_close = quote.prev_close if (quote and quote.prev_close) else None
+            open_price = prev_close or (bars[0].open if bars else last_price)
+            high = (quote.day_high if quote and quote.day_high else None) or max(
+                [b.high for b in bars], default=last_price
+            )
+            low = (quote.day_low if quote and quote.day_low else None) or min(
+                [b.low for b in bars], default=last_price
+            )
+            volume = (quote.volume if quote else 0) or (
+                sum([b.volume for b in bars]) if bars else 0.0
+            )
+            price_change = last_price - open_price
+            pct_change = (price_change / open_price * 100.0) if open_price else 0.0
 
             tickers.append({
                 "symbol": sym,
+                "market": code,
+                "currency": quote.currency if quote else market_def.currency,
                 "price": last_price,
-                "priceChange": price_change,
-                "priceChangePercent": pct_change,
-                "high24h": high_24h,
-                "low24h": low_24h,
-                "volume24h": vol_24h,
-                "quoteVolume24h": round(vol_24h * last_price, 2),
+                "priceChange": round(price_change, 6),
+                "priceChangePercent": round(pct_change, 2),
+                "high24h": high,
+                "low24h": low,
+                "volume24h": volume,
+                "quoteVolume24h": round(volume * last_price, 2),
                 "openPrice": open_price,
                 "trades24h": len(bars),
-                "lastUpdated": now_ts
+                "lastUpdated": now_ts,
             })
 
-        _cached_tickers = tickers
-        _cached_tickers_ts = now
+        _tickers_cache[code] = (time.time(), tickers)
         return tickers
 
     @router.get("/market/quote", dependencies=[Depends(require_auth)])
-    def get_quote(symbol: str = "SPY") -> Dict[str, Any]:
-        sym = _normalize_symbol(symbol)
+    def get_quote(symbol: str = "SPY", market: Optional[str] = None) -> Dict[str, Any]:
+        sym = _normalize_symbol(symbol, market)
         quote = actual_feed.get_latest_quote(sym)
         if not quote:
             raise HTTPException(status_code=404, detail=f"Quote not available for {sym}")
         return quote.model_dump(mode="json")
 
     @router.get("/market/clock", dependencies=[Depends(require_auth)])
-    def get_market_clock() -> Dict[str, Any]:
+    def get_market_clock(
+        market: Optional[str] = None, symbol: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Trading-session clock so the UI can tell 'market closed' from 'feed broken'."""
-        clock = broker.get_market_clock()
+        code = market
+        if symbol and not code:
+            ref = resolve_symbol(symbol)
+            code = ref.market.code if ref else None
+        clock = broker.get_market_clock(_normalize_market(code))
         if clock is None:
             raise HTTPException(status_code=503, detail="Broker clock unavailable")
         return clock
 
     @router.get("/market/model-context", dependencies=[Depends(require_auth)])
-    def get_model_context(symbol: str = "SPY") -> Dict[str, Any]:
+    def get_model_context(symbol: str = "SPY", market: Optional[str] = None) -> Dict[str, Any]:
         """Provides AI/Quant model ready market summary and technical indicators."""
-        sym = _normalize_symbol(symbol)
+        sym = _normalize_symbol(symbol, market)
         quote = actual_feed.get_latest_quote(sym)
         bars = actual_feed.get_historical_bars(sym)
         position = broker.get_position(sym)
         return ModelFeatureExporter.format_agent_market_context(sym, quote, bars, position)
 
-    # Portfolio & Orders Endpoints
+    # Portfolio & Orders Endpoints ---------------------------------------
     @router.get("/portfolio", dependencies=[Depends(require_auth)])
     def get_portfolio() -> Dict[str, Any]:
         try:
@@ -212,7 +296,9 @@ def create_api_router(
         except Exception as exc:
             # Never fabricate an account balance when the broker is unreachable.
             raise HTTPException(status_code=503, detail=f"Broker unavailable: {exc}")
+        fx_rates = p.fx_rates or {"USD": 1.0}
         return {
+            "base_currency": "USD",
             "cash": p.cash,
             "initial_capital": p.initial_capital,
             "market_value": p.market_value,
@@ -221,25 +307,22 @@ def create_api_router(
             "unrealized_pnl": p.unrealized_pnl,
             "total_pnl": p.total_pnl,
             "total_pnl_pct": p.total_pnl_pct,
+            "fx_rates": fx_rates,
             "positions": {
-                sym: {
-                    "symbol": pos.symbol,
-                    "quantity": pos.quantity,
-                    "avg_cost": pos.avg_cost,
-                    "current_price": pos.current_price,
-                    "market_value": pos.market_value,
-                    "unrealized_pnl": pos.unrealized_pnl,
-                    "unrealized_pnl_pct": pos.unrealized_pnl_pct
-                }
+                sym: _position_payload(pos, fx_rates)
                 for sym, pos in p.positions.items()
                 if pos.quantity > 0
-            }
+            },
         }
 
     @router.post("/portfolio/reset", dependencies=[Depends(require_auth)])
     def reset_portfolio(req: ResetRequest):
         broker.reset(req.initial_capital)
-        return {"status": "reset", "initial_capital": req.initial_capital}
+        return {
+            "status": "reset",
+            "initial_capital": req.initial_capital,
+            "base_currency": "USD",
+        }
 
     @router.get("/orders", dependencies=[Depends(require_auth)])
     def list_orders() -> List[Dict[str, Any]]:
@@ -248,14 +331,15 @@ def create_api_router(
 
     @router.post("/orders", dependencies=[Depends(require_auth)])
     def submit_order(req: OrderRequest) -> Dict[str, Any]:
+        sym = _normalize_symbol(req.symbol, req.market)
         try:
             # Sync latest quote before submitting
-            quote = actual_feed.get_latest_quote(req.symbol)
+            quote = actual_feed.get_latest_quote(sym)
             if quote:
                 broker.on_quote(quote)
 
             order = broker.submit_order(
-                symbol=req.symbol,
+                symbol=sym,
                 side=req.side,
                 order_type=req.order_type,
                 quantity=req.quantity,
