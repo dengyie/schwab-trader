@@ -10,6 +10,7 @@ import { OrdersPage } from './pages/OrdersPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { AuthPage } from './pages/AuthPage';
 import { useAuthStore } from './store/authStore';
+import { useMarketsStore } from './store/marketsStore';
 
 // Private Route Component
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
@@ -30,6 +31,12 @@ function AuthPageWrapper() {
 export function App() {
   const location = useLocation();
   const { isAuthenticated } = useAuthStore();
+  const loadMarkets = useMarketsStore((s) => s.loadMarkets);
+
+  // 市场注册表（币种/每手/最小跳动/涨跌停/时段）是全局唯一来源，登录后拉取一次。
+  useEffect(() => {
+    if (isAuthenticated) void loadMarkets();
+  }, [isAuthenticated, loadMarkets]);
 
   // A 401 from any API call clears the token; reflect that immediately.
   useEffect(() => {

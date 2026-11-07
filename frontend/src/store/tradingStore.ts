@@ -18,6 +18,7 @@ import type {
 import type { OrderBook } from '../types/market';
 import { useWalletStore } from './walletStore';
 import { useMarketStore } from './marketStore';
+import { useMarketsStore, marketCodeOfSymbol } from './marketsStore';
 import { notification } from './notificationStore';
 import { apiFetch } from '../services/apiClient';
 
@@ -166,8 +167,21 @@ export const useTradingStore = create<TradingState>()(
           if (needsLimitPrice && (!price || parseFloat(price) <= 0)) return null;
           if (needsTriggerPrice && (!triggerPrice || parseFloat(triggerPrice) <= 0)) return null;
 
+          // 美股由本地钱包 + 撮合镜像管账；港股/日股/A 股的下单簿在后端
+          // 虚拟撮合引擎里，本地 USD 钱包无法结算外币，因此直接交给后端。
+          const marketsState = useMarketsStore.getState();
+          const market = marketCodeOfSymbol(symbol, marketsState.markets);
+          const isDelegated = market !== 'US';
+
+          // 非美股必须整手：100 股的倍数（美股 lot=1 时保持原行为）。
+          const lot = isDelegated ? Math.max(1, marketsState.lotSizeFor(symbol)) : 1;
+          const rawQuantity = parseFloat(quantity);
+          const execQuantity = lot > 1 ? Math.floor(rawQuantity / lot) * lot : Math.round(rawQuantity);
+          if (!(execQuantity > 0)) return null;
+          const quantityText = String(execQuantity);
+
           const baseAsset = symbol.replace('USDT', '');
-          const quoteAsset = 'USD';
+          const quoteAsset = isDelegated ? marketsState.currencyOf(symbol) : 'USD';
           let requiredAmount: string;
           let assetToCheck: string;
 
@@ -175,23 +189,26 @@ export const useTradingStore = create<TradingState>()(
           if (side === 'buy') {
             assetToCheck = quoteAsset;
             if (needsLimitPrice) {
-              requiredAmount = new Decimal(price!).times(quantity).toFixed(8);
+              requiredAmount = new Decimal(price!).times(quantityText).toFixed(8);
             } else if (needsTriggerPrice && triggerPrice) {
               // For stop/TP market orders, use trigger price as estimate
-              requiredAmount = new Decimal(triggerPrice).times(quantity).times(1.05).toFixed(8);
+              requiredAmount = new Decimal(triggerPrice).times(quantityText).times(1.05).toFixed(8);
             } else {
               const mPrice = currentMarketPrice || useMarketStore.getState().metrics?.mid || '100.0';
-              requiredAmount = new Decimal(mPrice).times(quantity).times(1.05).toFixed(8);
+              requiredAmount = new Decimal(mPrice).times(quantityText).times(1.05).toFixed(8);
             }
           } else {
             assetToCheck = baseAsset;
-            requiredAmount = quantity;
+            requiredAmount = quantityText;
           }
 
-          const balance = walletStore.getBalance(assetToCheck);
-          if (!balance || new Decimal(balance.available).lt(requiredAmount)) {
-            notification.error(`order:balance:${Date.now()}`, 'INSUFFICIENT_MARGIN: Order rejected by engine');
-            return null;
+          // 只有美股在这里做本地余额校验，外币账户由后端统一记账。
+          if (!isDelegated) {
+            const balance = walletStore.getBalance(assetToCheck);
+            if (!balance || new Decimal(balance.available).lt(requiredAmount)) {
+              notification.error(`order:balance:${Date.now()}`, 'INSUFFICIENT_MARGIN: Order rejected by engine');
+              return null;
+            }
           }
 
           const now = Date.now();
@@ -201,7 +218,7 @@ export const useTradingStore = create<TradingState>()(
             clientOrderId: uuidv4(),
             symbol, side, type,
             price: needsLimitPrice ? price! : null,
-            quantity, filledQty: '0', avgPrice: '0',
+            quantity: quantityText, filledQty: '0', avgPrice: '0',
             status: isConditional ? 'open' : 'pending', 
             createdAt: now, updatedAt: now,
             fills: [], takeProfitPrice, stopLossPrice,
@@ -214,7 +231,7 @@ export const useTradingStore = create<TradingState>()(
           set((state) => ({ orders: [order, ...state.orders] }));
 
           // For conditional orders, freeze balance immediately but don't try to match
-          if (isConditional) {
+          if (isConditional && !isDelegated) {
             setTimeout(() => {
               const walletState = useWalletStore.getState();
               let freezeAmount: string;
@@ -244,6 +261,7 @@ export const useTradingStore = create<TradingState>()(
           }
 
           // Regular order processing
+          if (!isDelegated) {
           setTimeout(() => {
             const currentState = get();
             const walletState = useWalletStore.getState();
@@ -275,6 +293,7 @@ export const useTradingStore = create<TradingState>()(
             const ms = useMarketStore.getState();
             if (ms.orderBook && ms.orderBook.symbol === order.symbol) get().updateOrderBookForMatching(ms.orderBook);
           }, SIMULATED_DELAY_MIN_MS + Math.random() * (SIMULATED_DELAY_MAX_MS - SIMULATED_DELAY_MIN_MS));
+          }
 
           // Submit order to FastAPI matching engine / Alpaca broker
           try {
@@ -285,9 +304,11 @@ export const useTradingStore = create<TradingState>()(
                 symbol: symbol.replace('/USD', '').replace('USDT', ''),
                 side: side.toUpperCase(),
                 order_type: type === 'limit' ? 'LIMIT' : (type.includes('stop') ? 'STOP' : 'MARKET'),
-                quantity: Math.max(1, Math.round(parseFloat(quantity))),
+                quantity: execQuantity,
                 price: price ? parseFloat(price) : undefined,
                 stop_price: triggerPrice ? parseFloat(triggerPrice) : undefined,
+                // 裸数字代码（如 "0700"）需要市场提示；带后缀的规范符号后端可自行解析。
+                market,
               }),
             })
               .then(async (res) => {
@@ -299,6 +320,26 @@ export const useTradingStore = create<TradingState>()(
                       orders: s.orders.map(o => o.clientOrderId === order.clientOrderId ? { ...o, backendId } : o)
                     }));
                   }
+                  // 外币订单的持仓/现金由后端变更，立即拉一次快照回填。
+                  if (isDelegated) {
+                    void get().fetchOrders();
+                    void useWalletStore.getState().fetchPortfolio();
+                  }
+                } else if (isDelegated) {
+                  // 后端拒绝（整手/涨跌停/休市）必须让用户看到，而不是静默成功。
+                  let reason = '';
+                  try {
+                    const err = await res.json();
+                    reason = typeof err?.detail === 'string' ? err.detail : JSON.stringify(err?.detail ?? err);
+                  } catch {
+                    reason = `HTTP ${res.status}`;
+                  }
+                  notification.error(`order:reject:${order.clientOrderId}`, `ORDER_REJECTED: ${reason}`);
+                  set((s) => ({
+                    orders: s.orders.map(o => o.clientOrderId === order.clientOrderId
+                      ? { ...o, status: 'rejected', rejectReason: reason, updatedAt: Date.now() }
+                      : o),
+                  }));
                 }
               })
               .catch(() => {});
@@ -990,6 +1031,9 @@ export const useTradingStore = create<TradingState>()(
                 unrealizedPnl: String(pos.unrealized_pnl || 0),
                 realizedPnl: '0',
                 updatedAt: Date.now(),
+                // 后端按持仓所在市场给出币种，持仓表据此格式化金额。
+                market: pos.market,
+                currency: pos.currency,
               });
             } else {
               newPositions.delete(sym);

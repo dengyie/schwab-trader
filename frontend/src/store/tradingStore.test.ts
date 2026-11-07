@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { useTradingStore } from './tradingStore';
 import { useWalletStore } from './walletStore';
 import { useMarketStore } from './marketStore';
+import { useMarketsStore } from './marketsStore';
 
 describe('TradingStore - Order Freeze & Cancellation', () => {
   beforeEach(() => {
@@ -182,5 +183,88 @@ describe('TradingStore - Order Freeze & Cancellation', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe('TradingStore - non-US orders are delegated to the backend', () => {
+  let requested: Array<{ url: string; body: any }> = [];
+
+  beforeEach(() => {
+    requested = [];
+    useWalletStore.getState().resetWallet();
+    useWalletStore.getState().syncFromBackendPortfolio({ cash: 100000, total_equity: 100000 });
+    useTradingStore.setState({ orders: [], positions: new Map(), ocoOrders: [] });
+    useMarketStore.setState({
+      dataConfidence: {
+        level: 'live',
+        canTrade: true,
+        canTrustMetrics: true,
+        lastLiveTime: Date.now(),
+        degradedSince: 0,
+        details: {
+          wsConnected: true,
+          sequenceContinuous: true,
+          latencyOk: true,
+          updateFrequencyOk: true,
+          queueHealthy: true,
+        },
+      },
+      metrics: { mid: '419.80' } as any,
+    });
+    // 市场注册表：港股每手 100 股、币种 HKD。
+    useMarketsStore.setState({
+      markets: [
+        {
+          code: 'HK', name: 'Hong Kong', currency: 'HKD', timezone: 'Asia/Hong_Kong',
+          exchange: 'HKEX', sessions: [], lot_size: 100, settlement: 'T+0', suffix: '.HK',
+          price_limit_pct: null, decimals: 2, catalog: ['0700.HK'],
+        },
+      ],
+      status: 'ready',
+    });
+
+    globalThis.fetch = async (url: any, init?: any) => {
+      requested.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      return { ok: true, json: async () => ({ order_id: 'hk_1', status: 'OPEN' }) } as any;
+    };
+  });
+
+  it('sends the market hint and lot-rounded quantity instead of a USD order', () => {
+    const order = useTradingStore.getState().createOrder({
+      symbol: '0700.HK',
+      side: 'buy',
+      type: 'limit',
+      price: '419.80',
+      quantity: '250',
+    }, '419.80');
+
+    expect(order).toBeDefined();
+    const submit = requested.find((r) => r.url.includes('/orders'));
+    expect(submit).toBeDefined();
+    expect(submit!.body.market).toBe('HK');
+    expect(submit!.body.symbol).toBe('0700.HK');
+    // 250 股向上/向下都必须是 100 的整数倍 -> 200
+    expect(submit!.body.quantity).toBe(200);
+  });
+
+  it('does not freeze the USD wallet for a foreign-currency order', () => {
+    const before = useWalletStore.getState().getBalance('USD');
+    useTradingStore.getState().createOrder({
+      symbol: '0700.HK', side: 'buy', type: 'limit', price: '419.80', quantity: '100',
+    }, '419.80');
+
+    const after = useWalletStore.getState().getBalance('USD');
+    // 港币订单由后端虚拟撮合引擎结算，本地 USD 钱包不能被占用。
+    expect(parseFloat(after!.frozen)).toBe(parseFloat(before!.frozen));
+    expect(parseFloat(after!.available)).toBe(parseFloat(before!.available));
+  });
+
+  it('rejects a quantity below one board lot', () => {
+    const order = useTradingStore.getState().createOrder({
+      symbol: '0700.HK', side: 'buy', type: 'limit', price: '419.80', quantity: '50',
+    }, '419.80');
+
+    expect(order).toBeNull();
+    expect(requested.find((r) => r.url.includes('/orders'))).toBeUndefined();
   });
 });
