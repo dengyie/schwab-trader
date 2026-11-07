@@ -7,6 +7,8 @@ currency fills through the ledger's FX conversion.
 """
 from __future__ import annotations
 
+import logging
+import threading
 import uuid
 from typing import Callable, Dict, List, Optional
 
@@ -30,6 +32,12 @@ from app.models.trading import (
 )
 from app.engine.portfolio_ledger import PortfolioLedger
 from app.engine.base_broker import BaseBroker
+from app.engine.state_store import JsonStateStore
+
+logger = logging.getLogger(__name__)
+
+# Bump when the snapshot layout changes incompatibly; older files are ignored.
+STATE_VERSION = 1
 
 
 class VirtualMatchingEngine(BaseBroker):
@@ -41,6 +49,7 @@ class VirtualMatchingEngine(BaseBroker):
         fx=None,
         enforce_sessions: bool = False,
         enforce_sessions_for: frozenset | None = None,
+        state_store: Optional[JsonStateStore] = None,
     ):
         self.ledger = ledger
         self.default_slippage_bps = default_slippage_bps
@@ -52,6 +61,77 @@ class VirtualMatchingEngine(BaseBroker):
         self.orders: Dict[str, Order] = {}
         self.latest_quotes: Dict[str, Quote] = {}
         self.fill_listeners: List[Callable[[Trade, Order], None]] = []
+        # Snapshot of the book across process restarts (None = in-memory only).
+        self._store = state_store
+        self._state_lock = threading.RLock()
+        self._dirty = False
+        self._restore()
+
+    # -- persistence ------------------------------------------------------
+    def _restore(self) -> None:
+        """Rebuild the book from the last snapshot, if one exists."""
+        if self._store is None:
+            return
+        try:
+            snapshot = self._store.load()
+        except Exception as exc:  # never let a bad snapshot stop the service
+            logger.warning("Virtual book restore skipped: %s", exc)
+            return
+        if not snapshot:
+            return
+        if snapshot.get("version") != STATE_VERSION:
+            logger.warning(
+                "Virtual book snapshot version %r != %s; starting empty",
+                snapshot.get("version"), STATE_VERSION,
+            )
+            return
+        try:
+            portfolio = snapshot.get("portfolio")
+            if portfolio:
+                self.ledger.portfolio = Portfolio.model_validate(portfolio)
+                self.ledger.portfolio.positions = {
+                    str(sym).upper(): pos
+                    for sym, pos in self.ledger.portfolio.positions.items()
+                }
+            self.ledger.trades = [
+                Trade.model_validate(t) for t in snapshot.get("trades", [])
+            ]
+            self.orders = {
+                order.order_id: order
+                for order in (
+                    Order.model_validate(o) for o in snapshot.get("orders", [])
+                )
+            }
+        except Exception as exc:
+            # A structurally invalid snapshot is worse than none: keep the
+            # process alive on a clean book instead of failing every request.
+            logger.warning("Virtual book snapshot rejected: %s", exc)
+            self.orders = {}
+            return
+        logger.info(
+            "Virtual book restored: %d positions, %d orders, %d trades",
+            len(self.ledger.portfolio.positions), len(self.orders), len(self.ledger.trades),
+        )
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+
+    def _flush(self) -> None:
+        """Write the book if it changed since the last successful save."""
+        if self._store is None or not self._dirty:
+            return
+        with self._state_lock:
+            if not self._dirty:
+                return
+            snapshot = {
+                "version": STATE_VERSION,
+                "saved_at": utc_now().isoformat(),
+                "portfolio": self.ledger.portfolio.model_dump(mode="json"),
+                "trades": [t.model_dump(mode="json") for t in self.ledger.trades],
+                "orders": [o.model_dump(mode="json") for o in self.orders.values()],
+            }
+            if self._store.save(snapshot):
+                self._dirty = False
 
     # -- reads ------------------------------------------------------------
     def get_portfolio(self) -> Portfolio:
@@ -71,6 +151,8 @@ class VirtualMatchingEngine(BaseBroker):
         self.ledger.reset(initial_capital)
         self.orders.clear()
         self.latest_quotes.clear()
+        self._mark_dirty()
+        self._flush()
 
     def register_fill_listener(self, listener: Callable[[Trade, Order], None]) -> None:
         self.fill_listeners.append(listener)
@@ -134,9 +216,12 @@ class VirtualMatchingEngine(BaseBroker):
             currency=market.currency,
         )
         self.orders[order.order_id] = order
+        self._mark_dirty()
 
         if quote:
             self._try_match_order(order, quote)
+
+        self._flush()
 
         return order
 
@@ -147,6 +232,8 @@ class VirtualMatchingEngine(BaseBroker):
         if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
             order.status = OrderStatus.CANCELLED
             order.updated_at = utc_now()
+            self._mark_dirty()
+            self._flush()
         return order
 
     def on_quote(self, quote: Quote) -> List[Trade]:
@@ -172,6 +259,9 @@ class VirtualMatchingEngine(BaseBroker):
             trade = self._try_match_order(order, quote)
             if trade:
                 generated_trades.append(trade)
+
+        # Quotes arrive continuously; only touch the disk when the book moved.
+        self._flush()
 
         return generated_trades
 
@@ -202,6 +292,7 @@ class VirtualMatchingEngine(BaseBroker):
             if order.price is None:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = "Limit order requires price"
+                self._mark_dirty()
                 return None
 
             if order.side == OrderSide.BUY and quote.last <= order.price:
@@ -213,6 +304,7 @@ class VirtualMatchingEngine(BaseBroker):
             if order.stop_price is None:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = "Stop order requires stop_price"
+                self._mark_dirty()
                 return None
 
             if order.side == OrderSide.BUY and quote.last >= order.stop_price:
@@ -244,6 +336,7 @@ class VirtualMatchingEngine(BaseBroker):
                 order.filled_avg_price = fill_price
                 order.status = OrderStatus.FILLED
                 order.updated_at = utc_now()
+                self._mark_dirty()
 
                 for listener in self.fill_listeners:
                     try:
@@ -255,6 +348,7 @@ class VirtualMatchingEngine(BaseBroker):
             order.status = OrderStatus.REJECTED
             order.reject_reason = "Insufficient buying power or invalid position"
             order.updated_at = utc_now()
+            self._mark_dirty()
 
         return None
 

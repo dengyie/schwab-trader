@@ -68,6 +68,15 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("FX_ENABLED", "1") not in ("0", "false", "False")
     )
 
+    # Where the virtual (HK / JP / CN) book is persisted between restarts.
+    # Resolved relative to the backend working directory; the deploy keeps this
+    # directory out of its rsync --delete swap and hands it to the service user,
+    # so positions, cash and working orders survive a release.
+    # Empty string disables persistence (used by the hermetic test suite).
+    state_dir: str = Field(
+        default_factory=lambda: os.getenv("STATE_DIR", "data")
+    )
+
     # Default tracked tickers
     default_symbols: List[str] = [
         "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA",

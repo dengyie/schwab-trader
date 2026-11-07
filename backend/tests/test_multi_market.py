@@ -496,3 +496,133 @@ class TestPositionMarkGuard:
 
         assert decorated.last == 328.06
         assert decorated.day_high == 345.765
+
+
+class TestVirtualBookPersistence:
+    """The HK / JP / CN book is matched in-process, so it must survive a
+    restart; the US book keeps living at Alpaca."""
+
+    def _engine(self, fx, directory):
+        from app.engine.state_store import JsonStateStore
+
+        ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+        return VirtualMatchingEngine(
+            ledger=ledger,
+            default_slippage_bps=0.0,
+            default_commission_per_order=0.0,
+            fx=fx,
+            enforce_sessions=False,
+            state_store=JsonStateStore(str(directory), filename="book.json"),
+        )
+
+    def test_filled_position_survives_a_restart(self, fx, tmp_path):
+        first = self._engine(fx, tmp_path)
+        first.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+        first.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+        cash_after_buy = first.get_portfolio().cash
+
+        second = self._engine(fx, tmp_path)
+        pos = second.get_position("0700.HK")
+
+        assert pos is not None
+        assert pos.quantity == 100
+        assert pos.market == "HK"
+        assert pos.currency == "HKD"
+        # Cash spent must not come back on restart.
+        assert second.get_portfolio().cash == pytest.approx(cash_after_buy)
+
+    def test_working_limit_order_fills_after_restart(self, fx, tmp_path):
+        first = self._engine(fx, tmp_path)
+        order = first.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=500.0
+        )
+        assert order.status == OrderStatus.PENDING
+
+        second = self._engine(fx, tmp_path)
+        restored = second.get_order(order.order_id)
+        assert restored is not None
+        assert restored.status == OrderStatus.PENDING
+
+        trades = second.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+        assert len(trades) == 1
+        assert second.get_order(order.order_id).status == OrderStatus.FILLED
+
+    def test_cancel_is_persisted(self, fx, tmp_path):
+        first = self._engine(fx, tmp_path)
+        order = first.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=1.0
+        )
+        first.cancel_order(order.order_id)
+
+        second = self._engine(fx, tmp_path)
+        assert second.get_order(order.order_id).status == OrderStatus.CANCELLED
+
+    def test_trade_history_is_reloaded(self, fx, tmp_path):
+        first = self._engine(fx, tmp_path)
+        first.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+        first.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+
+        second = self._engine(fx, tmp_path)
+        assert len(second.get_orders()) == 1
+        assert len(second.ledger.trades) == 1
+        assert second.ledger.trades[0].symbol == "0700.HK"
+
+    def test_reset_clears_the_persisted_book(self, fx, tmp_path):
+        first = self._engine(fx, tmp_path)
+        first.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+        first.reset(100000.0)
+
+        second = self._engine(fx, tmp_path)
+        assert second.get_orders() == []
+        assert second.get_portfolio().positions == {}
+
+    def test_corrupt_snapshot_is_quarantined_not_fatal(self, fx, tmp_path):
+        (tmp_path / "book.json").write_text("{$not json", encoding="utf-8")
+
+        engine = self._engine(fx, tmp_path)  # must not raise
+
+        assert engine.get_portfolio().cash == pytest.approx(100000.0)
+        assert engine.get_orders() == []
+        assert any(p.name.startswith("book.corrupt-") for p in tmp_path.iterdir())
+
+    def test_unknown_snapshot_version_is_ignored(self, fx, tmp_path):
+        from app.engine.state_store import JsonStateStore
+
+        JsonStateStore(str(tmp_path), filename="book.json").save(
+            {"version": 999, "portfolio": {"cash": 5.0, "positions": {}}}
+        )
+
+        engine = self._engine(fx, tmp_path)
+
+        assert engine.get_portfolio().cash == pytest.approx(100000.0)
+
+    def test_engine_without_store_writes_nothing(self, fx, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+        engine = VirtualMatchingEngine(ledger=ledger, fx=fx, enforce_sessions=False)
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestAlpacaPositionBasis:
+    def test_parsed_positions_carry_usd_basis_and_market(self):
+        from app.adapters.alpaca_adapter import AlpacaDataAdapter
+
+        portfolio = AlpacaDataAdapter.parse_account_to_portfolio(
+            {"cash": "50000", "equity": "60000"},
+            [
+                {
+                    "symbol": "AAPL",
+                    "qty": "6",
+                    "avg_entry_price": "337.456667",
+                    "current_price": "342.41",
+                }
+            ],
+        )
+
+        pos = portfolio.positions["AAPL"]
+        assert pos.market == "US"
+        assert pos.currency == "USD"
+        assert pos.cost_basis_usd == pytest.approx(6 * 337.456667, rel=1e-9)
+        assert portfolio.unrealized_pnl == pytest.approx(6 * (342.41 - 337.456667), abs=1e-2)
