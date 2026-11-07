@@ -69,13 +69,15 @@ class Settings(BaseModel):
     )
 
     # Where the virtual (HK / JP / CN) book is persisted between restarts.
-    # Resolved relative to the backend working directory; the deploy keeps this
-    # directory out of its rsync --delete swap and hands it to the service user,
-    # so positions, cash and working orders survive a release.
-    # Empty string disables persistence (used by the hermetic test suite).
+    # Unset = resolve a writable directory at startup (see resolve_state_dir);
+    # "off" disables persistence (used by the hermetic test suite).
     state_dir: str = Field(
-        default_factory=lambda: os.getenv("STATE_DIR", "data")
+        default_factory=lambda: os.getenv("STATE_DIR", "")
     )
+
+    @property
+    def state_persist_enabled(self) -> bool:
+        return self.state_dir.strip().lower() not in ("off", "none", "0", "false")
 
     # Default tracked tickers
     default_symbols: List[str] = [
