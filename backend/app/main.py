@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import parse_qsl, urlencode
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -179,6 +180,51 @@ app.include_router(create_api_router(broker, feed))
 
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 WS_AUTH_TIMEOUT_SEC = 5.0
+LEGACY_TOKEN_KEY = "ws.legacy_query_token"
+
+
+class LegacyQueryTokenMiddleware:
+    """Hide the legacy ``?token=`` credential from the access log.
+
+    uvicorn logs ``get_path_with_query_string(scope)`` once per handshake, so a
+    tab still running the pre-AUTH bundle keeps writing the admin token to
+    journald. Routing only uses ``scope["path"]``, so the token is moved into a
+    scoped key here: the endpoint reads it through ``_legacy_query_token`` and
+    the access log shows a bare ``/ws``.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "websocket":
+            await self.app(scope, receive, send)
+            return
+
+        params = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+        tokens = [value for key, value in params if key == "token"]
+        if not tokens:
+            await self.app(scope, receive, send)
+            return
+
+        rest = [(key, value) for key, value in params if key != "token"]
+        scrubbed = dict(scope)
+        scrubbed["query_string"] = urlencode(rest).encode("latin-1")
+        scrubbed.setdefault("state", {})
+        scrubbed["state"][LEGACY_TOKEN_KEY] = tokens[0]
+        await self.app(scrubbed, receive, send)
+
+
+def _legacy_query_token(websocket: WebSocket) -> str | None:
+    """Scoped token re-applied by the middleware, or the raw query outside it."""
+    state = websocket.scope.get("state") or {}
+    if LEGACY_TOKEN_KEY in state:
+        return state[LEGACY_TOKEN_KEY]
+    return websocket.query_params.get("token")
+
+
+# Strip the legacy ?token= before uvicorn logs the scope.
+app.add_middleware(LegacyQueryTokenMiddleware)
 
 
 def _clean_symbol(value: object) -> str | None:
@@ -234,7 +280,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # accept() itself failed; nothing was registered, so nothing to clean up.
         return
 
-    query_token = websocket.query_params.get("token")
+    query_token = _legacy_query_token(websocket)
     authenticated = bool(query_token) and token_matches(query_token)
     if query_token and not authenticated:
         logger.warning("WebSocket rejected: invalid query token")
