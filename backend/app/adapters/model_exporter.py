@@ -108,7 +108,14 @@ class ModelFeatureExporter:
                 "bid": quote.bid if quote else None,
                 "ask": quote.ask if quote else None,
                 "last": quote.last if quote else latest_close,
-                "spread": round(quote.ask - quote.bid, 4) if quote else None,
+                # No two-sided book means no observable spread. Reporting
+                # 0 - 0 = 0 would read as a perfectly tight market.
+                "spread": (
+                    round(quote.ask - quote.bid, 4)
+                    if quote and quote.bid > 0 and quote.ask > 0
+                    else None
+                ),
+                "book_available": bool(quote.book_available) if quote else False,
                 "timestamp": quote.timestamp.isoformat() if quote else None
             },
             "technical_indicators": {
