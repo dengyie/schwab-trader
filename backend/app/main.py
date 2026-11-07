@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -127,9 +128,28 @@ feed.subscribe_trade(on_feed_trade)
 broker.register_fill_listener(on_order_fill)
 
 
+def _configure_logging() -> None:
+    """Make app loggers reach journald.
+
+    uvicorn only configures its own ``uvicorn.*`` loggers, so the root logger
+    keeps no handler and stdlib emits nothing below WARNING: every
+    ``logger.info`` in this app was silently dropped in production.
+    """
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(levelname)s [%(name)s] %(message)s"
+        ))
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _main_loop
+    _configure_logging()
     _main_loop = asyncio.get_running_loop()
     # Startup: Launch market feed loop
     await feed.start()
@@ -157,16 +177,20 @@ app.add_middleware(
 app.include_router(create_api_router(broker, feed))
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    # Authenticate before accepting: the browser passes the token as ?token=...
-    if not token_matches(websocket.query_params.get("token")):
-        await websocket.close(code=1008)
-        return
+_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+WS_AUTH_TIMEOUT_SEC = 5.0
 
-    await ws_manager.connect(websocket)
 
-    # Send initial portfolio snapshot upon connection (off the event loop)
+def _clean_symbol(value: object) -> str | None:
+    """Only real ticker shapes may reach the feed or broker from a socket."""
+    if not isinstance(value, str):
+        return None
+    sym = value.strip().upper()
+    return sym if _SYMBOL_RE.match(sym) else None
+
+
+async def _send_portfolio_snapshot(websocket: WebSocket) -> None:
+    """Send the initial snapshot; a broker hiccup must not tear the socket down."""
     try:
         p = await asyncio.to_thread(broker.get_portfolio)
         await websocket.send_json({
@@ -192,6 +216,60 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as exc:
         logger.warning("Initial portfolio snapshot unavailable: %s", exc)
 
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Authenticate before streaming.
+
+    A browser worker can only pass the token in the URL (it cannot set headers
+    on a WebSocket), and that URL lands verbatim in the uvicorn access log.
+    Clients therefore authenticate with a first ``{"action": "AUTH",
+    "token": ...}`` frame; the legacy ``?token=`` query parameter is still
+    honored so a tab running an older bundle keeps working across a deploy.
+    Both paths use the same constant-time comparison.
+    """
+    try:
+        await ws_manager.connect(websocket)
+    except Exception:
+        # accept() itself failed; nothing was registered, so nothing to clean up.
+        return
+
+    query_token = websocket.query_params.get("token")
+    authenticated = bool(query_token) and token_matches(query_token)
+    if query_token and not authenticated:
+        logger.warning("WebSocket rejected: invalid query token")
+        await ws_manager.close(websocket, code=4401, reason="unauthorized")
+        return
+
+    auth_via = "query"
+    if not authenticated:
+        try:
+            first = json.loads(
+                await asyncio.wait_for(
+                    websocket.receive_text(), timeout=WS_AUTH_TIMEOUT_SEC
+                )
+            )
+        except Exception:
+            first = None
+        if not (
+            isinstance(first, dict)
+            and first.get("action") == "AUTH"
+            and token_matches(first.get("token"))
+        ):
+            logger.warning("WebSocket rejected: missing or invalid AUTH frame")
+            await ws_manager.close(websocket, code=4401, reason="unauthorized")
+            return
+        auth_via = "frame"
+
+    logger.info(
+        "WebSocket connected (auth via %s, clients=%d)",
+        auth_via,
+        len(ws_manager.active_connections),
+    )
+    # Only now may this socket receive a single byte.
+    ws_manager.mark_authenticated(websocket)
+    await _send_portfolio_snapshot(websocket)
+
     try:
         while True:
             text = await websocket.receive_text()
@@ -199,10 +277,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = json.loads(text)
             except Exception:
                 continue
+            # Valid JSON is not necessarily an object; a bare list/string would
+            # otherwise raise on msg.get() and leak the connection.
+            if not isinstance(msg, dict):
+                continue
 
             action = msg.get("action")
+            if action == "AUTH":
+                # Already authenticated to get here; a repeat frame (or a
+                # handshake racing the snapshot) is an ack, not an error.
+                await websocket.send_json({"type": "AUTH_OK"})
+                continue
+
             if action == "SUBSCRIBE":
-                sym = msg.get("symbol", "SPY")
+                sym = _clean_symbol(msg.get("symbol", "SPY"))
+                if not sym:
+                    await websocket.send_json({
+                        "type": "SUBSCRIBE_ERROR", "error": "invalid symbol"
+                    })
+                    continue
                 ws_manager.subscribe(websocket, sym)
                 # Send immediate latest quote (off the event loop)
                 q = await asyncio.to_thread(feed.get_latest_quote, sym)
@@ -210,19 +303,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "QUOTE_UPDATE", "data": q.model_dump(mode="json")})
 
             elif action == "UNSUBSCRIBE":
-                sym = msg.get("symbol")
+                sym = _clean_symbol(msg.get("symbol"))
                 if sym:
                     ws_manager.unsubscribe(websocket, sym)
 
             elif action == "SUBMIT_ORDER":
                 try:
-                    q = await asyncio.to_thread(feed.get_latest_quote, msg["symbol"])
+                    sym = _clean_symbol(msg.get("symbol"))
+                    if not sym:
+                        raise ValueError("invalid symbol")
+                    q = await asyncio.to_thread(feed.get_latest_quote, sym)
                     if q:
                         broker.on_quote(q)
 
                     ord_obj = await asyncio.to_thread(
                         broker.submit_order,
-                        symbol=msg["symbol"],
+                        symbol=sym,
                         side=OrderSide(msg["side"]),
                         order_type=OrderType(msg["order_type"]),
                         quantity=int(msg["quantity"]),
@@ -238,6 +334,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
+    except Exception as exc:
+        # A malformed frame, a send error or a client that vanished must still
+        # run cleanup; otherwise the connection leaks in active_connections.
+        logger.warning("WebSocket session ended unexpectedly: %s", exc)
+        ws_manager.disconnect(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # Mount Production Frontend SPA if dist folder exists

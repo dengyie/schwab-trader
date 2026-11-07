@@ -14,13 +14,20 @@ import type {
 } from '../types/market';
 
 // ===== Configuration =====
-// Workers cannot access localStorage, so the token is delivered with SUBSCRIBE.
+// Workers cannot access localStorage, so the token arrives with the first
+// outbound frame (AUTH), never in the WebSocket URL.
 let authToken: string | null = null;
 
 function getWsUrl(): string {
   const protocol = self.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const base = `${protocol}//${self.location.host}/ws`;
-  return authToken ? `${base}?token=${encodeURIComponent(authToken)}` : base;
+  // The token must never ride in the URL: uvicorn writes the full request path
+  // to its access log. Authentication travels as the first in-band frame.
+  return `${protocol}//${self.location.host}/ws`;
+}
+
+function sendAuth(websocket: WebSocket): void {
+  if (!authToken) return;
+  websocket.send(JSON.stringify({ action: 'AUTH', token: authToken }));
 }
 
 function authHeaders(): Record<string, string> {
@@ -385,8 +392,9 @@ async function connect(symbol: string): Promise<void> {
         log('info', 'ws', 'ws.connected', { symbol });
         sendConnectionStatus();
         
-        // Subscribe to backend stream
+        // Authenticate first, then subscribe to the backend stream.
         try {
+          sendAuth(ws!);
           ws?.send(JSON.stringify({ action: 'SUBSCRIBE', symbol }));
         } catch {}
 
@@ -456,7 +464,9 @@ async function connect(symbol: string): Promise<void> {
           stopHeartbeat();
           return;
         }
-        
+
+        if (handleAuthRejection(event.code, event.reason)) return;
+
         addNetworkEvent('disconnected', `code: ${event.code}`, event.code);
         log('warn', 'ws', 'ws.disconnected', { 
           code: event.code, 
@@ -625,6 +635,19 @@ function checkBackpressure(): void {
   }
 }
 
+/**
+ * A rejected token is terminal: every retry would present the same token, so
+ * stop instead of hammering the server every few seconds.
+ */
+function handleAuthRejection(code: number, reason: string): boolean {
+  if (code !== 4401) return false;
+  log('error', 'ws', 'ws.auth_rejected', { code, reason });
+  connectionState = 'disconnected';
+  sendConnectionStatus();
+  stopHeartbeat();
+  return true;
+}
+
 function scheduleReconnect(): void {
   const now = Date.now();
   lastReconnectAttemptTime = now;
@@ -746,6 +769,7 @@ async function reconnectWithRetainedData(symbol: string): Promise<void> {
         sendConnectionStatus();
         
         try {
+          sendAuth(ws!);
           ws?.send(JSON.stringify({ action: 'SUBSCRIBE', symbol }));
         } catch {}
 
@@ -802,7 +826,9 @@ async function reconnectWithRetainedData(symbol: string): Promise<void> {
           stopHeartbeat();
           return;
         }
-        
+
+        if (handleAuthRejection(event.code, event.reason)) return;
+
         addNetworkEvent('disconnected', `code: ${event.code}`, event.code);
         log('warn', 'ws', 'ws.disconnected', { 
           code: event.code, 

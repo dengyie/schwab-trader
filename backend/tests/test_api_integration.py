@@ -9,7 +9,9 @@ os.environ["BROKER_PROVIDER"] = "virtual"
 os.environ["MARKET_DATA_PROVIDER"] = "simulation"
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
+from app import main
 from app.main import app, ledger, engine
 
 # Pin a deterministic token for the test session (settings are read from env at import).
@@ -127,15 +129,12 @@ def test_order_submission_and_portfolio_rest():
         assert cancel_resp.json()["status"] == "CANCELLED"
 
 
-def test_websocket_flow():
+def test_websocket_auth_frame_then_order_flow():
+    """Current client path: no token in the URL, AUTH sent as the first frame."""
     with TestClient(app) as client:
-        # Unauthenticated handshake must be rejected.
-        with pytest.raises(Exception):
-            with client.websocket_connect("/ws") as websocket:
-                websocket.receive_json()
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({"action": "AUTH", "token": "test-token"})
 
-        with client.websocket_connect("/ws?token=test-token") as websocket:
-            # First message should be PORTFOLIO_SNAPSHOT
             init_msg = websocket.receive_json()
             assert init_msg["type"] == "PORTFOLIO_SNAPSHOT"
             assert "cash" in init_msg["data"]
@@ -159,3 +158,57 @@ def test_websocket_flow():
             ord_res = websocket.receive_json()
             assert ord_res["type"] == "ORDER_UPDATE"
             assert ord_res["data"]["status"] == "FILLED"
+
+
+def test_websocket_legacy_query_token_still_accepted():
+    """A tab holding a pre-deploy bundle connects with ?token= and must not break."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?token=test-token") as websocket:
+            init_msg = websocket.receive_json()
+            assert init_msg["type"] == "PORTFOLIO_SNAPSHOT"
+
+            websocket.send_json({"action": "PING"})
+            assert websocket.receive_json()["type"] == "PONG"
+
+
+def _rejected_code(client, path: str, frames: list[dict] | None = None) -> int:
+    """Wait for the server to hang up and report the close code it chose."""
+    with client.websocket_connect(path) as websocket:
+        for frame in frames or []:
+            websocket.send_json(frame)
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            websocket.receive_json()
+    return excinfo.value.code
+
+
+def test_websocket_rejects_wrong_auth_frame():
+    with TestClient(app) as client:
+        assert _rejected_code(client, "/ws", [{"action": "AUTH", "token": "wrong"}]) == 4401
+
+
+def test_websocket_rejects_wrong_query_token():
+    with TestClient(app) as client:
+        assert _rejected_code(client, "/ws?token=wrong") == 4401
+
+
+def test_websocket_rejects_unauthenticated_handshake(monkeypatch):
+    """No query token and no AUTH frame: the server must time out and close 4401."""
+    monkeypatch.setattr(main, "WS_AUTH_TIMEOUT_SEC", 0.2)
+    with TestClient(app) as client:
+        assert _rejected_code(client, "/ws") == 4401
+
+
+def test_websocket_survives_malformed_frames():
+    """Garbage in the stream must not kill a session that already authenticated."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?token=test-token") as websocket:
+            assert websocket.receive_json()["type"] == "PORTFOLIO_SNAPSHOT"
+
+            websocket.send_text("not json at all")
+            websocket.send_json(["a", "list"])          # JSON, but not an object
+            websocket.send_json({"action": "SUBSCRIBE", "symbol": "../../etc"})
+            assert websocket.receive_json()["type"] == "SUBSCRIBE_ERROR"
+
+            websocket.send_json({"action": "PING"})
+            pong_msg = websocket.receive_json()
+            assert pong_msg["type"] == "PONG"

@@ -49,22 +49,6 @@ export function authHeaders(extra: Record<string, string> = {}): Record<string, 
   return token ? { ...extra, 'X-Auth-Token': token } : extra;
 }
 
-/**
- * Build the websocket URL with the auth token appended.
- * Worker-safe: a dedicated worker exposes `self.location` instead of window.
- */
-export function getWsUrl(): string {
-  const token = getToken() || '';
-  const loc =
-    (typeof window !== 'undefined' && window.location) ||
-    (typeof self !== 'undefined' ? self.location : undefined);
-  const host = loc && loc.host ? loc.host : '';
-  const isSecure = loc ? loc.protocol === 'https:' : false;
-  const protocol = isSecure ? 'wss:' : 'ws:';
-  const basePath = host ? `${protocol}//${host}/ws` : 'ws://127.0.0.1:8000/ws';
-  return token ? `${basePath}?token=${encodeURIComponent(token)}` : basePath;
-}
-
 /** Requests that hang on a half-open connection would otherwise spin forever. */
 const REQUEST_TIMEOUT_MS = 10_000;
 
