@@ -77,6 +77,7 @@ function WatchlistItem({
   onTogglePinned: _onTogglePinned,
   isCollapsed = false,
 }: WatchlistItemProps) {
+  const { t } = useI18n();
   const changeBadgeClass = useMemo(() => {
     if (!symbol || symbol.priceChange24h === undefined) return '';
     return symbol.priceChange24h > 0 ? styles.changeUp : symbol.priceChange24h < 0 ? styles.changeDown : '';
@@ -159,7 +160,8 @@ function WatchlistItem({
       </div>
       {!isCollapsed && (
         <div className={styles.itemRight}>
-          <div className={`${styles.price} tabular-nums`}>
+          <div className={`${styles.price} tabular-nums ${symbol.isStale ? styles.stalePrice : ''}`}
+            title={symbol.isStale ? (t.watchlist?.stalePrice || 'No recent trade') : undefined}>
             {hasPrice ? (
               <>
                 <span className={styles.priceCurrency}>{currencySymbol(symbol.quoteAsset)}</span>
@@ -199,7 +201,7 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
   const setActiveMarket = useMarketsStore((s) => s.setActiveMarket);
   const markets = useMarketsStore((s) => s.markets);
   // 当前市场的后端行情行：{symbol -> {price, priceChangePercent, currency}}
-  const [catalogTickers, setCatalogTickers] = useState<Record<string, { price: number; changePct: number; currency?: string }>>({});
+  const [catalogTickers, setCatalogTickers] = useState<Record<string, { price: number; changePct: number; currency?: string; isStale?: boolean }>>({});
 
   const filteredSymbols = useWatchlistStore(selectFilteredSymbols);
   const favorites = useWatchlistStore(selectFavorites);
@@ -250,6 +252,7 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
           price: ticker.price ? String(ticker.price) : info.price,
           priceChange24h: ticker.changePct,
           quoteAsset: ticker.currency || info.quoteAsset,
+          isStale: ticker.isStale,
         };
       }),
     [displaySymbols, catalogTickers],
@@ -267,11 +270,11 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
         }
         const data = await response.json();
 
-        const rows: Record<string, { price: number; changePct: number; currency?: string }> = {};
+        const rows: Record<string, { price: number; changePct: number; currency?: string; isStale?: boolean }> = {};
         for (const ticker of data) {
           const price = parseFloat(ticker.price) || 0;
           const changePct = parseFloat(ticker.priceChangePercent) || 0;
-          rows[ticker.symbol] = { price, changePct, currency: ticker.currency };
+          rows[ticker.symbol] = { price, changePct, currency: ticker.currency, isStale: ticker.isStale === true };
           // 同步本地 watchlist 的价格（供收藏/持仓徽标使用）
           updateSymbolPrice(ticker.symbol, price ? String(price) : '0', changePct);
         }

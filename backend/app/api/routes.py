@@ -227,7 +227,15 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 copy_item["priceChangePercent"] = round(
                     ((current_p - prev) / prev * 100.0) if prev else 0.0, 2
                 )
-                copy_item["lastUpdated"] = int(time.time() * 1000)
+                # The row's timestamp is the print's own time, never "now":
+                # rewriting it to the request time is what made an hours-old
+                # close look freshly updated.
+                copy_item["lastUpdated"] = (
+                    int(q.timestamp.timestamp() * 1000)
+                    if q is not None
+                    else int(time.time() * 1000)
+                )
+                copy_item["isStale"] = bool(q.is_stale) if q is not None else False
                 fresh.append(copy_item)
             return fresh
 
@@ -299,7 +307,12 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 "quoteVolume24h": round(volume * last_price, 2),
                 "openPrice": open_price,
                 "trades24h": len(bars),
-                "lastUpdated": now_ts,
+                "lastUpdated": (
+                    int(quote.timestamp.timestamp() * 1000)
+                    if quote is not None
+                    else now_ts
+                ),
+                "isStale": bool(quote.is_stale) if quote is not None else False,
             })
 
         _tickers_cache[code] = (time.time(), tickers)

@@ -219,6 +219,7 @@ export const zhCN = {
     imbalanceBuy: '买方强势',
     imbalanceSell: '卖方强势',
     imbalanceNeutral: '中性',
+    noDepth: '该市场无盘口，仅显示最新价',
   },
 
   // 最近成交
@@ -528,6 +529,7 @@ export const zhCN = {
     showFavorites: '只显示收藏',
     noResults: '未找到匹配的交易对',
     empty: '自选列表为空',
+    stalePrice: '该市场已开盘，但最近没有新的成交',
     symbols: '个标的',
     addToFavorites: '添加收藏',
     removeFromFavorites: '取消收藏',

@@ -64,6 +64,9 @@ export interface MarketTickerRow {
   volume24h: number;
   quoteVolume24h: number;
   openPrice: number;
-  trades24h: number;
+    trades24h: number;
+  /** 成交打印时间（ms）。开盘时段内该行不再是实时价时，它不会跟着刷新。 */
   lastUpdated: number;
+  /** 后端判定：该市场开盘，但这笔成交远超新鲜度阈值。 */
+  isStale?: boolean;
 }

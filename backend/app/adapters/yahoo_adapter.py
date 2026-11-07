@@ -40,7 +40,12 @@ class YahooFinanceAdapter:
 
     @classmethod
     def get_client(cls) -> httpx.Client:
-        if cls._shared_client is None or cls._shared_client.is_closed:
+        # Reuse the pooled client unless it is gone or was closed. ``is_closed``
+        # only exists on the real object, so anything else cached here (a test
+        # double that leaked in, for instance) is discarded rather than
+        # trusted -- a stale non-client would break every later fetch.
+        client = cls._shared_client
+        if client is None or not isinstance(client, httpx.Client) or client.is_closed:
             cls._shared_client = httpx.Client(
                 headers=cls.HEADERS,
                 timeout=httpx.Timeout(connect=2.5, read=3.5, write=2.5, pool=5.0),

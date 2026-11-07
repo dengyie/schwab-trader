@@ -9,7 +9,7 @@ import threading
 import time
 import logging
 from collections import OrderedDict
-from typing import Dict, List, Callable, Optional, Set
+from typing import Any, Dict, List, Callable, Optional, Set
 from datetime import datetime, timezone
 import httpx
 import websockets
@@ -18,7 +18,12 @@ from app.models.trading import Quote, Bar, Trade, OrderSide, utc_now
 from app.adapters.alpaca_adapter import AlpacaDataAdapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.config import settings
-from app.core.markets import within_day_range
+from app.core.markets import (
+    freshness_updates,
+    is_market_open,
+    market_of,
+    within_day_range,
+)
 from app.core.timeframes import TIMEFRAME_TTLS as CORE_TIMEFRAME_TTLS
 
 logger = logging.getLogger(__name__)
@@ -37,8 +42,11 @@ class AlpacaMarketFeedService:
 
     TIMEFRAME_TTLS: Dict[str, float] = dict(CORE_TIMEFRAME_TTLS)
     # Daily context (previous close, day range, volume) is refreshed at most
-    # this often, with one batched call for the whole catalog.
+    # this often. During a session the range moves; after the close it is
+    # static, so a far longer TTL keeps the same consolidated close for the
+    # rest of the day/weekend without hammering upstream.
     SNAPSHOT_TTL = 45.0
+    SNAPSHOT_TTL_CLOSED = 900.0
 
     def __init__(
         self,
@@ -89,6 +97,10 @@ class AlpacaMarketFeedService:
 
         # Initialize snapshot data
         self._preload_historical_bars_sync()
+        # Warm the consolidated daily context before the first read: the
+        # preloaded REST quotes carry no trade, and a row must not briefly
+        # display a one-venue previous close as the market's.
+        self.refresh_daily_stats(force=True)
 
     def _preload_historical_bars_sync(self) -> None:
         """Fetch latest historical 1-minute bars and quotes via REST on initialization."""
@@ -192,40 +204,57 @@ class AlpacaMarketFeedService:
         return self.get_bars(symbol, timeframe="1m")
 
     def _decorate_daily(self, quote: Optional[Quote]) -> Optional[Quote]:
-        """Attach the cached daily context (prev close, session high/low).
+        """Attach the consolidated daily context and the age of the print.
 
-        Alpaca's quote payloads carry no day range, so a lone bid-only print can
-        look like a valid price to every consumer downstream. Stamping the
-        range the snapshots already know lets those consumers reject a
-        self-contradicting quote instead of each re-deriving the truth.
+        Alpaca's quote payloads carry neither a day range nor a reference
+        close, and its snapshot is IEX only. Two consequences are fixed here:
 
-        A quote whose ``last`` contradicts that range is healed from the
-        snapshot's latest trade, the same value the tickers endpoint shows.
-        Otherwise a poisoned mark (e.g. seeded from an older session's bar)
-        survives every revaluation, because the guard keeps rejecting the only
-        quote on record instead of replacing it.
+        * The % change on a row is computed from ``prev_close``. IEX's own
+          previous close is one venue's last print (733.43 for SPY when the
+          consolidated close was 733.00), so it has to be replaced with the
+          consolidated figure carried by ``daily_stats``.
+        * ``last`` must be a trade. While the venue is open the venue print is
+          the freshest one available; once it is shut the consolidated close
+          is the authoritative price, not a single-venue print that missed the
+          closing auction.
+
+        The quote is also stamped with ``age_seconds`` and ``is_stale`` so the
+        UI can tell a live feed from a correctly-remembered close.
         """
         if quote is None:
             return None
-        stats = self.daily_stats.get(quote.symbol.upper())
-        if not stats:
-            return quote
 
-        day_low = quote.day_low or stats.get("day_low")
-        day_high = quote.day_high or stats.get("day_high")
-        updates = {
-            "prev_close": quote.prev_close or stats.get("prev_close"),
-            "day_high": day_high,
-            "day_low": day_low,
-        }
+        symbol = quote.symbol.upper()
+        updates: Dict[str, Any] = {}
+        stats = self.daily_stats.get(symbol) or {}
 
-        trusted_last = stats.get("last")
-        if (
-            trusted_last
-            and not within_day_range(quote.last, day_low, day_high)
-            and within_day_range(trusted_last, day_low, day_high)
-        ):
-            updates["last"] = trusted_last
+        if stats:
+            updates["prev_close"] = quote.prev_close or stats.get("prev_close")
+            updates["day_high"] = quote.day_high or stats.get("day_high")
+            updates["day_low"] = quote.day_low or stats.get("day_low")
+
+            trusted = stats.get("last")
+            day_lo = updates.get("day_low")
+            day_hi = updates.get("day_high")
+            if trusted:
+                try:
+                    venue_open = is_market_open(market_of(symbol))
+                except Exception:
+                    venue_open = True
+                if not venue_open and stats.get("consolidated"):
+                    updates["last"] = trusted
+                elif quote.last <= 0 and within_day_range(trusted, day_lo, day_hi):
+                    updates["last"] = trusted
+                elif (
+                    not within_day_range(quote.last, day_lo, day_hi)
+                    and within_day_range(trusted, day_lo, day_hi)
+                ):
+                    updates["last"] = trusted
+
+        try:
+            updates.update(freshness_updates(quote.timestamp, market_of(symbol)))
+        except Exception:
+            pass
 
         return quote.model_copy(update=updates)
 
@@ -249,21 +278,80 @@ class AlpacaMarketFeedService:
         return self.latest_quotes.get(sym)
 
     def refresh_daily_stats(self, symbols: Optional[List[str]] = None, force: bool = False) -> None:
-        """Refresh per-symbol daily context in one batched snapshot request.
+        """Refresh per-symbol daily context from the consolidated tape.
 
-        A watchlist row needs the previous close (for the % change) plus today's
-        range. Fetching those per symbol costs seconds each; the snapshot
-        endpoint answers for the whole catalog in a single call.
+        A watchlist row needs a previous close (for the % change) and today's
+        range. Those must come from the whole market, not from one venue's
+        share of it: Alpaca's free feed is IEX only (~2% of volume), whose
+        daily bar misses the closing auction, so its previous close was 733.43
+        for SPY when the consolidated close was 733.00. Yahoo carries the
+        consolidated figure, so it is the primary source here and the Alpaca
+        snapshot is only the fallback for symbols Yahoo cannot answer.
         """
-        with self._snapshot_lock:
-            now = time.time()
-            if not force and self._snapshot_ts and now - self._snapshot_ts < self.SNAPSHOT_TTL:
-                return
-            self._snapshot_ts = now
-
         syms = sorted(symbols or self.symbols)
         if not syms:
             return
+
+        with self._snapshot_lock:
+            now = time.time()
+            ttl = self._daily_ttl()
+            if not force and self._snapshot_ts and now - self._snapshot_ts < ttl:
+                return
+            self._snapshot_ts = now
+
+        missing = self._refresh_consolidated_daily(syms)
+        if missing:
+            self._refresh_alpaca_snapshots(missing)
+
+    def _daily_ttl(self) -> float:
+        """Longer TTL when every venue is shut: a close does not move."""
+        try:
+            closed = all(not is_market_open(market_of(sym)) for sym in self.symbols)
+        except Exception:
+            closed = False
+        return self.SNAPSHOT_TTL_CLOSED if closed else self.SNAPSHOT_TTL
+
+    @staticmethod
+    def _daily_from_meta(meta: Dict[str, Any]) -> Dict[str, float]:
+        """Consolidated daily context from a Yahoo chart ``meta`` block."""
+
+        def num(key: str) -> Optional[float]:
+            value = meta.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+            return None
+
+        entry: Dict[str, float] = {"consolidated": 1.0}
+        for key, source in (
+            ("prev_close", "chartPreviousClose"),
+            ("last", "regularMarketPrice"),
+            ("day_high", "regularMarketDayHigh"),
+            ("day_low", "regularMarketDayLow"),
+            ("volume", "regularMarketVolume"),
+        ):
+            value = num(source) or (num("previousClose") if key == "prev_close" else None)
+            if value is not None:
+                entry[key] = value
+        return entry if len(entry) > 1 else {}
+
+    def _refresh_consolidated_daily(self, syms: List[str]) -> List[str]:
+        """Fetch consolidated daily context; return symbols that failed."""
+        missing: List[str] = []
+        for sym in syms:
+            try:
+                meta = YahooFinanceAdapter.fetch_meta(sym)
+            except Exception as err:
+                logger.warning("Consolidated daily fetch failed for %s: %s", sym, err)
+                meta = None
+            entry = self._daily_from_meta(meta) if meta else {}
+            if entry:
+                self.daily_stats[sym] = {**self.daily_stats.get(sym, {}), **entry}
+            else:
+                missing.append(sym)
+        return missing
+
+    def _refresh_alpaca_snapshots(self, syms: List[str]) -> None:
+        """Single-venue fallback for symbols Yahoo did not answer."""
         try:
             with httpx.Client(headers=self.headers, timeout=10.0) as client:
                 resp = client.get(
@@ -273,8 +361,12 @@ class AlpacaMarketFeedService:
                 if resp.status_code != 200:
                     return
                 stats = AlpacaDataAdapter.parse_snapshots_response(resp.json())
-                if stats:
-                    self.daily_stats.update(stats)
+                for sym, entry in (stats or {}).items():
+                    # Never let the fallback overwrite a consolidated close.
+                    current = self.daily_stats.get(sym) or {}
+                    if current.get("consolidated"):
+                        continue
+                    self.daily_stats[sym] = {**current, **entry}
         except Exception as err:
             logger.warning("Alpaca snapshot refresh failed: %s", err)
 

@@ -176,6 +176,31 @@ describe('OrderBookManager', () => {
     });
   });
 
+  describe('trade-only venues', () => {
+    // HK / JP / CN publish a last price and no book. The book must stay empty
+    // and the real print must still drive the price display -- the defect this
+    // guards against was a mid price fabricated from a one-sided/absent book.
+    it('shows the real print and no levels when the quote has no book', () => {
+      manager.applyQuote({ symbol: '0700.HK', bid: 0, ask: 0, last: 402.5 });
+
+      const orderBook = manager.getOrderBook();
+      expect(orderBook.bids).toHaveLength(0);
+      expect(orderBook.asks).toHaveLength(0);
+
+      const metrics = manager.getMetrics();
+      expect(parseFloat(metrics.mid)).toBeCloseTo(402.5, 6);
+      expect(metrics.spread).toBe('0');
+      expect(metrics.spreadBps).toBe(0);
+    });
+
+    it('ignores a quote with neither a book nor a print', () => {
+      manager.applyQuote({ symbol: '0700.HK', bid: 0, ask: 0, last: 0 });
+      expect(manager.getOrderBook().bids).toHaveLength(0);
+      expect(manager.getOrderBook().asks).toHaveLength(0);
+      expect(manager.getMetrics().mid).toBe('0');
+    });
+  });
+
   describe('live quote honesty', () => {
     it('applies only the real NBBO levels (no synthetic ladder)', () => {
       manager.applyQuote({ symbol: 'SPY', bid: 500.0, ask: 500.05, bid_size: 300, ask_size: 200 });

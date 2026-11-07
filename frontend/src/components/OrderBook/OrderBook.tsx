@@ -120,6 +120,23 @@ export function OrderBook({ onPriceClick, embedded = false, compact = false }: O
 
   const spread = metrics?.spread ? parseFloat(metrics.spread) : 0;
   const spreadBps = metrics?.spreadBps ?? 0;
+  const lastPrice = metrics ? parseFloat(metrics.mid) : 0;
+  const hasBook = orderBook.bids.length > 0 || orderBook.asks.length > 0;
+
+  // Trade-only venue (HK / JP / CN): the feed publishes a real print but no
+  // bid/ask, so there is no ladder to show. Say so instead of rendering an
+  // empty book that reads like a broken feed.
+  if (!hasBook && lastPrice > 0) {
+    return (
+      <div className={`card ${styles.container}`}>
+        <div className="card-header"><span className="card-title">{t.orderBook.title}</span></div>
+        <div className={`card-body ${styles.loading}`}>
+          <div className="tabular-nums">{formatPrice(String(lastPrice))}</div>
+          <div className={styles.spreadBps}>{t.orderBook?.noDepth || 'No order book for this market'}</div>
+        </div>
+      </div>
+    );
+  }
 
   // 嵌入模式使用横向布局
   if (embedded) {

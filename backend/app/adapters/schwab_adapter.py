@@ -35,22 +35,10 @@ class SchwabDataAdapter:
         last = float(item.get("3") or item.get("last") or item.get("lastPrice") or item.get("regularMarketPrice") or 0.0)
         volume = int(item.get("8") or item.get("volume") or item.get("totalVolume") or 0)
 
-        # Fallback if last is missing but bid/ask exists
-        if last <= 0.0:
-            if bid > 0 and ask > 0:
-                last = round((bid + ask) / 2.0, 4)
-            elif bid > 0:
-                last = bid
-            elif ask > 0:
-                last = ask
-            else:
-                return None
-
-        # Fallback bid/ask around last price if missing
-        if bid <= 0.0:
-            bid = round(last * 0.9998, 4)
-        if ask <= 0.0:
-            ask = round(last * 1.0002, 4)
+        # A missing last stays unknown (0). A bid/ask midpoint is not a trade,
+        # and a synthesized bid/ask around it would be mistaken for a market.
+        if last <= 0.0 and bid <= 0.0 and ask <= 0.0:
+            return None
 
         raw_time = item.get("50") or item.get("quoteTime") or item.get("timestamp")
         if raw_time:

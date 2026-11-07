@@ -221,6 +221,7 @@ export const enUS: Locale = {
     imbalanceBuy: 'Buy Pressure',
     imbalanceSell: 'Sell Pressure',
     imbalanceNeutral: 'Neutral',
+    noDepth: 'No order book for this market, last price only',
   },
 
   // Recent Trades
@@ -529,6 +530,7 @@ export const enUS: Locale = {
     showFavorites: 'Favorites Only',
     noResults: 'No matching symbols',
     empty: 'Watchlist is empty',
+    stalePrice: 'Market open, but no recent trade',
     symbols: 'symbols',
     addToFavorites: 'Add to favorites',
     removeFromFavorites: 'Remove from favorites',

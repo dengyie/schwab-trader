@@ -11,6 +11,8 @@ export interface SymbolInfo {
   change24h?: string;
   volume24h?: string;
   sparkline?: number[]; // 24h price points for sparkline
+  /** 后端标记：该市场开盘，但这笔成交已远超新鲜度阈值。 */
+  isStale?: boolean;
 }
 
 // 默认交易对列表（美股核心大盘与科技成长标的）
