@@ -58,6 +58,20 @@ class MultiMarketFeed:
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
 
+    def get_daily_stats(self, symbol: str) -> Dict[str, float]:
+        """Previous close and today's range/volume, when the provider has them."""
+        canonical, feed = self._route(symbol)
+        if feed is None:
+            return {}
+        getter = getattr(feed, "get_daily_stats", None)
+        if not callable(getter):
+            return {}
+        try:
+            return getter(canonical) or {}
+        except Exception as exc:
+            logger.warning("Daily stats lookup failed for %s: %s", canonical, exc)
+            return {}
+
     # -- subscriptions ----------------------------------------------------
     def subscribe_quote(self, callback: Callable[[Quote], None]) -> None:
         self._us.subscribe_quote(callback)

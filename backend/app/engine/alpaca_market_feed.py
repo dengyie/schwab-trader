@@ -5,6 +5,7 @@ Connects to Alpaca IEX WebSocket Stream and REST API for real 1-minute bars, quo
 from __future__ import annotations
 import asyncio
 import json
+import threading
 import time
 import logging
 from collections import OrderedDict
@@ -34,6 +35,9 @@ class AlpacaMarketFeedService:
     """
 
     TIMEFRAME_TTLS: Dict[str, float] = dict(CORE_TIMEFRAME_TTLS)
+    # Daily context (previous close, day range, volume) is refreshed at most
+    # this often, with one batched call for the whole catalog.
+    SNAPSHOT_TTL = 45.0
 
     def __init__(
         self,
@@ -60,6 +64,11 @@ class AlpacaMarketFeedService:
         self.historical_bars: Dict[str, List[Bar]] = {}
         self.latest_quotes: Dict[str, Quote] = {}
         self.last_trade_prices: Dict[str, float] = {}
+        # Per-symbol daily context from the batched snapshot endpoint:
+        # {symbol: {"prev_close", "day_open", "day_high", "day_low", "volume", "last"}}
+        self.daily_stats: Dict[str, Dict[str, float]] = {}
+        self._snapshot_ts: float = 0.0
+        self._snapshot_lock = threading.Lock()
 
         # Multi-timeframe RAM cache: {symbol: {timeframe: [Bar, ...]}}
         # OrderedDict enables oldest-first eviction when the cache grows unbounded.
@@ -196,6 +205,44 @@ class AlpacaMarketFeedService:
             pass
         return self.latest_quotes.get(sym)
 
+    def refresh_daily_stats(self, symbols: Optional[List[str]] = None, force: bool = False) -> None:
+        """Refresh per-symbol daily context in one batched snapshot request.
+
+        A watchlist row needs the previous close (for the % change) plus today's
+        range. Fetching those per symbol costs seconds each; the snapshot
+        endpoint answers for the whole catalog in a single call.
+        """
+        with self._snapshot_lock:
+            now = time.time()
+            if not force and self._snapshot_ts and now - self._snapshot_ts < self.SNAPSHOT_TTL:
+                return
+            self._snapshot_ts = now
+
+        syms = sorted(symbols or self.symbols)
+        if not syms:
+            return
+        try:
+            with httpx.Client(headers=self.headers, timeout=10.0) as client:
+                resp = client.get(
+                    f"{self.data_base_url}/stocks/snapshots",
+                    params={"symbols": ",".join(syms), "feed": self.feed},
+                )
+                if resp.status_code != 200:
+                    return
+                stats = AlpacaDataAdapter.parse_snapshots_response(resp.json())
+                if stats:
+                    self.daily_stats.update(stats)
+        except Exception as err:
+            logger.warning("Alpaca snapshot refresh failed: %s", err)
+
+    def get_daily_stats(self, symbol: str) -> Dict[str, float]:
+        """Daily context for one symbol, cached and refreshed in the background."""
+        sym = symbol.upper()
+        cached = self.daily_stats.get(sym)
+        if not cached or (time.time() - self._snapshot_ts) >= self.SNAPSHOT_TTL:
+            self.refresh_daily_stats([sym])
+        return self.daily_stats.get(sym) or {}
+
     def subscribe_quote(self, callback: Callable[[Quote], None]) -> None:
         self.quote_listeners.append(callback)
 
@@ -331,6 +378,12 @@ class AlpacaMarketFeedService:
                 await asyncio.sleep(15)
                 if not self._running:
                     break
+
+                # Keep previous closes and day ranges warm for the watchlist.
+                try:
+                    await asyncio.to_thread(self.refresh_daily_stats)
+                except Exception:
+                    pass
 
                 for sym in self.symbols:
                     q = self.latest_quotes.get(sym)
