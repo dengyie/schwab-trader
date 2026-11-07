@@ -55,12 +55,13 @@ export interface DerivedMetrics {
   lastUpdateTime: number;   // 最后更新时间
   bidDepthVolume: string;   // 买盘累计深度
   askDepthVolume: string;   // 卖盘累计深度
-  // 24小时统计数据
-  high24h: string;          // 24小时最高价
-  low24h: string;           // 24小时最低价
-  vol24h: string;           // 24小时成交量（base asset）
-  priceChange24h: string;   // 24小时价格变化
-  priceChangePercent24h: string; // 24小时价格变化百分比
+  // 当日统计数据（来源：Quote 的 day_high/day_low/prev_close；缺失时为空串，
+  // 由 UI 渲染为 "—"，不用最新价顶替）。
+  high24h: string;          // 当日最高价
+  low24h: string;           // 当日最低价
+  vol24h: string;           // 当日成交量
+  priceChange24h: string;   // 相对前日收盘的变化
+  priceChangePercent24h: string; // 相对前日收盘的涨跌幅
 }
 
 // ===== 连接状态 =====

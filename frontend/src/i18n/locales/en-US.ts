@@ -582,13 +582,6 @@ export const enUS: Locale = {
     account: 'Account',
   },
 
-  // Trade Page
-  trade: {
-    stats24hHigh: '24H High',
-    stats24hLow: '24H Low',
-    stats24hVol: '24H Vol',
-  },
-
   // Markets
   markets: {
     title: 'Market Intelligence',

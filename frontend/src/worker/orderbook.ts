@@ -116,25 +116,6 @@ export class OrderBookManager {
   }
 
   /**
-   * Update 24h ticker data from websocket stream
-   */
-  updateTicker24h(data: {
-    h: string;  // high
-    l: string;  // low
-    v: string;  // volume
-    p: string;  // price change
-    P: string;  // price change percent
-  }): void {
-    this.ticker24h = {
-      high24h: data.h,
-      low24h: data.l,
-      vol24h: data.v,
-      priceChange24h: data.p,
-      priceChangePercent24h: data.P,
-    };
-  }
-
-  /**
    * Apply live quote from FastAPI / Alpaca feed.
    *
    * A quote carries exactly one price level per side: best bid and best ask
@@ -150,12 +131,13 @@ export class OrderBookManager {
     last?: number;
     last_size?: number;
     volume?: number;
-    high?: number;
-    low?: number;
-    open?: number;
+    /** Backend Quote keys: consolidated session range and reference close. */
+    day_high?: number;
+    day_low?: number;
+    prev_close?: number;
     timestamp?: string;
   }): void {
-    const { bid, ask, last, volume, high, low } = data;
+    const { bid, ask, last } = data;
 
     // No two-sided book: this venue publishes trades only (HK / JP / CN). The
     // book is emptied rather than filled with levels nobody quoted, and the
@@ -183,20 +165,24 @@ export class OrderBookManager {
 
   private _applyTickerStats(refLast: number, data: {
     volume?: number;
-    high?: number;
-    low?: number;
-    open?: number;
+    day_high?: number;
+    day_low?: number;
+    prev_close?: number;
   }): void {
     this.updateMidPrice(refLast);
 
-    // 24h-style stats: only report what the feed actually provides.
-    const { volume, high, low } = data;
+    // Session stats: only report what the feed actually provides. A missing
+    // day range stays empty (rendered as "—") rather than being masked with
+    // the last price, which would present it as the session high/low.
+    const { volume, day_high: high, day_low: low, prev_close } = data;
     this.ticker24h = {
-      high24h: (high ?? refLast).toFixed(2),
-      low24h: (low ?? refLast).toFixed(2),
+      high24h: high ? high.toFixed(2) : '',
+      low24h: low ? low.toFixed(2) : '',
       vol24h: String(volume ?? 0),
-      priceChange24h: data.open ? (refLast - data.open).toFixed(2) : '0',
-      priceChangePercent24h: data.open ? (((refLast - data.open) / data.open) * 100).toFixed(2) : '0',
+      priceChange24h: prev_close ? (refLast - prev_close).toFixed(2) : '0',
+      priceChangePercent24h: prev_close
+        ? (((refLast - prev_close) / prev_close) * 100).toFixed(2)
+        : '0',
     };
 
     this.state.lastUpdateId = Date.now();
