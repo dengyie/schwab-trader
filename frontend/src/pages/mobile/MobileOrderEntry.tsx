@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useMarketStore, selectOrderBook, selectMetrics, selectBestBid, selectBestAsk, selectDataConfidence } from '../../store/marketStore';
 import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
+import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
 import { useI18n, formatMessage } from '../../i18n';
 import { toast } from '../../components/Toast';
 import { Icon } from '../../components/Icon';
@@ -39,9 +40,13 @@ export function MobileOrderEntry({
 
   const symbol = orderBook?.symbol ?? 'SPY';
   const baseAsset = symbol.replace('/USD', '').replace('USDT', '');
-  const quoteAsset = 'USD';
+  // 币种随标的市场变化：港股 HKD、日股 JPY、A 股 CNY。
+  const market = marketCodeOfSymbol(symbol, useMarketsStore.getState().markets);
+  const quoteAsset = useMarketsStore.getState().currencyOf(symbol);
+  const isForeignMarket = market !== 'US';
+  const lotSize = Math.max(1, useMarketsStore.getState().lotSizeFor(symbol));
   const baseBalance = balances.find(b => b.asset === baseAsset);
-  const quoteBalance = balances.find(b => b.asset === quoteAsset);
+  const quoteBalance = balances.find(b => b.asset === quoteAsset) || balances.find(b => b.asset === 'USD');
 
   // Sync price from orderbook
   useEffect(() => {
@@ -101,6 +106,14 @@ export function MobileOrderEntry({
     if (!quantity || parseFloat(quantity) <= 0) {
       toast.warning(t.orderEntry?.invalidAmount || 'Invalid amount');
       return;
+    }
+    // 非美股按整手交易，数量必须是每手股数的整数倍。
+    if (lotSize > 1) {
+      const q = parseFloat(quantity);
+      if (Math.abs(q / lotSize - Math.round(q / lotSize)) > 1e-9) {
+        toast.warning(t.orderEntry?.lotError || `Quantity must be a multiple of ${lotSize}`);
+        return;
+      }
     }
     if (type === 'limit' && (!price || parseFloat(price) <= 0)) {
       toast.warning(t.orderEntry?.invalidPrice || 'Invalid price');

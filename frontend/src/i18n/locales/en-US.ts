@@ -316,6 +316,13 @@ export const enUS: Locale = {
     invalidStopLimitPrice: 'Invalid stop limit price',
     invalidTrailingValue: 'Invalid trailing value',
     insufficientBalance: 'Insufficient balance',
+    // Multi-market
+    perLot: 'per lot',
+    lotError: 'Quantity must be a multiple of the board lot',
+    priceBand: 'Limit band',
+    priceBandError: 'Price is outside the allowed daily band',
+    tickError: 'Price does not match the venue tick size',
+    unsupportedOnMarket: 'Not supported on this market',
   },
 
   // Open Orders

@@ -14,6 +14,7 @@ const selectSymbolPrices = (state: { symbols: Array<{ symbol: string; price?: st
   return priceMap;
 };
 import { useI18n } from '../../i18n';
+import { currencySymbol } from '../../utils/money';
 import { toast } from '../Toast';
 import { Icon } from '../Icon';
 import { TPSLForm } from './TPSLForm';
@@ -141,6 +142,7 @@ export function Positions() {
         unrealizedPnl: unrealizedPnl.toNumber(),
         pnlPercent: pnlPercent.toNumber(),
         hasRealTimePrice,
+        currency: pos.currency || 'USD',
       };
     });
 
@@ -237,14 +239,14 @@ export function Positions() {
                       </div>
                     </td>
                     <td className={styles.numericCell}>{formatCrypto(pos.quantity)}</td>
-                    <td className={styles.numericCell}>${formatUSDT(pos.avgEntryPrice)}</td>
+                    <td className={styles.numericCell}>{currencySymbol(pos.currency)}{formatUSDT(pos.avgEntryPrice)}</td>
                     <td className={styles.numericCell}>
-                      {pos.hasRealTimePrice ? `$${formatUSDT(pos.currentPrice)}` : '—'}
+                      {pos.hasRealTimePrice ? `${currencySymbol(pos.currency)}${formatUSDT(pos.currentPrice)}` : '—'}
                     </td>
                     <td className={`${styles.pnlCell} ${pos.hasRealTimePrice ? (pos.unrealizedPnl >= 0 ? styles.positive : styles.negative) : styles.pending}`}>
                       {pos.hasRealTimePrice ? (
                         <>
-                          {pos.unrealizedPnl >= 0 ? '+' : ''}${pos.unrealizedPnl.toFixed(2)}
+                          {pos.unrealizedPnl >= 0 ? '+' : '-'}{currencySymbol(pos.currency)}{Math.abs(pos.unrealizedPnl).toFixed(2)}
                           <span style={{ opacity: 0.7, marginLeft: 4, fontSize: 9 }}>
                             ({pos.pnlPercent >= 0 ? '+' : ''}{pos.pnlPercent.toFixed(1)}%)
                           </span>

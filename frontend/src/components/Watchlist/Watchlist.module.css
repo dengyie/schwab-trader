@@ -326,6 +326,46 @@
   line-height: 1.2;
 }
 
+/* 币种前缀：多市场下 HK$/¥/CN¥ 必须与数字同排显示 */
+.priceCurrency {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-right: 1px;
+}
+
+/* 市场切换（US / HK / JP / CN） */
+.marketTabs {
+  display: flex;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.marketTab {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 0;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.marketTab:hover {
+  color: var(--text-secondary);
+}
+
+.marketTab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
 .priceChange {
   font-size: 10px;
   font-weight: 600;

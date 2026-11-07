@@ -18,6 +18,10 @@ export interface MarketTicker {
   openPrice: number;
   trades24h: number;
   lastUpdated: number;
+  /** 所属市场（US/HK/JP/CN），由后端按符号标注。 */
+  market?: string;
+  /** 该标的的计价币种。 */
+  currency?: string;
 }
 
 export interface MarketSparkline {
@@ -47,28 +51,38 @@ const CATEGORY_MAP: Record<string, string[]> = {
 
 export const GET_SYMBOLS_BY_CATEGORY = (cat: string) => CATEGORY_MAP[cat] || POPULAR_SYMBOLS;
 
-let tickerCache: Map<string, MarketTicker> = new Map();
-let lastFetchTime = 0;
+interface TickerCacheEntry {
+  fetchedAt: number;
+  rows: Map<string, MarketTicker>;
+}
+
+// 每个市场单独缓存：切换市场时不能拿到上一个市场的行情。
+const tickerCaches: Map<string, TickerCacheEntry> = new Map();
 const CACHE_TTL = 2000;
 
-export async function fetchAllTickers(): Promise<MarketTicker[]> {
+/** 拉取某个市场的行情列表。market 为空时回退到后端默认（美股）。 */
+export async function fetchAllTickers(market?: string | null): Promise<MarketTicker[]> {
+  const key = (market || 'US').toUpperCase();
+  const cached = tickerCaches.get(key);
   const now = Date.now();
-  if (now - lastFetchTime < CACHE_TTL && tickerCache.size > 0) return Array.from(tickerCache.values());
+  if (cached && now - cached.fetchedAt < CACHE_TTL && cached.rows.size > 0) {
+    return Array.from(cached.rows.values());
+  }
 
   try {
-    const response = await apiFetch('/market/tickers');
+    const path = `/market/tickers?market=${encodeURIComponent(key)}`;
+    const response = await apiFetch(path);
     if (!response.ok) throw response;
     const data: MarketTicker[] = await response.json();
-    
-    data.forEach((t) => {
-      tickerCache.set(t.symbol, t);
-    });
 
-    lastFetchTime = now;
+    const rows = new Map<string, MarketTicker>();
+    data.forEach((t) => rows.set(t.symbol, t));
+    tickerCaches.set(key, { fetchedAt: now, rows });
+
     return data.sort((a, b) => b.volume24h - a.volume24h);
   } catch (error) {
     logError(handleApiError(error));
-    return Array.from(tickerCache.values());
+    return cached ? Array.from(cached.rows.values()) : [];
   }
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useEffect } from 'react';
+import { useCallback, useMemo, useRef, useEffect, useState } from 'react';
 import { 
   useWatchlistStore, 
   selectFilteredSymbols, 
@@ -10,9 +10,11 @@ import {
   type SymbolInfo 
 } from '../../store/watchlistStore';
 import { useTradingStore, selectPositions } from '../../store/tradingStore';
+import { useMarketsStore, MARKET_CODES } from '../../store/marketsStore';
 import { useI18n } from '../../i18n';
 import { Icon } from '../Icon';
 import { apiFetch } from '../../services/apiClient';
+import { formatPriceByDecimals, currencySymbol, currencyDecimals } from '../../utils/money';
 import styles from './Watchlist.module.css';
 import Decimal from 'decimal.js';
 
@@ -158,10 +160,17 @@ function WatchlistItem({
       {!isCollapsed && (
         <div className={styles.itemRight}>
           <div className={`${styles.price} tabular-nums`}>
-            {hasPrice 
-              ? parseFloat(symbol.price!).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })
-              : <span className={styles.loading}>...</span>
-            }
+            {hasPrice ? (
+              <>
+                <span className={styles.priceCurrency}>{currencySymbol(symbol.quoteAsset)}</span>
+                {formatPriceByDecimals(
+                  parseFloat(symbol.price!),
+                  currencyDecimals(symbol.quoteAsset, parseFloat(symbol.price!) < 1 ? 4 : 2),
+                )}
+              </>
+            ) : (
+              <span className={styles.loading}>...</span>
+            )}
           </div>
           {symbol.priceChange24h !== undefined ? (
             <div className={`${styles.priceChange} ${changeBadgeClass} tabular-nums`}>
@@ -186,6 +195,12 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
   const { t } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   
+  const activeMarket = useMarketsStore((s) => s.activeMarket);
+  const setActiveMarket = useMarketsStore((s) => s.setActiveMarket);
+  const markets = useMarketsStore((s) => s.markets);
+  // 当前市场的后端行情行：{symbol -> {price, priceChangePercent, currency}}
+  const [catalogTickers, setCatalogTickers] = useState<Record<string, { price: number; changePct: number; currency?: string }>>({});
+
   const filteredSymbols = useWatchlistStore(selectFilteredSymbols);
   const favorites = useWatchlistStore(selectFavorites);
   const pinned = useWatchlistStore(selectPinned);
@@ -195,44 +210,86 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
   const positions = useTradingStore(selectPositions);
   const updateSymbolPrice = useWatchlistStore(state => state.updateSymbolPrice);
   
-  // 获取所有 symbols 的价格数据（对接美股真实后端行情）
+  // 切换市场时，把该市场的 catalog 注入 watchlist，作为可交易标的列表。
+  const marketCatalog = useMemo(() => {
+    const def = markets.find((m) => m.code === activeMarket);
+    if (def && def.catalog && def.catalog.length > 0) {
+      return def.catalog.map((symbol) => ({ symbol, baseAsset: symbol, quoteAsset: def.currency }));
+    }
+    return null;
+  }, [markets, activeMarket]);
+
+  // 显示列表：优先用当前市场 catalog；取不到时才回退到本地 watchlist。
+  const displaySymbols = useMemo<SymbolInfo[]>(() => {
+    let list = marketCatalog ?? filteredSymbols;
+
+    if (showFavoritesOnly) {
+      list = list.filter((s) => favorites.includes(s.symbol));
+    }
+
+    const query = searchQuery.trim().toLowerCase();
+    if (query) {
+      list = list.filter(
+        (s) =>
+          s.symbol.toLowerCase().includes(query) ||
+          (s.baseAsset || '').toLowerCase().includes(query),
+      );
+    }
+
+    return list;
+  }, [marketCatalog, filteredSymbols, showFavoritesOnly, favorites, searchQuery]);
+
+  // catalog 行只有符号，价格来自当前市场的行情接口，按符号合并后再渲染。
+  const displayRows = useMemo<SymbolInfo[]>(
+    () =>
+      displaySymbols.map((info) => {
+        const ticker = catalogTickers[info.symbol];
+        if (!ticker) return info;
+        return {
+          ...info,
+          price: ticker.price ? String(ticker.price) : info.price,
+          priceChange24h: ticker.changePct,
+          quoteAsset: ticker.currency || info.quoteAsset,
+        };
+      }),
+    [displaySymbols, catalogTickers],
+  );
+
+  // 拉取当前市场全部标的价格（对接多市场后端行情）
   useEffect(() => {
     let isSubscribed = true;
 
     const fetchPrices = async () => {
       try {
-        const response = await apiFetch('/market/tickers');
+        const response = await apiFetch(`/market/tickers?market=${encodeURIComponent(activeMarket)}`);
         if (!response.ok || !isSubscribed) {
           return;
         }
-        
         const data = await response.json();
-        
-        // 更新每个 symbol 的真实美股价格与涨跌幅
+
+        const rows: Record<string, { price: number; changePct: number; currency?: string }> = {};
         for (const ticker of data) {
-          updateSymbolPrice(
-            ticker.symbol, 
-            ticker.price?.toString() || '0', 
-            parseFloat(ticker.priceChangePercent) || 0
-          );
+          const price = parseFloat(ticker.price) || 0;
+          const changePct = parseFloat(ticker.priceChangePercent) || 0;
+          rows[ticker.symbol] = { price, changePct, currency: ticker.currency };
+          // 同步本地 watchlist 的价格（供收藏/持仓徽标使用）
+          updateSymbolPrice(ticker.symbol, price ? String(price) : '0', changePct);
         }
+        if (isSubscribed) setCatalogTickers(rows);
       } catch (err) {
         console.error('Failed to fetch prices:', err);
       }
     };
 
-    // 首次请求
     fetchPrices();
-
-    // 每 15 秒更新一次自选列表价格
     const interval = setInterval(fetchPrices, 15000);
 
     return () => {
       isSubscribed = false;
       clearInterval(interval);
     };
-  }, [updateSymbolPrice]);
-  
+  }, [activeMarket, updateSymbolPrice]);
+
   const getPosition = useCallback((symbol: string) => {
     if (positions instanceof Map) {
       return positions.get(symbol);
@@ -252,6 +309,18 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
     togglePinned,
   } = useWatchlistStore();
 
+  // 选中当前市场的第一个标的，确保切市场后图表/下单不会指向空符号。
+  useEffect(() => {
+    const catalog = markets.find((m) => m.code === activeMarket)?.catalog || [];
+    const list = catalog.length > 0 ? catalog : displaySymbols.map((s) => s.symbol);
+    const first = list[0];
+    if (first && !list.includes(selectedSymbol)) {
+      setSelectedSymbol(first);
+      onSymbolChange?.(first);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeMarket]);
+
   const handleSymbolSelect = useCallback((symbol: string) => {
     setSelectedSymbol(symbol);
     onSymbolChange?.(symbol);
@@ -268,25 +337,25 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
 
   // 键盘导航
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (filteredSymbols.length === 0) return;
+    if (displaySymbols.length === 0) return;
     
-    const currentIndex = filteredSymbols.findIndex(s => s.symbol === selectedSymbol);
+    const currentIndex = displaySymbols.findIndex(s => s.symbol === selectedSymbol);
     
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      const nextIndex = currentIndex < filteredSymbols.length - 1 ? currentIndex + 1 : 0;
-      const nextSymbol = filteredSymbols[nextIndex];
+      const nextIndex = currentIndex < displaySymbols.length - 1 ? currentIndex + 1 : 0;
+      const nextSymbol = displaySymbols[nextIndex];
       if (nextSymbol) handleSymbolSelect(nextSymbol.symbol);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      const prevIndex = currentIndex > 0 ? currentIndex - 1 : filteredSymbols.length - 1;
-      const prevSymbol = filteredSymbols[prevIndex];
+      const prevIndex = currentIndex > 0 ? currentIndex - 1 : displaySymbols.length - 1;
+      const prevSymbol = displaySymbols[prevIndex];
       if (prevSymbol) handleSymbolSelect(prevSymbol.symbol);
     } else if (e.key === 'Enter' && currentIndex >= 0) {
       // Enter 确认当前选中
       onSymbolChange?.(selectedSymbol);
     }
-  }, [filteredSymbols, selectedSymbol, handleSymbolSelect, onSymbolChange]);
+  }, [displaySymbols, selectedSymbol, handleSymbolSelect, onSymbolChange]);
 
   return (
     <div className={`card ${styles.container} ${isCollapsed ? styles.collapsed : ''}`}>
@@ -304,6 +373,28 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
         </div>
       )}
       
+      {/* 市场切换：US / HK / JP / CN */}
+      {!isCollapsed && (
+        <div className={styles.marketTabs} role="tablist" aria-label="Market">
+          {MARKET_CODES.map((code) => {
+            const def = markets.find((m) => m.code === code);
+            const label = def?.name || code;
+            return (
+              <button
+                key={code}
+                role="tab"
+                aria-selected={activeMarket === code}
+                className={`${styles.marketTab} ${activeMarket === code ? styles.active : ''}`}
+                onClick={() => setActiveMarket(code)}
+                title={def ? `${label} · ${def.currency}` : code}
+              >
+                {code}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* 搜索框 */}
       {!isCollapsed && (
         <div className={styles.searchWrapper}>
@@ -329,8 +420,8 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
 
       {/* 列表 */}
       <div className={styles.list}>
-        {filteredSymbols.length > 0 ? (
-          filteredSymbols.map((symbol) => (
+        {displayRows.length > 0 ? (
+          displayRows.map((symbol) => (
             <WatchlistItem
               key={symbol.symbol}
               symbol={symbol}
@@ -357,7 +448,7 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
       {!isCollapsed && (
         <div className={styles.footer}>
           <span className={styles.count}>
-            {filteredSymbols.length} {t.watchlist?.symbols || 'symbols'}
+            {displayRows.length} {t.watchlist?.symbols || 'symbols'}
           </span>
         </div>
       )}

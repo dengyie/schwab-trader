@@ -3,6 +3,8 @@ import { useMarketStore, selectOrderBook, selectMetrics, selectBestBid, selectBe
 import { useTradingStore, selectFocusMode } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
+import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
+import { currencySymbol, roundToTick } from '../../utils/money';
 import { useI18n, formatMessage } from '../../i18n';
 import { toast } from '../Toast';
 import { Icon } from '../Icon';
@@ -103,9 +105,45 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
   const symbol = selectedSymbol || orderBook?.symbol || 'SPY';
   const baseAsset = symbol.replace('/USD', '').replace('USDT', '');
-  const quoteAsset = 'USD';
+
+  // 多市场：币种、每手、最小跳动、涨跌停、交易时段全部来自市场注册表。
+  const markets = useMarketsStore((s) => s.markets);
+  const market = marketCodeOfSymbol(symbol, markets);
+  const marketDef = markets.find((m) => m.code === market);
+  const quoteAsset = marketDef?.currency || 'USD';
+  const isForeignMarket = market !== 'US';
+  const lotSize = Math.max(1, marketDef?.lot_size ?? (isForeignMarket ? 100 : 1));
+  const priceDecimals = marketDef?.decimals ?? 2;
   const baseBalance = balances.find(b => b.asset === baseAsset);
-  const quoteBalance = balances.find(b => b.asset === 'USD' || b.asset === 'USDT');
+  const quoteBalance = balances.find(b => b.asset === quoteAsset);
+  const priceLimitPct = useMarketsStore((s) => s.priceLimitPctFor(symbol));
+  const marketClock = marketDef?.clock;
+  const marketClosed = marketClock ? !marketClock.is_open : false;
+  const tickFor = (value: number) => useMarketsStore.getState().tickSizeFor(symbol, value);
+
+  // A 股涨跌停区间：以昨收/最新价为基准，超出直接拦在提交前。
+  const priceBand = (() => {
+    if (!priceLimitPct) return null;
+    const ref = parseFloat(metrics?.mid || '0');
+    if (!(ref > 0)) return null;
+    const pct = priceLimitPct / 100;
+    return { low: ref * (1 - pct), high: ref * (1 + pct) };
+  })();
+
+  const priceOutOfBand = (value: string): boolean => {
+    if (!priceBand || !value) return false;
+    const p = parseFloat(value);
+    if (!(p > 0)) return false;
+    return p < priceBand.low - 1e-9 || p > priceBand.high + 1e-9;
+  };
+
+  // 数量必须是整手。
+  const quantityNotLot = (value: string): boolean => {
+    if (lotSize <= 1 || !value) return false;
+    const q = parseFloat(value);
+    if (!(q > 0)) return false;
+    return Math.abs(q / lotSize - Math.round(q / lotSize)) > 1e-9;
+  };
 
   // Reset fields when category changes
   useEffect(() => {
@@ -164,18 +202,27 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   }, [price, quantity, type, metrics, orderCategory, triggerPrice, limitPrice, ocoLimitPrice]);
 
   const getMaxQuantity = useCallback(() => {
-    if (side === 'buy' && quoteBalance && metrics) {
-      const av = parseFloat(quoteBalance.available);
-      const p = type === 'limit' && price ? parseFloat(price) : parseFloat(metrics.mid);
+    if (side === 'buy' && (quoteBalance || (isForeignMarket && balances?.length))) {
+      // 外币买入：账户现金始终以 USD 记账，购买力按汇率折算成当地币种。
+      const source = quoteBalance || balances.find((b) => b.asset === 'USD');
+      const usdAv = parseFloat(source?.available || '0');
+      const rate = isForeignMarket ? useMarketsStore.getState().usdPerUnit(quoteAsset) : 1;
+      const av = rate > 0 ? usdAv / rate : usdAv;
+      const p = type === 'limit' && price ? parseFloat(price) : parseFloat(metrics?.mid || '0');
       return p > 0 ? av / p : 0;
     } else if (side === 'sell' && baseBalance) return parseFloat(baseBalance.available);
     return 0;
-  }, [side, type, price, quoteBalance, baseBalance, metrics]);
+  }, [side, type, price, quoteBalance, baseBalance, metrics, isForeignMarket, quoteAsset, balances]);
 
   const updateQuantityFromPercent = useCallback((pct: number) => {
     const max = getMaxQuantity();
-    if (max > 0) setQuantity((max * pct / 100).toFixed(6));
-  }, [getMaxQuantity]);
+    if (max > 0) {
+      // 整手向下取整：港股/日股/A 股买入必须是每手股数的整数倍。
+      const raw = (max * pct) / 100;
+      const stepped = lotSize > 1 ? Math.floor(raw / lotSize) * lotSize : raw;
+      if (stepped > 0) setQuantity(String(stepped));
+    }
+  }, [getMaxQuantity, lotSize]);
 
   useEffect(() => {
     const max = getMaxQuantity();
@@ -193,21 +240,23 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     if (price) {
       const p = parseFloat(price);
       if (!isNaN(p)) {
-        const step = p >= 1 ? 0.01 : 0.0001;
-        setPrice((p + step).toFixed(p >= 1 ? 2 : 4));
+        const step = tickFor(p);
+        setPrice(roundToTick(p + step, step).toFixed(priceDecimals));
       }
     }
-  }, [price]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [price, symbol, priceDecimals]);
 
   const handleStepDown = useCallback(() => {
     if (price) {
       const p = parseFloat(price);
       if (!isNaN(p)) {
-        const step = p >= 1 ? 0.01 : 0.0001;
-        setPrice(Math.max(0, p - step).toFixed(p >= 1 ? 2 : 4));
+        const step = tickFor(p);
+        setPrice(roundToTick(Math.max(0, p - step), step).toFixed(priceDecimals));
       }
     }
-  }, [price]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [price, symbol, priceDecimals]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -243,8 +292,48 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       toast.warning(t.dataConfidence.closedDesc);
       return;
     }
+    // 该市场自身休市时，市价单同样无处成交。
+    if (marketClosed && type === 'market' && orderCategory === 'spot') {
+      toast.warning(
+        marketClock?.next_open
+          ? `${market} closed · next open ${marketClock.next_open}`
+          : `${market} is closed`,
+      );
+      return;
+    }
     if (dataConfidence.level === 'degraded' && !showDegradedConfirm) { setShowDegradedConfirm(true); return; }
     if (!quantity || parseFloat(quantity) <= 0) { toast.warning(t.orderEntry.invalidAmount); return; }
+    if (quantityNotLot(quantity)) {
+      toast.warning(t.orderEntry.lotError || `Quantity must be a multiple of ${lotSize}`);
+      return;
+    }
+    // OCO / 追踪止损是本地撮合特性，外币市场由后端虚拟引擎记账，不支持。
+    if (isForeignMarket && (orderCategory === 'oco' || type === 'trailing_stop')) {
+      toast.warning(t.orderEntry.unsupportedOnMarket || `Not supported on ${market}`);
+      return;
+    }
+    // 涨跌停校验：A 股超价直接被交易所拒单，前端先拦住。
+    const pricedForBand = type === 'limit' ? price : (limitPrice || '');
+    if (priceOutOfBand(pricedForBand)) {
+      toast.warning(
+        t.orderEntry.priceBandError ||
+          `Price outside ${priceLimitPct}% band (${priceBand!.low.toFixed(priceDecimals)}–${priceBand!.high.toFixed(priceDecimals)})`,
+      );
+      return;
+    }
+    // 港交所/东证/上交所只接受其最小跳动倍数。
+    if (isForeignMarket && pricedForBand) {
+      const p = parseFloat(pricedForBand);
+      if (p > 0) {
+        const tick = tickFor(p);
+        if (Math.abs(roundToTick(p, tick) - p) > 1e-9) {
+          setPrice(roundToTick(p, tick).toFixed(priceDecimals));
+          setLimitPrice(roundToTick(p, tick).toFixed(priceDecimals));
+          toast.warning(t.orderEntry.tickError || `Price snapped to the ${tick} tick`);
+          return;
+        }
+      }
+    }
 
     let order = null;
 
@@ -346,7 +435,10 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     if (dataConfidence.level === 'stale') return true;
     // 收盘时市价单无法成交，保持禁用直到开盘
     if (dataConfidence.level === 'closed' && type === 'market' && orderCategory === 'spot') return true;
+    if (marketClosed && type === 'market' && orderCategory === 'spot') return true;
     if (!quantity || parseFloat(quantity) <= 0) return true;
+    if (quantityNotLot(quantity)) return true;
+    if (priceOutOfBand(type === 'limit' ? price : (orderCategory === 'conditional' ? limitPrice : ''))) return true;
     
     if (orderCategory === 'spot') {
       if (type === 'limit' && (!price || parseFloat(price) <= 0)) return true;
@@ -390,6 +482,14 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     <div className={`card ${styles.container} ${focusMode ? styles.focused : ''} animate-fade`}>
       <div className="card-header">
         <span className="card-title">{t.orderEntry.title}</span>
+        <span className={styles.marketBadge} title={marketDef ? `${marketDef.name} · ${marketDef.exchange} · ${marketDef.settlement}` : undefined}>
+          {market} · {quoteAsset}
+          {marketClock && (
+            <span className={marketClock.is_open ? styles.sessionOpen : styles.sessionClosed}>
+              {marketClock.is_open ? (marketClock.session === 'break' ? 'BREAK' : 'OPEN') : 'CLOSED'}
+            </span>
+          )}
+        </span>
         {focusMode && <span className={styles.focusBadge}>Focus</span>}
       </div>
       
@@ -414,6 +514,8 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
             type="button" 
             className={`${styles.categoryTab} ${orderCategory === 'oco' ? styles.active : ''}`}
             onClick={() => setOrderCategory('oco')}
+            disabled={isForeignMarket}
+            title={isForeignMarket ? (t.orderEntry.unsupportedOnMarket || `Not supported on ${market}`) : undefined}
           >
             OCO
           </button>
@@ -438,7 +540,9 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
             <div className={styles.typeToggle}>
               <button type="button" className={`${styles.typeBtn} ${type === 'stop_limit' ? styles.active : ''}`} onClick={() => setType('stop_limit')}>Stop</button>
               <button type="button" className={`${styles.typeBtn} ${type === 'take_profit_limit' ? styles.active : ''}`} onClick={() => setType('take_profit_limit')}>TP</button>
-              <button type="button" className={`${styles.typeBtn} ${type === 'trailing_stop' ? styles.active : ''}`} onClick={() => setType('trailing_stop')}>Trail</button>
+              {!isForeignMarket && (
+                <button type="button" className={`${styles.typeBtn} ${type === 'trailing_stop' ? styles.active : ''}`} onClick={() => setType('trailing_stop')}>Trail</button>
+              )}
             </div>
           )}
         </div>
@@ -461,6 +565,11 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
                   <button type="button" className={styles.quickFillBtn} onClick={setFromMid}>{t.orderEntry.mid}</button>
                   <button type="button" className={styles.quickFillBtn} onClick={setFromBestAsk}>{t.orderEntry.ask1}</button>
                 </div>
+                {priceBand && (
+                  <div className={styles.bandHint}>
+                    {t.orderEntry.priceBand || 'Limit band'}: {priceBand.low.toFixed(priceDecimals)} – {priceBand.high.toFixed(priceDecimals)}
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -563,11 +672,21 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
 
         {/* Amount Input */}
         <div className={styles.inputGroup}>
-          <label className={styles.label}>{t.orderEntry.amount}</label>
+          <label className={styles.label}>
+            {t.orderEntry.amount}
+            {lotSize > 1 && <span className={styles.lotHint}> · {lotSize} {t.orderEntry.perLot || 'per lot'}</span>}
+          </label>
           <div className={styles.inputWrapper}>
-            <input ref={quantityInputRef} type="text" inputMode="decimal" className={`input ${styles.input}`} value={quantity} onChange={(e) => setQuantity(e.target.value)} onFocus={handleInputFocus('quantity')} onBlur={handleInputBlur} placeholder="0.00" style={{ paddingRight: '48px' }} />
+            <button type="button" className={styles.stepBtn} onClick={() => setQuantity((q) => String(Math.max(0, (parseFloat(q) || 0) - lotSize)))}><Icon name="minus" size="xs" /></button>
+            <input ref={quantityInputRef} type="text" inputMode="decimal" className={`input ${styles.input}`} value={quantity} onChange={(e) => setQuantity(e.target.value)} onFocus={handleInputFocus('quantity')} onBlur={handleInputBlur} placeholder={lotSize > 1 ? String(lotSize) : '0.00'} style={{ paddingRight: '48px' }} />
+            <button type="button" className={styles.stepBtn} onClick={() => setQuantity((q) => String((parseFloat(q) || 0) + lotSize))}><Icon name="plus" size="xs" /></button>
             <span className={styles.inputSuffix} style={{ right: '8px' }}>{baseAsset}</span>
           </div>
+          {quantityNotLot(quantity) && (
+            <div className={styles.inputError}>
+              {t.orderEntry.lotError || `Quantity must be a multiple of ${lotSize}`}
+            </div>
+          )}
           <div className={styles.sliderRow}>
             <div className={styles.sliderContainer}>
               <QuantitySlider value={quantityPercent} onChange={(p) => { setQuantityPercent(p); updateQuantityFromPercent(p); }} estimatedQty={quantity || '0'} />
@@ -604,20 +723,29 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
           </div>
           <div className={styles.estimatedRow}>
             <span className={styles.estimatedLabel}>{t.orderEntry.fee}</span>
-            <span className={`${styles.estimatedValue} tabular-nums`}>{feeValue}</span>
+            <span className={`${styles.estimatedValue} tabular-nums`}>{currencySymbol(quoteAsset)}{feeValue}</span>
           </div>
         </div>
 
         {/* Total & Available */}
         <div className={styles.totalRow}>
           <span className={styles.totalLabel}>{t.orderEntry.total}</span>
-          <span className={`${styles.totalValue} tabular-nums`}>{total} {quoteAsset}</span>
+          <span className={`${styles.totalValue} tabular-nums`}>{currencySymbol(quoteAsset)}{total}</span>
         </div>
 
         <div className={styles.balanceRow}>
           <span className={styles.balanceLabel}>{t.orderEntry.available}</span>
           <span className={`${styles.balanceValue} tabular-nums`}>
-            {side === 'buy' ? `${parseFloat(quoteBalance?.available ?? '0').toFixed(2)} ${quoteAsset}` : `${parseFloat(baseBalance?.available ?? '0').toFixed(6)} ${baseAsset}`}
+            {side === 'buy'
+              ? isForeignMarket
+                ? (() => {
+                    const usd = balances.find((b) => b.asset === 'USD');
+                    const rate = useMarketsStore.getState().usdPerUnit(quoteAsset);
+                    const native = rate > 0 ? parseFloat(usd?.available || '0') / rate : 0;
+                    return `≈${currencySymbol(quoteAsset)}${native.toFixed(priceDecimals)}`;
+                  })()
+                : `${parseFloat(quoteBalance?.available ?? '0').toFixed(2)} USD`
+              : `${parseFloat(baseBalance?.available ?? '0').toFixed(6)} ${baseAsset}`}
           </span>
         </div>
 
