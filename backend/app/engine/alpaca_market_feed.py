@@ -217,6 +217,14 @@ class AlpacaMarketFeedService:
           the freshest one available; once it is shut the consolidated close
           is the authoritative price, not a single-venue print that missed the
           closing auction.
+        * A book is only worth showing if a consumer could actually trade
+          against it. A one-sided or absurdly wide IEX book (measured: SPY
+          bid 712.63 / ask 764.24, a 7% spread) is withheld and
+          ``book_available`` is set False rather than passing it off as a
+          market.
+        * ``volume`` means the session's consolidated volume. IEX's own number
+          is a fraction of it and is replaced or zeroed, never shown as the
+          total.
 
         The quote is also stamped with ``age_seconds`` and ``is_stale`` so the
         UI can tell a live feed from a correctly-remembered close.
@@ -232,6 +240,15 @@ class AlpacaMarketFeedService:
             updates["prev_close"] = quote.prev_close or stats.get("prev_close")
             updates["day_high"] = quote.day_high or stats.get("day_high")
             updates["day_low"] = quote.day_low or stats.get("day_low")
+
+            # IEX is one venue carrying a fraction of consolidated volume, so
+            # its size is not "the volume of the day" and must not be rendered
+            # as such. Prefer the consolidated figure; drop the venue's number
+            # rather than pass off ~80 shares as a session total.
+            if stats.get("volume"):
+                updates["volume"] = int(stats["volume"])
+            elif quote.volume:
+                updates["volume"] = 0
 
             trusted = stats.get("last")
             day_lo = updates.get("day_low")
@@ -251,8 +268,33 @@ class AlpacaMarketFeedService:
                 ):
                     updates["last"] = trusted
 
+        # An IEX-only book is one-sided or absurdly wide around the close/in the
+        # after hours. A consumer that sees a bid must be able to trade against
+        # it, so such a book is withheld instead of passed through as if it were
+        # the market. The real print above still stands.
+        book = bool(
+            AlpacaDataAdapter.is_tradeable_quote(quote.bid, quote.ask)
+        )
+        updates["book_available"] = book
+        if not book:
+            updates["bid"] = 0.0
+            updates["ask"] = 0.0
+
+        # When ``last`` came from the consolidated tape, its timestamp must
+        # come with it: the venue quote's own time describes a different print,
+        # so the age shown would belong to the wrong moment.
+        effective_ts = quote.timestamp
+        if "last" in updates and stats.get("last_ts"):
+            try:
+                effective_ts = datetime.fromtimestamp(
+                    float(stats["last_ts"]), tz=timezone.utc
+                )
+                updates["timestamp"] = effective_ts
+            except Exception:
+                effective_ts = quote.timestamp
+
         try:
-            updates.update(freshness_updates(quote.timestamp, market_of(symbol)))
+            updates.update(freshness_updates(effective_ts, market_of(symbol)))
         except Exception:
             pass
 
@@ -312,8 +354,13 @@ class AlpacaMarketFeedService:
         return self.SNAPSHOT_TTL_CLOSED if closed else self.SNAPSHOT_TTL
 
     @staticmethod
-    def _daily_from_meta(meta: Dict[str, Any]) -> Dict[str, float]:
-        """Consolidated daily context from a Yahoo chart ``meta`` block."""
+    def _daily_from_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Consolidated daily context from a Yahoo chart ``meta`` block.
+
+        ``last_ts`` is the exchange time of ``last`` itself. Without it the
+        served quote keeps the venue quote's timestamp while carrying a
+        different venue's price, and the age shown belongs to the wrong print.
+        """
 
         def num(key: str) -> Optional[float]:
             value = meta.get(key)
@@ -321,7 +368,7 @@ class AlpacaMarketFeedService:
                 return float(value)
             return None
 
-        entry: Dict[str, float] = {"consolidated": 1.0}
+        entry: Dict[str, Any] = {"consolidated": 1.0}
         for key, source in (
             ("prev_close", "chartPreviousClose"),
             ("last", "regularMarketPrice"),
@@ -332,6 +379,13 @@ class AlpacaMarketFeedService:
             value = num(source) or (num("previousClose") if key == "prev_close" else None)
             if value is not None:
                 entry[key] = value
+
+        # Exchange time of the consolidated print, so ``last`` and its age
+        # describe the same moment.
+        trade_ts = meta.get("regularMarketTime")
+        if isinstance(trade_ts, (int, float)) and trade_ts > 0:
+            entry["last_ts"] = float(trade_ts)
+
         return entry if len(entry) > 1 else {}
 
     def _refresh_consolidated_daily(self, syms: List[str]) -> List[str]:

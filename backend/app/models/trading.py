@@ -51,6 +51,10 @@ class Quote(BaseModel):
     day_high: Optional[float] = None
     day_low: Optional[float] = None
     source: str = "us"
+    # False when the venue's book is one-sided or absurdly wide (e.g. a single
+    # IEX venue after hours). Consumers reading bid/ask must treat 0/0 with
+    # ``book_available`` False as "there is no book", never as a crossed quote.
+    book_available: bool = False
     # Set by the feed when the quote is served: how old this print is, in
     # seconds, and whether a fresher print is expected (open session). The UI
     # uses this to stop rendering a stale close as a live price.

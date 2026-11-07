@@ -25,6 +25,8 @@ export interface Quote {
   age_seconds?: number | null;
   /** 开盘时段内成交超过阈值未更新即为过期，UI 不应再把它当实时价。 */
   is_stale?: boolean | null;
+  /** 后端判定：bid/ask 空或过宽时为 false，此时 bid/ask 已被清零，不可当报价使用。 */
+  book_available?: boolean | null;
 }
 
 export interface BackendPosition {
@@ -114,6 +116,8 @@ export interface ModelContext {
     ask?: number | null;
     last?: number;
     spread?: number | null;
+    /** 后端判定：两侧盘口可交易。false 时 bid/ask 为 0，spread 为 null。 */
+    book_available?: boolean;
     timestamp?: string | null;
   };
   /** @deprecated legacy alias; prefer real_time_quote */

@@ -107,9 +107,10 @@ class YahooQuoteFeed:
         prev_raw = meta.get("previousClose") or meta.get("chartPreviousClose")
         prev_close = float(prev_raw) if isinstance(prev_raw, (int, float)) else None
 
-        # Yahoo exposes a last price only, no book smoothing. A bid/ask built
-        # around it is an estimate, so it is left at 0 here and only
-        # synthesized by the display layer that knows it is an estimate.
+        # Yahoo publishes a last price only, never a book. A bid/ask built
+        # around it would be an estimate presented as a quote, so both stay 0
+        # and ``book_available`` (default False) tells the UI to say "no book"
+        # rather than draw a ladder nobody quoted.
         bid = 0.0
         ask = 0.0
 
