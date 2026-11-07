@@ -348,3 +348,37 @@ class TestDailyStatsWarmup:
 
         monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client", boom)
         assert feed.get_daily_stats("SPY") == {}
+
+
+class TestDayPriceGuard:
+    """Regression: a stale bid below the session low drove both the price and
+    the day change. Production showed AAPL 328.06 with a 338.59-345.765 range."""
+
+    def _quote(self, last):
+        from app.models.trading import Quote
+
+        return Quote(symbol="AAPL", bid=last, ask=0.0, last=last)
+
+    def test_stale_price_outside_range_is_rejected(self):
+        from app.api.routes import _pick_day_price
+
+        daily = {"prev_close": 344.6, "last": 342.41, "day_high": 345.765, "day_low": 338.59}
+        price = _pick_day_price(self._quote(328.06), daily, [], 338.59, 345.765)
+        assert price == 342.41
+
+    def test_in_range_quote_is_preferred_over_snapshot(self):
+        from app.api.routes import _pick_day_price
+
+        daily = {"prev_close": 344.6, "last": 342.41, "day_high": 345.765, "day_low": 338.59}
+        assert _pick_day_price(self._quote(343.9), daily, [], 338.59, 345.765) == 343.9
+
+    def test_without_range_the_quote_is_used(self):
+        from app.api.routes import _pick_day_price
+
+        assert _pick_day_price(self._quote(100.0), {}, [], None, None) == 100.0
+
+    def test_every_price_outside_range_yields_none(self):
+        from app.api.routes import _pick_day_price
+
+        daily = {"last": 1.0, "day_high": 345.765, "day_low": 338.59}
+        assert _pick_day_price(self._quote(328.06), daily, [], 338.59, 345.765) is None
