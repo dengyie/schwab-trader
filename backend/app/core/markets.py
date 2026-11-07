@@ -17,6 +17,25 @@ from zoneinfo import ZoneInfo
 # Weekday numbering follows datetime.weekday(): Monday == 0.
 WEEKDAYS_MON_FRI = (0, 1, 2, 3, 4)
 
+# A last price may sit a hair outside the session range, but a bid-only or very
+# stale quote can land far outside it. Anything beyond this tolerance is not a
+# tradeable price for the session, so it must never become a mark or a row price.
+DAY_RANGE_TOLERANCE = 1.002
+
+
+def within_day_range(price: Optional[float], low: Optional[float], high: Optional[float]) -> bool:
+    """True when ``price`` is plausibly inside today's low/high range.
+
+    Missing prices or missing range return True: this guard only rejects data
+    that positively contradicts itself, it never invents a rejection.
+    """
+    if not price or price <= 0 or not low or not high or low <= 0 or high <= 0:
+        return True
+    lo = min(low, high) / DAY_RANGE_TOLERANCE
+    hi = max(low, high) * DAY_RANGE_TOLERANCE
+    return lo <= price <= hi
+
+
 
 @dataclass(frozen=True)
 class Session:

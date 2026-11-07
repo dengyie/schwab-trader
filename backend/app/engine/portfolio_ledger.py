@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from app.core.markets import local_date, market_of
+from app.core.markets import local_date, market_of, within_day_range
 from app.models.trading import Portfolio, Position, Trade, OrderSide, Quote
 
 
@@ -45,11 +45,21 @@ class PortfolioLedger:
         return self.portfolio.positions.get(symbol.upper())
 
     def update_quote(self, quote: Quote) -> None:
-        """Mark-to-market revaluation on fresh quote."""
+        """Mark-to-market revaluation on fresh quote.
+
+        A lone stale bid (thin IEX moment) can contradict the session range;
+        do not let it pull the mark outside the real day high/low. Prefer a
+        clean in-range print, else keep the previous mark.
+        """
         symbol = quote.symbol.upper()
-        if symbol in self.portfolio.positions:
-            pos = self.portfolio.positions[symbol]
-            pos.current_price = quote.last
+        pos = self.portfolio.positions.get(symbol)
+        if pos is None:
+            return
+        # A lone stale bid (thin IEX moment) can contradict the session range;
+        # do not let it pull the mark outside the real day high/low.
+        if not within_day_range(quote.last, quote.day_low, quote.day_high):
+            return
+        pos.current_price = quote.last
 
     # -- writes -----------------------------------------------------------
     def apply_trade(self, trade: Trade) -> bool:

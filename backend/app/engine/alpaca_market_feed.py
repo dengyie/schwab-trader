@@ -186,10 +186,31 @@ class AlpacaMarketFeedService:
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
 
+    def _decorate_daily(self, quote: Optional[Quote]) -> Optional[Quote]:
+        """Attach the cached daily context (prev close, session high/low).
+
+        Alpaca's quote payloads carry no day range, so a lone bid-only print can
+        look like a valid price to every consumer downstream. Stamping the
+        range the snapshots already know lets those consumers reject a
+        self-contradicting quote instead of each re-deriving the truth.
+        """
+        if quote is None:
+            return None
+        stats = self.daily_stats.get(quote.symbol.upper())
+        if not stats:
+            return quote
+        return quote.model_copy(
+            update={
+                "prev_close": quote.prev_close or stats.get("prev_close"),
+                "day_high": quote.day_high or stats.get("day_high"),
+                "day_low": quote.day_low or stats.get("day_low"),
+            }
+        )
+
     def get_latest_quote(self, symbol: str) -> Optional[Quote]:
         sym = symbol.upper()
         if sym in self.latest_quotes:
-            return self.latest_quotes[sym]
+            return self._decorate_daily(self.latest_quotes[sym])
         try:
             with httpx.Client(headers=self.headers, timeout=5.0) as client:
                 resp = client.get(
@@ -200,7 +221,7 @@ class AlpacaMarketFeedService:
                     q = AlpacaDataAdapter.parse_rest_quote_response(sym, resp.json())
                     if q:
                         self.latest_quotes[sym] = q
-                        return q
+                        return self._decorate_daily(q)
         except Exception:
             pass
         return self.latest_quotes.get(sym)
@@ -336,6 +357,7 @@ class AlpacaMarketFeedService:
                                 last_p = self.last_trade_prices.get(sym)
                                 quote = AlpacaDataAdapter.parse_stream_quote(item, last_price=last_p)
                                 if quote:
+                                    quote = self._decorate_daily(quote) or quote
                                     self.latest_quotes[sym] = quote
                                     for listener in self.quote_listeners:
                                         try:
@@ -387,7 +409,7 @@ class AlpacaMarketFeedService:
                     pass
 
                 for sym in self.symbols:
-                    q = self.latest_quotes.get(sym)
+                    q = self._decorate_daily(self.latest_quotes.get(sym))
                     if q:
                         for listener in self.quote_listeners:
                             try:

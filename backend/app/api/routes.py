@@ -21,11 +21,13 @@ from app.adapters.model_exporter import ModelFeatureExporter
 from app.core.auth import require_auth
 from app.core.config import settings
 from app.core.markets import (
+    DAY_RANGE_TOLERANCE,
     MARKETS,
     market_clock,
     market_of,
     market_payload,
     resolve_symbol,
+    within_day_range,
 )
 from app.core.timeframes import TIMEFRAME_SECONDS
 
@@ -88,18 +90,10 @@ def _normalize_market(code: Optional[str]) -> str:
     return market.code
 
 
-# A last price may sit slightly outside the session range, but a bid-only or
-# very stale quote can land far outside it. Anything beyond this tolerance is
-# not a tradeable price for the session.
-_DAY_RANGE_TOLERANCE = 1.002
-
-
-def _within_day_range(price: Optional[float], low: Optional[float], high: Optional[float]) -> bool:
-    if not price or not low or not high:
-        return True
-    lo = min(low, high) / _DAY_RANGE_TOLERANCE
-    hi = max(low, high) * _DAY_RANGE_TOLERANCE
-    return lo <= price <= hi
+# Day-range guard lives in app.core.markets so the REST rows and the position
+# marks cannot drift apart; keep the local alias for the existing call sites.
+_DAY_RANGE_TOLERANCE = DAY_RANGE_TOLERANCE
+_within_day_range = within_day_range
 
 
 def _pick_day_price(
