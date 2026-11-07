@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { createChart, IChartApi, ColorType, UTCTimestamp, LineSeries, CandlestickSeries, HistogramSeries, CrosshairMode } from 'lightweight-charts';
 import { handleApiError, logError } from '../../utils/errorHandler';
 import { apiFetch } from '../../services/apiClient';
+import { computeSessionStats, marketTimezoneFor } from '../../utils/sessionStats';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useMarketStore } from '../../store/marketStore';
 import { useAutomationStore } from '../../store/automationStore';
@@ -860,30 +861,14 @@ export function PriceChart() {
     };
   }, [chartReady, chartType, timeRange, selectedSymbol, activeIndicators]);
 
-  // 价格信息计算 (融合实时现价和完整历史)
+  // 价格信息计算：只统计最近一个交易日的 K 线，涨跌对照前一日收盘。
+  // 旧实现把整个 K 线窗口（15m 约 10 个交易日）当成"24H"，高低点和
+  // 涨跌幅都是窗口口径，收盘后还把 Yahoo 的 forming 尾根算进去。
   const priceInfo = useMemo(() => {
     const list = klinesRef.current.length > 0 ? klinesRef.current : klines;
     if (list.length === 0) return null;
-    const lastKline = list[list.length - 1];
-    const firstKline = list[0];
-    if (!lastKline || !firstKline) return null;
-    
-    const current = livePrice ?? lastKline.close;
-    const first = firstKline.open;
-    const high24h = Math.max(...list.map(k => k.high), current);
-    const low24h = Math.min(...list.map(k => k.low), current);
-    const totalVolume = list.reduce((sum, k) => sum + k.volume, 0);
-    
-    return {
-      current,
-      high24h,
-      low24h,
-      change: current - first,
-      changePercent: ((current - first) / first) * 100,
-      volume: totalVolume,
-      amplitude: ((high24h - low24h) / low24h) * 100,
-    };
-  }, [klines, livePrice]);
+    return computeSessionStats(list, marketTimezoneFor(selectedSymbol), livePrice ?? null);
+  }, [klines, livePrice, selectedSymbol]);
 
   // 重置图表视图
   const handleReset = useCallback(() => {
@@ -988,11 +973,11 @@ export function PriceChart() {
               </>
             ) : priceInfo && (
               <>
-                <span className={styles.ohlcItem}><label>{isMobile ? 'H' : '24H High'}</label>{priceInfo.high24h.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                <span className={styles.ohlcItem}><label>{isMobile ? 'L' : '24H Low'}</label>{priceInfo.low24h.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className={styles.ohlcItem}><label>{isMobile ? 'H' : (t.chart?.dayHigh ?? 'Day High')}</label>{priceInfo.high.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className={styles.ohlcItem}><label>{isMobile ? 'L' : (t.chart?.dayLow ?? 'Day Low')}</label>{priceInfo.low.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                 {!isMobile && (
                   <>
-                    <span className={styles.ohlcItem}><label>24H Vol</label>{(priceInfo.volume / 1000000).toFixed(2)}M</span>
+                    <span className={styles.ohlcItem}><label>{t.chart?.dayVol ?? 'Day Vol'}</label>{(priceInfo.volume / 1000000).toFixed(2)}M</span>
                     <span className={styles.ohlcItem}><label>Amp</label>{priceInfo.amplitude.toFixed(2)}%</span>
                   </>
                 )}
