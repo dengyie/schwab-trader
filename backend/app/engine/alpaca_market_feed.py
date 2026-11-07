@@ -18,6 +18,7 @@ from app.models.trading import Quote, Bar, Trade, OrderSide, utc_now
 from app.adapters.alpaca_adapter import AlpacaDataAdapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.config import settings
+from app.core.markets import within_day_range
 from app.core.timeframes import TIMEFRAME_TTLS as CORE_TIMEFRAME_TTLS
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,11 @@ class AlpacaMarketFeedService:
                             parsed = AlpacaDataAdapter.parse_rest_bars_response(bars_resp.json(), symbol=sym)
                             if parsed:
                                 self.historical_bars[sym.upper()] = parsed
-                                self.last_trade_prices[sym.upper()] = parsed[-1].close
+                            # NOTE: do not seed last_trade_prices from a bar
+                            # close — that window can reach back into an older
+                            # session and masquerade as a live trade. The first
+                            # real trade, or the snapshot's latestTrade via
+                            # _decorate_daily, is the authoritative price.
                     except Exception as err:
                         logger.warning("Alpaca feed bar error for %s: %s", sym, err)
 
@@ -193,19 +198,36 @@ class AlpacaMarketFeedService:
         look like a valid price to every consumer downstream. Stamping the
         range the snapshots already know lets those consumers reject a
         self-contradicting quote instead of each re-deriving the truth.
+
+        A quote whose ``last`` contradicts that range is healed from the
+        snapshot's latest trade, the same value the tickers endpoint shows.
+        Otherwise a poisoned mark (e.g. seeded from an older session's bar)
+        survives every revaluation, because the guard keeps rejecting the only
+        quote on record instead of replacing it.
         """
         if quote is None:
             return None
         stats = self.daily_stats.get(quote.symbol.upper())
         if not stats:
             return quote
-        return quote.model_copy(
-            update={
-                "prev_close": quote.prev_close or stats.get("prev_close"),
-                "day_high": quote.day_high or stats.get("day_high"),
-                "day_low": quote.day_low or stats.get("day_low"),
-            }
-        )
+
+        day_low = quote.day_low or stats.get("day_low")
+        day_high = quote.day_high or stats.get("day_high")
+        updates = {
+            "prev_close": quote.prev_close or stats.get("prev_close"),
+            "day_high": day_high,
+            "day_low": day_low,
+        }
+
+        trusted_last = stats.get("last")
+        if (
+            trusted_last
+            and not within_day_range(quote.last, day_low, day_high)
+            and within_day_range(trusted_last, day_low, day_high)
+        ):
+            updates["last"] = trusted_last
+
+        return quote.model_copy(update=updates)
 
     def get_latest_quote(self, symbol: str) -> Optional[Quote]:
         sym = symbol.upper()

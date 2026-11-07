@@ -437,3 +437,62 @@ class TestPositionMarkGuard:
         assert decorated.prev_close == 344.6
         # The raw object is not mutated: callers keep owning their cache entry.
         assert raw.day_low is None
+
+    def test_feed_heals_an_out_of_range_last_from_the_snapshot_trade(self):
+        """An out-of-range last must be replaced by the snapshot's latest trade
+        so portfolio marks converge with the watchlist instead of freezing."""
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+        from app.models.trading import Quote
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {
+            "AAPL": {
+                "last": 342.41,
+                "day_high": 345.765,
+                "day_low": 338.59,
+            }
+        }
+        raw = Quote(symbol="AAPL", bid=328.06, ask=0.0, last=328.06)
+
+        decorated = feed._decorate_daily(raw)
+
+        assert decorated.last == 342.41
+
+    def test_feed_keeps_an_in_range_last_untouched(self):
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+        from app.models.trading import Quote
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {
+            "AAPL": {
+                "last": 300.0,
+                "day_high": 345.765,
+                "day_low": 338.59,
+            }
+        }
+        raw = Quote(symbol="AAPL", bid=343.90, ask=0.0, last=343.90)
+
+        decorated = feed._decorate_daily(raw)
+
+        assert decorated.last == 343.90
+
+    def test_feed_does_not_heal_from_a_snapshot_trade_outside_the_range(self):
+        """If even the snapshot's last contradicts the range, leave the quote
+        alone — the downstream guard will reject it rather than invent a price."""
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+        from app.models.trading import Quote
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {
+            "AAPL": {
+                "last": 328.06,
+                "day_high": 345.765,
+                "day_low": 338.59,
+            }
+        }
+        raw = Quote(symbol="AAPL", bid=328.06, ask=0.0, last=328.06)
+
+        decorated = feed._decorate_daily(raw)
+
+        assert decorated.last == 328.06
+        assert decorated.day_high == 345.765
