@@ -221,12 +221,32 @@ describe('OrderBookManager', () => {
       expect(metrics.vwap60s).toBe('0');
     });
 
-    it('does not invent 24h high/low when the feed omits them', () => {
+    it('does not invent session high/low when the feed omits them', () => {
       manager.applyQuote({ symbol: 'SPY', bid: 500.0, ask: 500.05 });
       const metrics = manager.getMetrics();
-      expect(parseFloat(metrics.high24h)).toBeCloseTo(500.02, 2);
-      expect(parseFloat(metrics.low24h)).toBeCloseTo(500.02, 2);
+      // Empty, not masked with the last price: the UI renders "—".
+      expect(metrics.high24h).toBe('');
+      expect(metrics.low24h).toBe('');
       expect(parseFloat(metrics.vol24h)).toBe(0);
+    });
+
+    it('maps the backend day range and prev close onto the session stats', () => {
+      manager.applyQuote({
+        symbol: 'SPY',
+        bid: 500.0,
+        ask: 500.05,
+        last: 505.0,
+        day_high: 507.0,
+        day_low: 498.0,
+        prev_close: 500.0,
+        volume: 61_234_567,
+      });
+      const metrics = manager.getMetrics();
+      expect(parseFloat(metrics.high24h)).toBeCloseTo(507.0, 2);
+      expect(parseFloat(metrics.low24h)).toBeCloseTo(498.0, 2);
+      expect(parseFloat(metrics.vol24h)).toBeCloseTo(61_234_567, 0);
+      expect(parseFloat(metrics.priceChange24h)).toBeCloseTo(5.0, 2);
+      expect(parseFloat(metrics.priceChangePercent24h)).toBeCloseTo(1.0, 2);
     });
 
     it('ingests real trades into VWAP and intensity', () => {

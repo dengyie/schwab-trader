@@ -581,13 +581,6 @@ export const zhCN = {
     account: '账户',
   },
 
-  // 交易页
-  trade: {
-    stats24hHigh: '24H 最高',
-    stats24hLow: '24H 最低',
-    stats24hVol: '24H 成交量',
-  },
-
   // 市场页
   markets: {
     title: '市场中心',

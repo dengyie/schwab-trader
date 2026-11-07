@@ -209,15 +209,15 @@ export function MobileTradePage() {
 
         <div className={styles.headerStats}>
           <div className={styles.statItem}>
-            <span className={styles.statLabel}>24H H</span>
+            <span className={styles.statLabel}>{t.chart?.dayHigh ?? 'Day High'}</span>
             <span className={`${styles.statValue} tabular-nums`}>{metrics?.high24h ? formatPrice(parseFloat(metrics.high24h)) : '—'}</span>
           </div>
           <div className={styles.statItem}>
-            <span className={styles.statLabel}>24H L</span>
+            <span className={styles.statLabel}>{t.chart?.dayLow ?? 'Day Low'}</span>
             <span className={`${styles.statValue} tabular-nums`}>{metrics?.low24h ? formatPrice(parseFloat(metrics.low24h)) : '—'}</span>
           </div>
           <div className={styles.statItem}>
-            <span className={styles.statLabel}>24H Vol</span>
+            <span className={styles.statLabel}>{t.chart?.dayVol ?? 'Day Vol'}</span>
             <span className={`${styles.statValue} tabular-nums`}>{metrics?.vol24h ? formatVolume(parseFloat(metrics.vol24h)) : '—'}</span>
           </div>
         </div>

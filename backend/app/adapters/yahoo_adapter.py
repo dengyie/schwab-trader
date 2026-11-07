@@ -189,6 +189,13 @@ class YahooFinanceAdapter:
         change calculation, so it is dropped. The guard is deliberately narrow:
         only a bar that both lands off the interval grid and has no range is
         removed, so a genuinely traded final bar of an irregular session stays.
+
+        Grid alignment is judged relative to the previous bar, not by an
+        absolute modulo. Daily bars are anchored to the session open (a US
+        13:30 UTC open gives ``time % 86400 == 52200``) and US/CN/HK hourly
+        buckets start at :30, so an absolute test would classify every genuine
+        bar as off-grid and silently drop the flat last day of a suspended
+        stock.
         """
         if len(bars) < 2:
             return bars
@@ -197,7 +204,7 @@ class YahooFinanceAdapter:
             return bars
 
         last = bars[-1]
-        if last.time % step == 0:
+        if (last.time - bars[-2].time) % step == 0:
             return bars
         if last.open != last.high or last.open != last.low or last.open != last.close:
             return bars
