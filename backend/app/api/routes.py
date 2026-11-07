@@ -219,21 +219,38 @@ def create_api_router(
 
         for sym in symbols:
             quote = actual_feed.get_latest_quote(sym)
+            daily = actual_feed.get_daily_stats(sym)
             bars = getattr(actual_feed, "historical_bars", {}).get(sym) or []
-            last_price = quote.last if (quote and quote.last > 0) else (bars[-1].close if bars else None)
+            last_price = (
+                quote.last if (quote and quote.last > 0)
+                else (daily.get("last") if daily.get("last") else None)
+                or (bars[-1].close if bars else None)
+            )
             if not last_price:
                 # No live quote and no historical bars: omit instead of inventing a price.
                 continue
-            prev_close = quote.prev_close if (quote and quote.prev_close) else None
-            open_price = prev_close or (bars[0].open if bars else last_price)
-            high = (quote.day_high if quote and quote.day_high else None) or max(
-                [b.high for b in bars], default=last_price
+            # Day change is measured against the previous close, which is what
+            # a watchlist row is expected to show.
+            open_price = (
+                (quote.prev_close if (quote and quote.prev_close) else None)
+                or daily.get("prev_close")
+                or daily.get("day_open")
+                or (bars[0].open if bars else last_price)
             )
-            low = (quote.day_low if quote and quote.day_low else None) or min(
-                [b.low for b in bars], default=last_price
+            high = (
+                (quote.day_high if quote and quote.day_high else None)
+                or daily.get("day_high")
+                or max([b.high for b in bars], default=last_price)
             )
-            volume = (quote.volume if quote else 0) or (
-                sum([b.volume for b in bars]) if bars else 0.0
+            low = (
+                (quote.day_low if quote and quote.day_low else None)
+                or daily.get("day_low")
+                or min([b.low for b in bars], default=last_price)
+            )
+            volume = (
+                (daily.get("volume") if daily.get("volume") else 0)
+                or (quote.volume if quote else 0)
+                or (sum([b.volume for b in bars]) if bars else 0.0)
             )
             price_change = last_price - open_price
             pct_change = (price_change / open_price * 100.0) if open_price else 0.0

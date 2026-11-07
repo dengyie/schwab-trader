@@ -245,3 +245,31 @@ class TestFxService:
     def test_unknown_currency_is_identity(self):
         service = FxService(enabled=False)
         assert service.usd_per_unit("XXX") == 1.0
+
+
+class TestSnapshotParser:
+    def test_parse_snapshots_response(self):
+        from app.adapters.alpaca_adapter import AlpacaDataAdapter
+
+        payload = {
+            "SPY": {
+                "prevDailyBar": {"c": 733.43},
+                "dailyBar": {"o": 734.0, "h": 735.5, "l": 733.0, "c": 735.4, "v": 50000000},
+                "latestTrade": {"p": 735.4},
+            },
+            "UNKNOWN_SYM": {"error": "invalid symbol"},
+        }
+        stats = AlpacaDataAdapter.parse_snapshots_response(payload)
+        assert stats["SPY"]["prev_close"] == 733.43
+        assert stats["SPY"]["day_open"] == 734.0
+        assert stats["SPY"]["day_high"] == 735.5
+        assert stats["SPY"]["day_low"] == 733.0
+        assert stats["SPY"]["volume"] == 50000000
+        assert "UNKNOWN_SYM" not in stats
+
+    def test_parse_snapshots_response_skips_garbage(self):
+        from app.adapters.alpaca_adapter import AlpacaDataAdapter
+
+        assert AlpacaDataAdapter.parse_snapshots_response(None) == {}
+        assert AlpacaDataAdapter.parse_snapshots_response({"X": None}) == {}
+        assert AlpacaDataAdapter.parse_snapshots_response("not a dict") == {}

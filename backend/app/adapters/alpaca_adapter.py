@@ -183,6 +183,47 @@ class AlpacaDataAdapter:
             return None
 
     @staticmethod
+    def parse_snapshots_response(res_json: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        """Parses ``/v2/stocks/snapshots`` into per-symbol daily context.
+
+        The multi-symbol snapshot endpoint returns, for every requested symbol:
+        ``{"prevDailyBar": {...}, "dailyBar": {...}, "latestTrade": {...}}``.
+        A single request therefore yields the previous close plus today's
+        open/high/low/volume and last trade for the whole catalog, instead of
+        one historical call per symbol.
+        """
+        stats: Dict[str, Dict[str, float]] = {}
+        if not isinstance(res_json, dict):
+            return stats
+
+        def _num(obj: Any, key: str) -> Optional[float]:
+            if not isinstance(obj, dict):
+                return None
+            value = obj.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+            return None
+
+        for symbol, snap in res_json.items():
+            if not isinstance(snap, dict):
+                continue
+            bar = snap.get("dailyBar")
+            entry: Dict[str, float] = {}
+            for key, value in (
+                ("prev_close", _num(snap.get("prevDailyBar"), "c")),
+                ("last", _num(snap.get("latestTrade"), "p") or _num(bar, "c")),
+                ("day_open", _num(bar, "o")),
+                ("day_high", _num(bar, "h")),
+                ("day_low", _num(bar, "l")),
+                ("volume", _num(bar, "v")),
+            ):
+                if value is not None:
+                    entry[key] = value
+            if entry:
+                stats[str(symbol).upper()] = entry
+        return stats
+
+    @staticmethod
     def parse_rest_bars_response(res_json: Dict[str, Any], symbol: Optional[str] = None) -> List[Bar]:
         """
         Parses Alpaca REST /v2/stocks/bars or /v2/stocks/{symbol}/bars response.
