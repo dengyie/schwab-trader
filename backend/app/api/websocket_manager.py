@@ -20,17 +20,36 @@ class WebSocketManager:
     def __init__(self, throttle_ms: float = 40.0):
         # Store connected websockets and their subscribed ticker sets
         self.active_connections: Dict[WebSocket, Set[str]] = {}
+        # Accepted is not the same as trusted: the endpoint accepts the socket
+        # before it has the token, and only this set may ever receive a message.
+        self._authenticated: Set[WebSocket] = set()
         self.last_broadcast_ts: Dict[str, float] = {}
         self.throttle_sec = throttle_ms / 1000.0
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        # Default subscribe to SPY
-        self.active_connections[websocket] = {"SPY"}
+        # No subscriptions and no trusted status until the caller authenticates.
+        self.active_connections[websocket] = set()
+
+    def mark_authenticated(self, websocket: WebSocket) -> None:
+        if websocket in self.active_connections:
+            self._authenticated.add(websocket)
+
+    def is_authenticated(self, websocket: WebSocket) -> bool:
+        return websocket in self._authenticated
+
+    async def close(self, websocket: WebSocket, code: int = 1000, reason: str = "") -> None:
+        """Close and forget a connection that must be refused (e.g. bad auth)."""
+        self.disconnect(websocket)
+        try:
+            await websocket.close(code=code, reason=reason)
+        except Exception:
+            # The peer may already be gone; nothing left to release.
+            pass
 
     def disconnect(self, websocket: WebSocket) -> None:
-        if websocket in self.active_connections:
-            del self.active_connections[websocket]
+        self.active_connections.pop(websocket, None)
+        self._authenticated.discard(websocket)
 
     def subscribe(self, websocket: WebSocket, symbol: str) -> None:
         if websocket in self.active_connections:
@@ -62,10 +81,15 @@ class WebSocketManager:
             return False
 
     def _targets(self, symbol: str | None = None) -> List[WebSocket]:
+        trusted = [
+            ws for ws in self.active_connections if ws in self._authenticated
+        ]
         if symbol is None:
-            return list(self.active_connections.keys())
+            return trusted
         sym = symbol.upper()
-        return [ws for ws, subs in list(self.active_connections.items()) if sym in subs]
+        return [
+            ws for ws in trusted if sym in self.active_connections[ws]
+        ]
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         """Broadcast message to all connected clients immediately."""
