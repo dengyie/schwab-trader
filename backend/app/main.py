@@ -32,14 +32,57 @@ from app.engine.market_router import MarketRouterBroker
 from app.api.websocket_manager import WebSocketManager
 from app.api.routes import create_api_router
 
-# Give the root logger a handler before the engine is constructed below: the
-# virtual book restores (and any other import-time log) would otherwise be
-# dropped, because uvicorn only wires logging when the app starts.
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(levelname)s [%(name)s] %(message)s",
-    )
+LOG_FORMAT = "%(levelname)s [%(name)s] %(message)s"
+
+
+class _RedactWsQueryFilter(logging.Filter):
+    """Keep the legacy ``?token=`` out of uvicorn's access records.
+
+    uvicorn logs each WebSocket handshake from the protocol layer, which holds
+    its own copy of the scope: no ASGI middleware can see that call. The only
+    interception point that works is the LogRecord itself, so this filter
+    strips the query string from the request path before a handler formats it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.args or "WebSocket" not in str(record.msg):
+            return True
+        args = tuple(record.args)
+        if len(args) < 2 or not isinstance(args[1], str):
+            return True
+        path = args[1]
+        clean = path.split("?", 1)[0]
+        if clean != path:
+            record.args = (args[0], clean) + args[2:]
+        return True
+
+
+def _configure_logging() -> None:
+    """Make app loggers reach journald.
+
+    uvicorn only configures its own ``uvicorn.*`` loggers, so the root logger
+    keeps no handler and stdlib emits nothing below WARNING: every
+    ``logger.info`` in this app was silently dropped in production.
+
+    Called at import time so the virtual-book restore (which runs while this
+    module is built) is visible, and again from the lifespan; it is idempotent.
+    """
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(handler)
+    root.setLevel(level)
+
+    # uvicorn logs WebSocket handshakes from its protocol layer, so the app
+    # scope cannot be scrubbed; filter the record instead.
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _RedactWsQueryFilter) for f in uvicorn_error.filters):
+        uvicorn_error.addFilter(_RedactWsQueryFilter())
+
+
+_configure_logging()
 
 # 1. Market Data Provider Factory
 if settings.market_data_provider == "alpaca":
@@ -97,10 +140,6 @@ else:
 
 # One account view across Alpaca (US) and the multi-market virtual engine.
 broker: BaseBroker = MarketRouterBroker(us_broker, virtual_engine)
-
-# Compatibility alias: legacy tooling/tests expected the local matching
-# engine; the account-facing broker is the multi-market router.
-engine = virtual_engine
 
 ws_manager = WebSocketManager()
 
@@ -162,30 +201,6 @@ feed.subscribe_trade(on_feed_trade)
 broker.register_fill_listener(on_order_fill)
 
 
-def _configure_logging() -> None:
-    """Make app loggers reach journald.
-
-    uvicorn only configures its own ``uvicorn.*`` loggers, so the root logger
-    keeps no handler and stdlib emits nothing below WARNING: every
-    ``logger.info`` in this app was silently dropped in production.
-    """
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    root = logging.getLogger()
-    if not root.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(levelname)s [%(name)s] %(message)s"
-        ))
-        root.addHandler(handler)
-    root.setLevel(level)
-
-    # uvicorn logs WebSocket handshakes from its protocol layer, so the app
-    # scope cannot be scrubbed; filter the record instead.
-    uvicorn_error = logging.getLogger("uvicorn.error")
-    if not any(isinstance(f, _RedactWsQueryFilter) for f in uvicorn_error.filters):
-        uvicorn_error.addFilter(_RedactWsQueryFilter())
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _main_loop
@@ -218,28 +233,6 @@ app.include_router(create_api_router(broker, feed))
 
 
 WS_AUTH_TIMEOUT_SEC = 5.0
-
-
-class _RedactWsQueryFilter(logging.Filter):
-    """Keep the legacy ``?token=`` out of uvicorn's access records.
-
-    uvicorn logs each WebSocket handshake from the protocol layer, which holds
-    its own copy of the scope: no ASGI middleware can see that call. The only
-    interception point that works is the LogRecord itself, so this filter
-    strips the query string from the request path before a handler formats it.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not record.args or "WebSocket" not in str(record.msg):
-            return True
-        args = tuple(record.args)
-        if len(args) < 2 or not isinstance(args[1], str):
-            return True
-        path = args[1]
-        clean = path.split("?", 1)[0]
-        if clean != path:
-            record.args = (args[0], clean) + args[2:]
-        return True
 
 
 def _clean_symbol(value: object, market: object = None) -> str | None:

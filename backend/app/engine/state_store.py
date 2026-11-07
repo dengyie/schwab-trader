@@ -76,22 +76,37 @@ class JsonStateStore:
                 snapshot = json.loads(raw)
             except ValueError as exc:
                 # Never drop the bytes: keep them for inspection and start clean.
-                quarantine = self.path.with_suffix(
-                    f".corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
-                )
-                try:
-                    os.replace(self.path, quarantine)
-                    logger.warning(
-                        "Virtual book at %s was corrupt (%s); moved to %s",
-                        self.path, exc, quarantine,
-                    )
-                except OSError:
-                    logger.warning("Virtual book at %s was corrupt: %s", self.path, exc)
+                self.quarantine("corrupt", detail=str(exc))
                 return None
             if not isinstance(snapshot, dict):
                 logger.warning("Virtual book at %s is not an object; ignoring", self.path)
                 return None
             return snapshot
+
+    def quarantine(self, reason: str = "rejected", detail: str = "") -> None:
+        """Move the snapshot aside so it is never rebuilt from again.
+
+        A structurally invalid file that stays in place would be re-read and
+        re-rejected on every boot, so the same half-broken book would come back
+        each time. Renaming keeps the bytes for inspection and lets the engine
+        write a clean snapshot in its place.
+        """
+        with self._lock:
+            if not self.path.exists():
+                return
+            target = self.path.with_suffix(
+                f".{reason}-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            try:
+                os.replace(self.path, target)
+                logger.warning(
+                    "Virtual book at %s quarantined to %s%s",
+                    self.path,
+                    target,
+                    f": {detail}" if detail else "",
+                )
+            except OSError as exc:
+                logger.warning("Virtual book at %s could not be quarantined: %s", self.path, exc)
 
     def save(self, snapshot: Dict[str, Any]) -> bool:
         """Atomically replace the snapshot. Returns False if the write failed."""

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
 from app import main
-from app.main import app, ledger, engine, virtual_engine
+from app.main import app, ledger, virtual_engine
 
 # Pin a deterministic token for the test session (settings are read from env at import).
 settings.admin_token = "test-token"

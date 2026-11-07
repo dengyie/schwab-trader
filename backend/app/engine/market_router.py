@@ -161,7 +161,7 @@ class MarketRouterBroker(BaseBroker):
         if ledger is not None:
             try:
                 ledger.refresh_fx()
-                return dict(ledger.portfolio.fx_rates)
+                return ledger.fx_rates()
             except Exception as exc:
                 logger.warning("FX refresh failed: %s", exc)
         return {"USD": 1.0}

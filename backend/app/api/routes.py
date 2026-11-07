@@ -21,7 +21,6 @@ from app.adapters.model_exporter import ModelFeatureExporter
 from app.core.auth import require_auth
 from app.core.config import settings
 from app.core.markets import (
-    DAY_RANGE_TOLERANCE,
     MARKETS,
     market_clock,
     market_of,
@@ -91,9 +90,7 @@ def _normalize_market(code: Optional[str]) -> str:
 
 
 # Day-range guard lives in app.core.markets so the REST rows and the position
-# marks cannot drift apart; keep the local alias for the existing call sites.
-_DAY_RANGE_TOLERANCE = DAY_RANGE_TOLERANCE
-_within_day_range = within_day_range
+# marks cannot drift apart.
 
 
 def _pick_day_price(
@@ -119,7 +116,7 @@ def _pick_day_price(
     if not candidates:
         return None
     for candidate in candidates:
-        if _within_day_range(candidate, low, high):
+        if within_day_range(candidate, low, high):
             return candidate
     return None
 
@@ -147,21 +144,8 @@ def _position_payload(pos: Position, fx_rates: Dict[str, float]) -> Dict[str, An
     }
 
 
-def create_api_router(
-    ledger_or_broker: Any,
-    engine: Optional[Any] = None,
-    feed: Any = None
-) -> APIRouter:
-    # Support both create_api_router(ledger, engine, feed) and create_api_router(broker, feed)
-    if engine is not None and hasattr(engine, "submit_order"):
-        broker: BaseBroker = engine
-        actual_feed = feed
-    elif hasattr(ledger_or_broker, "submit_order"):
-        broker: BaseBroker = ledger_or_broker
-        actual_feed = engine if feed is None else feed
-    else:
-        broker: BaseBroker = engine
-        actual_feed = feed
+def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
+    actual_feed = feed
 
     router = APIRouter(prefix="/api")
 
@@ -234,7 +218,7 @@ def create_api_router(
                 q = actual_feed.get_latest_quote(sym)
                 current_p = q.last if (q and q.last > 0) else item["price"]
                 # A stale bid-only quote must not drag the row outside the range.
-                if not _within_day_range(current_p, item.get("low24h"), item.get("high24h")):
+                if not within_day_range(current_p, item.get("low24h"), item.get("high24h")):
                     current_p = item["price"]
                 prev = item.get("openPrice") or current_p
                 copy_item = dict(item)
