@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-from urllib.parse import parse_qsl, urlencode
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -146,6 +145,12 @@ def _configure_logging() -> None:
         root.addHandler(handler)
     root.setLevel(level)
 
+    # uvicorn logs WebSocket handshakes from its protocol layer, so the app
+    # scope cannot be scrubbed; filter the record instead.
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _RedactWsQueryFilter) for f in uvicorn_error.filters):
+        uvicorn_error.addFilter(_RedactWsQueryFilter())
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -180,51 +185,28 @@ app.include_router(create_api_router(broker, feed))
 
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 WS_AUTH_TIMEOUT_SEC = 5.0
-LEGACY_TOKEN_KEY = "ws.legacy_query_token"
 
 
-class LegacyQueryTokenMiddleware:
-    """Hide the legacy ``?token=`` credential from the access log.
+class _RedactWsQueryFilter(logging.Filter):
+    """Keep the legacy ``?token=`` out of uvicorn's access records.
 
-    uvicorn logs ``get_path_with_query_string(scope)`` once per handshake, so a
-    tab still running the pre-AUTH bundle keeps writing the admin token to
-    journald. Routing only uses ``scope["path"]``, so the token is moved into a
-    scoped key here: the endpoint reads it through ``_legacy_query_token`` and
-    the access log shows a bare ``/ws``.
+    uvicorn logs each WebSocket handshake from the protocol layer, which holds
+    its own copy of the scope: no ASGI middleware can see that call. The only
+    interception point that works is the LogRecord itself, so this filter
+    strips the query string from the request path before a handler formats it.
     """
 
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "websocket":
-            await self.app(scope, receive, send)
-            return
-
-        params = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
-        tokens = [value for key, value in params if key == "token"]
-        if not tokens:
-            await self.app(scope, receive, send)
-            return
-
-        rest = [(key, value) for key, value in params if key != "token"]
-        scrubbed = dict(scope)
-        scrubbed["query_string"] = urlencode(rest).encode("latin-1")
-        scrubbed.setdefault("state", {})
-        scrubbed["state"][LEGACY_TOKEN_KEY] = tokens[0]
-        await self.app(scrubbed, receive, send)
-
-
-def _legacy_query_token(websocket: WebSocket) -> str | None:
-    """Scoped token re-applied by the middleware, or the raw query outside it."""
-    state = websocket.scope.get("state") or {}
-    if LEGACY_TOKEN_KEY in state:
-        return state[LEGACY_TOKEN_KEY]
-    return websocket.query_params.get("token")
-
-
-# Strip the legacy ?token= before uvicorn logs the scope.
-app.add_middleware(LegacyQueryTokenMiddleware)
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.args or "WebSocket" not in str(record.msg):
+            return True
+        args = tuple(record.args)
+        if len(args) < 2 or not isinstance(args[1], str):
+            return True
+        path = args[1]
+        clean = path.split("?", 1)[0]
+        if clean != path:
+            record.args = (args[0], clean) + args[2:]
+        return True
 
 
 def _clean_symbol(value: object) -> str | None:
@@ -280,7 +262,7 @@ async def websocket_endpoint(websocket: WebSocket):
         # accept() itself failed; nothing was registered, so nothing to clean up.
         return
 
-    query_token = _legacy_query_token(websocket)
+    query_token = websocket.query_params.get("token")
     authenticated = bool(query_token) and token_matches(query_token)
     if query_token and not authenticated:
         logger.warning("WebSocket rejected: invalid query token")

@@ -1,54 +1,59 @@
-"""The legacy ?token= must never reach the access log.
+"""The legacy ?token= must not survive into a log record.
 
-uvicorn logs the raw query string of every handshake, so the middleware moves
-the token into a scoped key that only the endpoint reads.
+uvicorn logs WebSocket handshakes from its protocol layer, so the only place
+the credential can be removed is the LogRecord itself.
 """
-import asyncio
+import logging
 
-from app.main import LEGACY_TOKEN_KEY, LegacyQueryTokenMiddleware
-
-
-def run_middleware(scope):
-    captured = {}
-
-    async def inner(inner_scope, receive, send):
-        captured["scope"] = inner_scope
-
-    middleware = LegacyQueryTokenMiddleware(inner)
-    asyncio.run(middleware(scope, None, None))
-    return captured["scope"]
+from app.main import _RedactWsQueryFilter, _configure_logging
 
 
-def test_token_is_moved_out_of_the_logged_query_string():
-    scope = {
-        "type": "websocket",
-        "path": "/ws",
-        "query_string": b"token=secret&symbol=SPY",
-    }
-
-    forwarded = run_middleware(scope)
-
-    # What uvicorn logs no longer contains the credential.
-    assert forwarded["query_string"] == b"symbol=SPY"
-    # The endpoint can still read it.
-    assert forwarded["state"][LEGACY_TOKEN_KEY] == "secret"
-    # The caller's scope is left untouched.
-    assert scope["query_string"] == b"token=secret&symbol=SPY"
+def make_record(message, args):
+    return logging.LogRecord(
+        "uvicorn.error", logging.INFO, __file__, 1, message, args, None
+    )
 
 
-def test_scope_without_token_is_passed_through():
-    scope = {"type": "websocket", "path": "/ws", "query_string": b"symbol=SPY"}
+def test_ws_access_record_loses_its_query_string():
+    record = make_record(
+        '%s - "WebSocket %s" [accepted]', ("127.0.0.1:5000", "/ws?token=secret")
+    )
 
-    forwarded = run_middleware(scope)
+    _RedactWsQueryFilter().filter(record)
 
-    assert forwarded is scope
-    assert forwarded["query_string"] == b"symbol=SPY"
+    assert record.getMessage() == '127.0.0.1:5000 - "WebSocket /ws" [accepted]'
 
 
-def test_http_scopes_are_ignored():
-    scope = {"type": "http", "path": "/api/health", "query_string": b"token=secret"}
+def test_ws_close_record_is_scrubbed_too():
+    record = make_record(
+        '%s - "WebSocket %s" 4401', ("127.0.0.1:5000", "/ws?token=secret")
+    )
 
-    forwarded = run_middleware(scope)
+    _RedactWsQueryFilter().filter(record)
 
-    assert forwarded is scope
-    assert forwarded["query_string"] == b"token=secret"
+    assert "secret" not in record.getMessage()
+    assert record.getMessage().endswith('"WebSocket /ws" 4401')
+
+
+def test_ws_record_without_query_is_unchanged():
+    record = make_record('%s - "WebSocket %s" [accepted]', ("127.0.0.1:5000", "/ws"))
+
+    _RedactWsQueryFilter().filter(record)
+
+    assert record.getMessage() == '127.0.0.1:5000 - "WebSocket /ws" [accepted]'
+
+
+def test_non_ws_records_are_untouched():
+    record = make_record("Application startup complete.", None)
+
+    assert _RedactWsQueryFilter().filter(record) is True
+    assert record.getMessage() == "Application startup complete."
+
+
+def test_configure_logging_installs_the_filter_once():
+    _configure_logging()
+    _configure_logging()
+
+    filters = logging.getLogger("uvicorn.error").filters
+    installed = [f for f in filters if isinstance(f, _RedactWsQueryFilter)]
+    assert len(installed) == 1
