@@ -32,6 +32,15 @@ from app.engine.market_router import MarketRouterBroker
 from app.api.websocket_manager import WebSocketManager
 from app.api.routes import create_api_router
 
+# Give the root logger a handler before the engine is constructed below: the
+# virtual book restores (and any other import-time log) would otherwise be
+# dropped, because uvicorn only wires logging when the app starts.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(levelname)s [%(name)s] %(message)s",
+    )
+
 # 1. Market Data Provider Factory
 if settings.market_data_provider == "alpaca":
     if not settings.alpaca_api_key or not settings.alpaca_api_secret:
