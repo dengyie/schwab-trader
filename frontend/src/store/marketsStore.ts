@@ -118,6 +118,7 @@ export function normalizeTicker(row: Partial<MarketTickerRow> & { symbol: string
     openPrice: 0,
     trades24h: 0,
     lastUpdated: 0,
+    isStale: false,
     ...row,
     market,
       currency: row.currency || def?.currency || DEFAULT_CURRENCY[market] || 'USD',

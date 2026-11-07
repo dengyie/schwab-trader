@@ -51,6 +51,11 @@ class Quote(BaseModel):
     day_high: Optional[float] = None
     day_low: Optional[float] = None
     source: str = "us"
+    # Set by the feed when the quote is served: how old this print is, in
+    # seconds, and whether a fresher print is expected (open session). The UI
+    # uses this to stop rendering a stale close as a live price.
+    age_seconds: Optional[float] = None
+    is_stale: Optional[bool] = None
 
     @property
     def mid_price(self) -> float:

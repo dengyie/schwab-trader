@@ -30,6 +30,10 @@ interface OrderBookState {
   pendingUpdates: BinanceDepthUpdate[];
   lastResyncTime: number;
   consecutiveFailures: number;
+  // Most recent real trade price. Venues that publish only a last price
+  // (HK / JP / CN) have no book; keeping the print here lets the price
+  // display stay honest instead of inventing bid/ask levels around it.
+  lastPrice: number;
 }
 
 // 24h ticker data
@@ -83,6 +87,7 @@ export class OrderBookManager {
       pendingUpdates: [],
       lastResyncTime: 0,
       consecutiveFailures: 0,
+      lastPrice: 0,
     };
 
     this.midPriceBuffer = {
@@ -151,7 +156,19 @@ export class OrderBookManager {
     timestamp?: string;
   }): void {
     const { bid, ask, last, volume, high, low } = data;
-    if (!(bid > 0) || !(ask > 0) || ask < bid) return;
+
+    // No two-sided book: this venue publishes trades only (HK / JP / CN). The
+    // book is emptied rather than filled with levels nobody quoted, and the
+    // price display falls back to the real print held in ``lastPrice``.
+    if (!(bid > 0) || !(ask > 0) || ask < bid) {
+      const print = last || 0;
+      if (!(print > 0)) return;
+      this.state.bids.clear();
+      this.state.asks.clear();
+      this.state.lastPrice = print;
+      this._applyTickerStats(print, data);
+      return;
+    }
 
     this.state.bids.clear();
     this.state.asks.clear();
@@ -160,10 +177,20 @@ export class OrderBookManager {
     this.state.asks.set(ask.toFixed(2), String(Math.max(1, Math.round(data.ask_size || 0))));
 
     const mid = (bid + ask) / 2.0;
-    this.updateMidPrice(mid);
+    this.state.lastPrice = last || mid;
+    this._applyTickerStats(this.state.lastPrice, data);
+  }
+
+  private _applyTickerStats(refLast: number, data: {
+    volume?: number;
+    high?: number;
+    low?: number;
+    open?: number;
+  }): void {
+    this.updateMidPrice(refLast);
 
     // 24h-style stats: only report what the feed actually provides.
-    const refLast = last || mid;
+    const { volume, high, low } = data;
     this.ticker24h = {
       high24h: (high ?? refLast).toFixed(2),
       low24h: (low ?? refLast).toFixed(2),
@@ -415,6 +442,17 @@ export class OrderBookManager {
     const bestAsk = orderBook.asks[0];
 
     if (!bestBid || !bestAsk) {
+      // No two-sided book. If a real print exists, report it as the mid and
+      // leave the book-derived numbers at zero rather than inventing a spread
+      // from a fabricated level.
+      if (this.state.lastPrice > 0) {
+        this.updateMidPrice(this.state.lastPrice);
+        return {
+          ...this.getEmptyMetrics(now),
+          mid: this.state.lastPrice.toFixed(8),
+          lastUpdateTime: now,
+        };
+      }
       return this.getEmptyMetrics(now);
     }
 

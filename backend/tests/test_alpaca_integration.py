@@ -47,7 +47,9 @@ def test_alpaca_parse_stream_quote():
     assert quote.symbol == "SPY"
     assert quote.bid == 753.47
     assert quote.ask == 753.51
-    assert quote.last == round((753.47 + 753.51) / 2.0, 4)
+    # A quote is not a trade: with no print known, ``last`` stays unknown. The
+    # old midpoint here was shown as a price SPY never traded at.
+    assert quote.last == 0.0
     assert quote.volume == 120
 
     # With prior trade price

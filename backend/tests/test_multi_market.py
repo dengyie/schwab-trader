@@ -350,6 +350,157 @@ class TestDailyStatsWarmup:
         assert feed.get_daily_stats("SPY") == {}
 
 
+class TestConsolidatedDailyContext:
+    """Fix B: the daily reference must come from a consolidated source, not the
+    IEX-only snapshot. IEX's previous close missed the closing auction (733.43
+    for SPY when the consolidated close was 733.00), which skewed every row's
+    percent change."""
+
+    def _feed(self):
+        import threading
+
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {}
+        feed._snapshot_ts = 0.0
+        feed._snapshot_lock = threading.Lock()
+        feed.symbols = {"SPY"}
+        feed.headers = {}
+        feed.data_base_url = "https://example.invalid"
+        feed.feed = "iex"
+        return feed
+
+    def test_daily_from_meta_keeps_only_real_numbers(self):
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+
+        entry = AlpacaMarketFeedService._daily_from_meta(
+            {
+                "chartPreviousClose": 733.0,
+                "regularMarketPrice": 735.29,
+                "regularMarketDayHigh": 736.1,
+                "regularMarketDayLow": 731.5,
+                "regularMarketVolume": 12345678,
+                "unrelated": 1,
+            }
+        )
+        assert entry["consolidated"] == 1.0
+        assert entry["prev_close"] == 733.0
+        assert entry["last"] == 735.29
+        assert entry["day_high"] == 736.1
+        assert entry["day_low"] == 731.5
+        assert entry["volume"] == 12345678
+
+    def test_daily_from_meta_rejects_an_empty_payload(self):
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+
+        assert AlpacaMarketFeedService._daily_from_meta({"chartPreviousClose": 0}) == {}
+
+    def test_consolidated_meta_wins_over_the_iex_snapshot(self, monkeypatch):
+        feed = self._feed()
+
+        monkeypatch.setattr(
+            "app.engine.alpaca_market_feed.YahooFinanceAdapter.fetch_meta",
+            classmethod(lambda cls, sym: {
+                "chartPreviousClose": 733.0,
+                "regularMarketPrice": 735.29,
+                "regularMarketDayHigh": 736.1,
+                "regularMarketDayLow": 731.5,
+                "regularMarketVolume": 10,
+            }),
+        )
+
+        def snapshot_must_not_run(self, missing):
+            raise AssertionError("IEX snapshot must not override consolidated data")
+
+        monkeypatch.setattr(
+            "app.engine.alpaca_market_feed.AlpacaMarketFeedService._refresh_alpaca_snapshots",
+            snapshot_must_not_run,
+        )
+
+        feed.refresh_daily_stats(["SPY"], force=True)
+
+        stats = feed.get_daily_stats("SPY")
+        assert stats["prev_close"] == 733.0
+        assert stats["consolidated"] == 1.0
+
+    def test_snapshot_fills_a_gap_when_yahoo_fails(self, monkeypatch):
+        feed = self._feed()
+
+        monkeypatch.setattr(
+            "app.engine.alpaca_market_feed.YahooFinanceAdapter.fetch_meta",
+            classmethod(lambda cls, sym: None),
+        )
+
+        def fake_snapshot(self, missing):
+            for sym in missing:
+                self.daily_stats[sym] = {"prev_close": 100.0, "last": 101.0}
+
+        monkeypatch.setattr(
+            "app.engine.alpaca_market_feed.AlpacaMarketFeedService._refresh_alpaca_snapshots",
+            fake_snapshot,
+        )
+
+        feed.refresh_daily_stats(["SPY"], force=True)
+
+        stats = feed.get_daily_stats("SPY")
+        assert stats["prev_close"] == 100.0
+        assert not stats.get("consolidated")
+
+
+class TestQuoteFreshness:
+    """Fix C: a quote must carry the age of its own print, and must not be
+    flagged stale merely because its venue is closed."""
+
+    def test_open_venue_flags_an_old_print(self):
+        from datetime import datetime, timedelta, timezone
+
+        from app.core.markets import freshness_updates, market_of
+
+        # 2026-11-02 is a Monday; 15:00 UTC is 10:00 ET, inside the US session.
+        now = datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc)
+        updates = freshness_updates(now - timedelta(minutes=10), market_of("SPY"), now)
+        assert updates["age_seconds"] == 600.0
+        assert updates["is_stale"] is True
+
+    def test_closed_venue_never_flags_a_clean_close(self):
+        from datetime import datetime, timedelta, timezone
+
+        from app.core.markets import freshness_updates, market_of
+        from app.models.trading import utc_now
+
+        # A weekend print for a US name is expected to be old.
+        moment = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)  # Saturday
+        updates = freshness_updates(moment - timedelta(days=2), market_of("SPY"), moment)
+        assert updates["is_stale"] is False
+
+    def test_fresh_print_is_not_stale(self):
+        from app.models.trading import utc_now
+        from app.core.markets import freshness_updates, market_of
+
+        now = utc_now()
+        updates = freshness_updates(now, market_of("SPY"), now)
+        assert updates["age_seconds"] == 0.0
+        assert updates["is_stale"] is False
+
+    def test_feed_stamps_age_and_stale_flag(self):
+        from datetime import timedelta
+
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+        from app.models.trading import Quote, utc_now
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {}
+
+        raw = Quote(symbol="SPY", bid=0.0, ask=0.0, last=700.0,
+                    timestamp=utc_now() - timedelta(hours=5))
+
+        decorated = feed._decorate_daily(raw)
+        assert decorated.age_seconds is not None and decorated.age_seconds >= 17_000
+        # Whether it is stale depends on the session, but the field is set.
+        assert decorated.is_stale in (True, False)
+
+
 class TestDayPriceGuard:
     """Regression: a stale bid below the session low drove both the price and
     the day change. Production showed AAPL 328.06 with a 338.59-345.765 range."""

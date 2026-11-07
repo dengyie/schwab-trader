@@ -43,12 +43,35 @@ class AlpacaDataAdapter:
     Normalizes Alpaca Market Data and Paper Trading API payloads.
     """
 
+    # Widest two-sided spread, in basis points, that still counts as a usable
+    # market. Single-venue (IEX) books go one-sided or absurdly wide around the
+    # close and outside the session; a midpoint taken there is not a price any
+    # trade ever happened at, so it must never become a mark or a "last".
+    MAX_QUOTE_SPREAD_BPS = 50.0
+
+    @classmethod
+    def is_tradeable_quote(cls, bid: float, ask: float) -> bool:
+        """True only for a two-sided, sane (not crossed, not wide) quote."""
+        if bid <= 0 or ask <= 0 or bid > ask:
+            return False
+        mid = (ask + bid) / 2.0
+        if mid <= 0:
+            return False
+        spread_bps = (ask - bid) / mid * 10000.0
+        return spread_bps <= cls.MAX_QUOTE_SPREAD_BPS
+
     @staticmethod
     def parse_stream_quote(item: Dict[str, Any], last_price: Optional[float] = None) -> Optional[Quote]:
         """
         Parses Alpaca IEX/SIP stream quote message (T='q').
         Example:
         {"T": "q", "S": "SPY", "bp": 753.47, "bs": 40, "ap": 753.51, "as": 80, "t": "2026-11-02T19:48:19Z"}
+
+        ``last`` is the last *trade* price and nothing else. When no trade price
+        is known it is left at 0 (unknown) so a downstream provider can fill it
+        from a real consolidated print. A midpoint of a one-sided or wide
+        after-hours IEX book is not a trade and used to be shown to the user as
+        one -- see the SPY 738.435 / close 735.29 incident.
         """
         try:
             symbol = item.get("S", "").upper()
@@ -60,19 +83,9 @@ class AlpacaDataAdapter:
             volume = int(item.get("as", 0) + item.get("bs", 0))
             ts = _parse_alpaca_timestamp(item.get("t"))
 
-            # Derive last price
-            if last_price and last_price > 0:
-                last = float(last_price)
-            elif bid > 0 and ask > 0:
-                last = round((bid + ask) / 2.0, 4)
-            else:
-                last = bid or ask or 0.0
-
-            # If bid or ask is zero, synthesize tight spread from last
-            if bid <= 0 and last > 0:
-                bid = round(last * 0.9998, 4)
-            if ask <= 0 and last > 0:
-                ask = round(last * 1.0002, 4)
+            # Only a real print may set last. If this tick carries no price we
+            # keep the one the caller already knows and pass 0 otherwise.
+            last = float(last_price) if (last_price and last_price > 0) else 0.0
 
             return Quote(
                 symbol=symbol,
@@ -152,11 +165,16 @@ class AlpacaDataAdapter:
             return None
 
     @staticmethod
-    def parse_rest_quote_response(symbol: str, res_json: Dict[str, Any]) -> Optional[Quote]:
+    def parse_rest_quote_response(
+        symbol: str, res_json: Dict[str, Any], last_price: Optional[float] = None
+    ) -> Optional[Quote]:
         """
         Parses Alpaca REST /v2/stocks/{symbol}/quotes/latest response.
         Example:
         {"symbol": "SPY", "quote": {"ap": 753.51, "bp": 753.47, "t": "2026-11-02T19:48:19Z"}}
+
+        The REST quote carries no trade, so ``last`` is only whatever real print
+        the caller already knows. It is never derived from the book.
         """
         try:
             q_data = res_json.get("quote", {})
@@ -164,12 +182,7 @@ class AlpacaDataAdapter:
             ask = float(q_data.get("ap") or 0.0)
             volume = int(q_data.get("as", 0) + q_data.get("bs", 0))
             ts = _parse_alpaca_timestamp(q_data.get("t"))
-
-            last = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else (bid or ask or 0.0)
-            if bid <= 0 and last > 0:
-                bid = round(last * 0.9998, 4)
-            if ask <= 0 and last > 0:
-                ask = round(last * 1.0002, 4)
+            last = float(last_price) if (last_price and last_price > 0) else 0.0
 
             return Quote(
                 symbol=symbol.upper(),

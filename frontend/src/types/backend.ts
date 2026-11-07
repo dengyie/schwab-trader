@@ -19,6 +19,12 @@ export interface Quote {
   /** 所属市场（US/HK/JP/CN）与计价币种，由后端标注。 */
   market?: string;
   currency?: string;
+  /** 数据来源（alpaca / yahoo），用于区分实时流与轮询。 */
+  source?: string;
+  /** 该笔成交距请求时刻的秒数；由后端在开盘时段标注。 */
+  age_seconds?: number | null;
+  /** 开盘时段内成交超过阈值未更新即为过期，UI 不应再把它当实时价。 */
+  is_stale?: boolean | null;
 }
 
 export interface BackendPosition {

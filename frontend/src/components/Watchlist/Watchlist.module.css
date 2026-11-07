@@ -390,6 +390,11 @@
   opacity: 0.6;
 }
 
+/* 该市场开盘，但这一行的成交已过期：价格是旧打印，不是实时价。 */
+.stalePrice {
+  opacity: 0.55;
+}
+
 /* 空状态 */
 .empty {
   padding: var(--space-6);

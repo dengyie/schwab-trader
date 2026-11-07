@@ -36,6 +36,30 @@ def within_day_range(price: Optional[float], low: Optional[float], high: Optiona
     return lo <= price <= hi
 
 
+# A print older than this while its venue is open means no fresh print is
+# arriving; the UI must show that instead of painting the old price as live.
+STALE_AFTER_SECONDS = 120.0
+
+
+def freshness_updates(
+    timestamp: datetime,
+    market: "MarketDef",
+    now: Optional[datetime] = None,
+) -> dict:
+    """``age_seconds`` / ``is_stale`` for a quote, computed in one place.
+
+    Staleness is only meaningful while the venue is open: a closed market's
+    last print is supposed to be old, and flagging it would make a correct
+    close look like a broken feed.
+    """
+    moment = now or datetime.now(timezone.utc)
+    age = max((moment - timestamp).total_seconds(), 0.0)
+    return {
+        "age_seconds": round(age, 1),
+        "is_stale": bool(age > STALE_AFTER_SECONDS and is_market_open(market, moment)),
+    }
+
+
 
 @dataclass(frozen=True)
 class Session:

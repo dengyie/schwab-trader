@@ -18,11 +18,10 @@ from zoneinfo import ZoneInfo
 
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.markets import (
+    freshness_updates,
     is_market_open,
     market_of,
     resolve_symbol,
-    round_to_tick,
-    tick_size_for,
 )
 from app.core.timeframes import TIMEFRAME_TTLS
 from app.models.trading import Bar, Quote, utc_now
@@ -108,10 +107,11 @@ class YahooQuoteFeed:
         prev_raw = meta.get("previousClose") or meta.get("chartPreviousClose")
         prev_close = float(prev_raw) if isinstance(prev_raw, (int, float)) else None
 
-        tick = tick_size_for(market, price)
-        spread = max(tick, price * 0.0004)
-        bid = round_to_tick(max(tick, price - spread / 2.0), tick)
-        ask = round_to_tick(price + spread / 2.0, tick)
+        # Yahoo exposes a last price only, no book smoothing. A bid/ask built
+        # around it is an estimate, so it is left at 0 here and only
+        # synthesized by the display layer that knows it is an estimate.
+        bid = 0.0
+        ask = 0.0
 
         trade_time = meta.get("regularMarketTime")
         if isinstance(trade_time, (int, float)) and trade_time > 0:
@@ -137,6 +137,7 @@ class YahooQuoteFeed:
             if isinstance(meta.get("regularMarketDayLow"), (int, float))
             else None,
             source="yahoo",
+            **freshness_updates(stamp, market),
         )
 
         with self._lock:
