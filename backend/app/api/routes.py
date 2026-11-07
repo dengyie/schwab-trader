@@ -217,6 +217,14 @@ def create_api_router(
         tickers: List[Dict[str, Any]] = []
         now_ts = int(time.time() * 1000)
 
+        # One batched warm-up for the whole market, not one call per row.
+        warmer = getattr(actual_feed, "ensure_daily_stats", None)
+        if callable(warmer):
+            try:
+                warmer(code)
+            except Exception:
+                pass
+
         for sym in symbols:
             quote = actual_feed.get_latest_quote(sym)
             daily = actual_feed.get_daily_stats(sym)
