@@ -111,7 +111,11 @@ class YahooFinanceAdapter:
         params = {
             "interval": interval,
             "range": range_param,
-            "includePrePost": "true",
+            # Pre/post hours are thin, unrepresentative prints. Measured on SPY
+            # 15m they carried lows of 691.53 and highs of 781.05 against a
+            # 735.29 close -- a +-6.5% range that no session ever traded. The
+            # chart and its stats are about the session, so only it is fetched.
+            "includePrePost": "false",
             "events": "div,splits"
         }
 
@@ -160,6 +164,8 @@ class YahooFinanceAdapter:
                     )
                 )
 
+            raw_bars = cls._drop_forming_tail(raw_bars, interval)
+
             # If 4h requested, aggregate 1h bars into 4h bars aligned to the
             # exchange's own session rather than to UTC midnight.
             if tf_key == "4h" and raw_bars:
@@ -171,6 +177,32 @@ class YahooFinanceAdapter:
         except Exception as e:
             logger.warning("YahooFinanceAdapter fetch_bars error for %s (%s): %s", sym, timeframe, e)
             return []
+
+    @staticmethod
+    def _drop_forming_tail(bars: List[Bar], interval: str) -> List[Bar]:
+        """Drop a trailing bar that is not an interval of real trading.
+
+        Yahoo marks the still-forming candle with the *wall clock* instead of
+        its bucket start (measured: SPY 15m bars every 900s, then one at
+        19:59:52 ET with open == high == low == close). Published as data that
+        bar stretches the x-axis past the close and its flat price drags the
+        change calculation, so it is dropped. The guard is deliberately narrow:
+        only a bar that both lands off the interval grid and has no range is
+        removed, so a genuinely traded final bar of an irregular session stays.
+        """
+        if len(bars) < 2:
+            return bars
+        step = TIMEFRAME_SECONDS.get(interval)
+        if not step:
+            return bars
+
+        last = bars[-1]
+        if last.time % step == 0:
+            return bars
+        if last.open != last.high or last.open != last.low or last.open != last.close:
+            return bars
+
+        return bars[:-1]
 
     @staticmethod
     def _aggregate_bars(
