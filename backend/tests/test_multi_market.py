@@ -557,15 +557,18 @@ class TestVirtualBookPersistence:
         second = self._engine(fx, tmp_path)
         assert second.get_order(order.order_id).status == OrderStatus.CANCELLED
 
-    def test_trade_history_is_reloaded(self, fx, tmp_path):
+    def test_snapshot_holds_only_portfolio_and_orders(self, fx, tmp_path):
+        """Fills are read from order records; a trade log would be dead weight."""
+        import json
+
         first = self._engine(fx, tmp_path)
         first.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
         first.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
 
-        second = self._engine(fx, tmp_path)
-        assert len(second.get_orders()) == 1
-        assert len(second.ledger.trades) == 1
-        assert second.ledger.trades[0].symbol == "0700.HK"
+        raw = json.loads((tmp_path / "book.json").read_text(encoding="utf-8"))
+
+        assert set(raw) == {"version", "saved_at", "portfolio", "orders"}
+        assert len(raw["orders"]) == 1
 
     def test_reset_clears_the_persisted_book(self, fx, tmp_path):
         first = self._engine(fx, tmp_path)
@@ -603,6 +606,179 @@ class TestVirtualBookPersistence:
         engine.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
 
         assert list(tmp_path.iterdir()) == []
+
+    def test_partially_invalid_snapshot_is_not_applied(self, fx, tmp_path):
+        """A snapshot whose orders fail validation must not leave orphans behind.
+
+        Applying the positions but dropping the orders produced a book that was
+        wrong in a way it could never recover from: the rejected file stayed on
+        disk, so the same split was recreated on every boot.
+        """
+        from app.engine.state_store import JsonStateStore
+
+        JsonStateStore(str(tmp_path), filename="book.json").save(
+            {
+                "version": 1,
+                "portfolio": {
+                    "cash": 1234.0,
+                    "initial_capital": 100000.0,
+                    "positions": {
+                        "0700.HK": {
+                            "symbol": "0700.HK",
+                            "quantity": 100,
+                            "avg_cost": 400.0,
+                            "current_price": 400.0,
+                            "market": "HK",
+                            "currency": "HKD",
+                        }
+                    },
+                },
+                # Missing symbol/side/order_type/quantity -> invalid order.
+                "orders": [{"order_id": "ord_broken"}],
+            }
+        )
+
+        engine = self._engine(fx, tmp_path)
+
+        assert engine.get_portfolio().positions == {}
+        assert engine.get_portfolio().cash == pytest.approx(100000.0)
+        assert engine.get_orders() == []
+        assert any(p.name.startswith("book.rejected-") for p in tmp_path.iterdir())
+
+        # The clean book was written back, so the next boot is not rejected again.
+        second = self._engine(fx, tmp_path)
+        assert second.get_orders() == []
+        assert second.get_portfolio().cash == pytest.approx(100000.0)
+
+    def test_save_failure_backs_off_instead_of_retrying_every_quote(
+        self, fx, tmp_path, monkeypatch
+    ):
+        engine = self._engine(fx, tmp_path)
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+
+        calls = {"n": 0}
+        real_save = engine._store.save
+
+        def failing_save(snapshot):
+            calls["n"] += 1
+            return False
+
+        monkeypatch.setattr(engine._store, "save", failing_save)
+
+        # Every quote marks the book dirty; only the first attempt may hit disk.
+        for _ in range(20):
+            engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+
+        assert calls["n"] == 1
+        # The in-memory book is unaffected by the failed write.
+        assert engine.get_order(engine.get_orders()[0].order_id) is not None
+
+        # Once the disk heals, the next flush writes again.
+        monkeypatch.setattr(engine._store, "save", real_save)
+        engine.on_quote(quote("0700.HK", 401.0, prev_close=395.0))
+        assert (tmp_path / "book.json").exists()
+
+
+class TestBookConcurrency:
+    """The feed thread and FastAPI's threadpool touch the same book."""
+
+    def test_concurrent_submit_quote_and_read(self, fx):
+        import threading
+
+        ledger = PortfolioLedger(initial_capital=1000000.0, fx=fx)
+        engine = VirtualMatchingEngine(ledger=ledger, fx=fx, enforce_sessions=False)
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+
+        errors = []
+        expected = 40
+
+        def submitter():
+            try:
+                for _ in range(expected):
+                    engine.submit_order(
+                        "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=1.0
+                    )
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        def quoter():
+            try:
+                for i in range(200):
+                    engine.on_quote(quote("0700.HK", 400.0 + i * 0.1, prev_close=395.0))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        def reader():
+            try:
+                for _ in range(400):
+                    engine.get_orders()
+                    engine.get_portfolio()
+                    engine.get_position("0700.HK")
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=submitter),
+            threading.Thread(target=quoter),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(engine.get_orders()) == expected
+
+
+class TestClosedSessionMatching:
+    """A closed venue only offers the previous close; fills must wait."""
+
+    def _engine(self, fx):
+        ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+        return VirtualMatchingEngine(
+            ledger=ledger,
+            fx=fx,
+            enforce_sessions_for=frozenset({"HK", "JP", "CN"}),
+        )
+
+    def test_resting_order_does_not_fill_while_market_is_closed(
+        self, fx, monkeypatch
+    ):
+        import app.engine.matching_engine as me
+
+        monkeypatch.setattr(me, "is_market_open", lambda market: False)
+
+        engine = self._engine(fx)
+        order = engine.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=500.0
+        )
+        assert order.status == OrderStatus.PENDING
+
+        # The quote is the previous session's close; it must not fill the order.
+        trades = engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+
+        assert trades == []
+        assert engine.get_order(order.order_id).status == OrderStatus.PENDING
+        assert engine.get_position("0700.HK") is None
+
+    def test_resting_order_fills_once_the_session_opens(self, fx, monkeypatch):
+        import app.engine.matching_engine as me
+
+        monkeypatch.setattr(me, "is_market_open", lambda market: False)
+        engine = self._engine(fx)
+        order = engine.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=500.0
+        )
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+        assert engine.get_order(order.order_id).status == OrderStatus.PENDING
+
+        monkeypatch.setattr(me, "is_market_open", lambda market: True)
+        trades = engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+
+        assert len(trades) == 1
+        assert engine.get_order(order.order_id).status == OrderStatus.FILLED
 
 
 class TestAlpacaPositionBasis:

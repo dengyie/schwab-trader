@@ -4,11 +4,21 @@ Virtual Paper Trading Matching Engine simulating exchange fills and order routin
 The engine enforces the same market rules a real venue would (board lots, tick
 sizes, daily price bands, T+1) before an order is accepted, and books foreign
 currency fills through the ledger's FX conversion.
+
+Threading: the book is written by the feed thread (``on_quote``) and read by
+HTTP worker threads (FastAPI runs the sync order routes in its threadpool).
+Every read and write of ``orders`` / ``latest_quotes`` happens under one
+re-entrant book lock, which also guards the ledger snapshot written to disk.
+Without it an order insert could make a concurrent iteration raise
+``dictionary changed size during iteration`` — and because the order row is
+inserted *before* it is matched, that exception reached the client as a 500
+after the fill had already been booked, inviting a duplicate retry.
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from typing import Callable, Dict, List, Optional
 
@@ -37,7 +47,14 @@ from app.engine.state_store import JsonStateStore
 logger = logging.getLogger(__name__)
 
 # Bump when the snapshot layout changes incompatibly; older files are ignored.
+# v1 files may also carry a ``trades`` key, which is no longer written (fills
+# are served through ``order.fills``) and is deliberately ignored on restore.
 STATE_VERSION = 1
+
+# A failing write must not be retried at quote rate (that re-serializes the
+# whole book and fsyncs on the feed thread for every tick).
+SAVE_BACKOFF_INITIAL = 1.0
+SAVE_BACKOFF_MAX = 30.0
 
 
 class VirtualMatchingEngine(BaseBroker):
@@ -63,13 +80,21 @@ class VirtualMatchingEngine(BaseBroker):
         self.fill_listeners: List[Callable[[Trade, Order], None]] = []
         # Snapshot of the book across process restarts (None = in-memory only).
         self._store = state_store
-        self._state_lock = threading.RLock()
+        # Lock order is always book -> ledger; the ledger never calls back here.
+        self._book_lock = threading.RLock()
         self._dirty = False
+        self._save_retry_at = 0.0
+        self._save_backoff = 0.0
         self._restore()
 
     # -- persistence ------------------------------------------------------
     def _restore(self) -> None:
-        """Rebuild the book from the last snapshot, if one exists."""
+        """Rebuild the book from the last snapshot, if one exists.
+
+        Restore is all-or-nothing: a snapshot whose orders fail validation must
+        not leave the positions of those orders behind, because the split book
+        would then be flushed back and repeat on every boot.
+        """
         if self._store is None:
             return
         try:
@@ -85,32 +110,42 @@ class VirtualMatchingEngine(BaseBroker):
                 snapshot.get("version"), STATE_VERSION,
             )
             return
+
+        initial_capital = self.ledger.portfolio_snapshot().initial_capital
         try:
-            portfolio = snapshot.get("portfolio")
-            if portfolio:
-                self.ledger.portfolio = Portfolio.model_validate(portfolio)
-                self.ledger.portfolio.positions = {
+            raw_portfolio = snapshot.get("portfolio")
+            portfolio = (
+                Portfolio.model_validate(raw_portfolio) if raw_portfolio else None
+            )
+            if portfolio is not None:
+                portfolio.positions = {
                     str(sym).upper(): pos
-                    for sym, pos in self.ledger.portfolio.positions.items()
+                    for sym, pos in portfolio.positions.items()
                 }
-            self.ledger.trades = [
-                Trade.model_validate(t) for t in snapshot.get("trades", [])
-            ]
-            self.orders = {
+            orders = {
                 order.order_id: order
                 for order in (
-                    Order.model_validate(o) for o in snapshot.get("orders", [])
+                    Order.model_validate(raw) for raw in snapshot.get("orders", [])
                 )
             }
         except Exception as exc:
-            # A structurally invalid snapshot is worse than none: keep the
-            # process alive on a clean book instead of failing every request.
+            # A structurally invalid snapshot is worse than none: quarantine it
+            # so it is not re-read every boot, then start from a clean book.
             logger.warning("Virtual book snapshot rejected: %s", exc)
+            self._store.quarantine("rejected", detail=str(exc))
+            self.ledger.reset(initial_capital)
             self.orders = {}
+            self._mark_dirty()
+            self._flush()
             return
+
+        if portfolio is not None:
+            self.ledger.replace_portfolio(portfolio)
+        self.orders = orders
         logger.info(
-            "Virtual book restored: %d positions, %d orders, %d trades",
-            len(self.ledger.portfolio.positions), len(self.orders), len(self.ledger.trades),
+            "Virtual book restored: %d positions, %d orders",
+            len(portfolio.positions) if portfolio else 0,
+            len(self.orders),
         )
 
     def _mark_dirty(self) -> None:
@@ -120,18 +155,28 @@ class VirtualMatchingEngine(BaseBroker):
         """Write the book if it changed since the last successful save."""
         if self._store is None or not self._dirty:
             return
-        with self._state_lock:
+        with self._book_lock:
             if not self._dirty:
+                return
+            now = time.monotonic()
+            if now < self._save_retry_at:
                 return
             snapshot = {
                 "version": STATE_VERSION,
                 "saved_at": utc_now().isoformat(),
-                "portfolio": self.ledger.portfolio.model_dump(mode="json"),
-                "trades": [t.model_dump(mode="json") for t in self.ledger.trades],
+                "portfolio": self.ledger.portfolio_snapshot().model_dump(mode="json"),
                 "orders": [o.model_dump(mode="json") for o in self.orders.values()],
             }
             if self._store.save(snapshot):
                 self._dirty = False
+                self._save_backoff = 0.0
+                self._save_retry_at = 0.0
+                return
+            # Back off instead of re-serializing the book on every quote.
+            self._save_backoff = min(
+                max(self._save_backoff * 2.0, SAVE_BACKOFF_INITIAL), SAVE_BACKOFF_MAX
+            )
+            self._save_retry_at = now + self._save_backoff
 
     # -- reads ------------------------------------------------------------
     def get_portfolio(self) -> Portfolio:
@@ -141,23 +186,32 @@ class VirtualMatchingEngine(BaseBroker):
         return self.ledger.get_position(symbol)
 
     def get_orders(self) -> List[Order]:
-        return list(self.orders.values())
+        # Copies: a caller serializing a live Order could otherwise observe the
+        # feed thread half-way through a status/fill update.
+        with self._book_lock:
+            return [order.model_copy(deep=True) for order in self.orders.values()]
 
     def get_order(self, order_id: str) -> Optional[Order]:
-        return self.orders.get(order_id)
+        with self._book_lock:
+            order = self.orders.get(order_id)
+            return order.model_copy(deep=True) if order is not None else None
 
     # -- lifecycle --------------------------------------------------------
     def reset(self, initial_capital: float = 100000.0) -> None:
-        self.ledger.reset(initial_capital)
-        self.orders.clear()
-        self.latest_quotes.clear()
-        self._mark_dirty()
-        self._flush()
+        with self._book_lock:
+            self.ledger.reset(initial_capital)
+            self.orders.clear()
+            self.latest_quotes.clear()
+            self._mark_dirty()
+            self._flush()
 
     def register_fill_listener(self, listener: Callable[[Trade, Order], None]) -> None:
         self.fill_listeners.append(listener)
 
     # -- execution --------------------------------------------------------
+    def _session_guarded(self, market) -> bool:
+        return self._enforce_sessions or market.code in self._enforce_sessions_for
+
     def submit_order(
         self,
         symbol: str,
@@ -173,68 +227,70 @@ class VirtualMatchingEngine(BaseBroker):
         market = ref.market
         canonical = ref.symbol
 
-        quote = self.latest_quotes.get(canonical)
-        prev_close = quote.prev_close if quote else None
+        with self._book_lock:
+            quote = self.latest_quotes.get(canonical)
+            prev_close = quote.prev_close if quote else None
 
-        validate_order(
-            market,
-            canonical,
-            side,
-            order_type,
-            quantity,
-            price=price,
-            stop_price=stop_price,
-            prev_close=prev_close,
-            position=self.ledger.get_position(canonical),
-        )
-
-        # A market order cannot be filled while the venue is shut; accepting it
-        # would silently book a trade at a stale price.
-        session_guarded = self._enforce_sessions or market.code in self._enforce_sessions_for
-        if (
-            session_guarded
-            and order_type == OrderType.MARKET
-            and not is_market_open(market)
-        ):
-            raise ValueError(
-                f"{market.code} market is closed; use a limit order or retry "
-                "when the session opens"
+            validate_order(
+                market,
+                canonical,
+                side,
+                order_type,
+                quantity,
+                price=price,
+                stop_price=stop_price,
+                prev_close=prev_close,
+                position=self.ledger.get_position(canonical),
             )
 
-        order = Order(
-            order_id=f"ord_{uuid.uuid4().hex[:12]}",
-            symbol=canonical,
-            side=side,
-            order_type=order_type,
-            quantity=quantity,
-            price=price,
-            stop_price=stop_price,
-            status=OrderStatus.PENDING,
-            created_at=utc_now(),
-            updated_at=utc_now(),
-            market=market.code,
-            currency=market.currency,
-        )
-        self.orders[order.order_id] = order
-        self._mark_dirty()
+            # A market order depends on a live session: it would otherwise fill
+            # against the previous close as soon as a quote arrived.
+            if (
+                self._session_guarded(market)
+                and order_type == OrderType.MARKET
+                and not is_market_open(market)
+            ):
+                raise ValueError(
+                    f"{market.code} market is closed; submit a limit order "
+                    "(it will rest until the session opens) or retry when the "
+                    "session opens"
+                )
 
-        if quote:
-            self._try_match_order(order, quote)
+            order = Order(
+                order_id=f"ord_{uuid.uuid4().hex[:12]}",
+                symbol=canonical,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                price=price,
+                stop_price=stop_price,
+                status=OrderStatus.PENDING,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                market=market.code,
+                currency=market.currency,
+            )
+            self.orders[order.order_id] = order
+            self._mark_dirty()
 
-        self._flush()
+            if quote:
+                self._try_match_order(order, quote)
 
-        return order
+            self._flush()
+
+            return order
 
     def cancel_order(self, order_id: str) -> Optional[Order]:
-        order = self.orders.get(order_id)
-        if not order:
-            return None
-        if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
-            order.status = OrderStatus.CANCELLED
-            order.updated_at = utc_now()
-            self._mark_dirty()
-            self._flush()
-        return order
+        with self._book_lock:
+            order = self.orders.get(order_id)
+            if not order:
+                return None
+            if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
+                order.status = OrderStatus.CANCELLED
+                order.updated_at = utc_now()
+                self._mark_dirty()
+                self._flush()
+            return order
 
     def on_quote(self, quote: Quote) -> List[Trade]:
         """
@@ -244,26 +300,27 @@ class VirtualMatchingEngine(BaseBroker):
         3. Match active pending orders
         """
         symbol = quote.symbol.upper()
-        self.latest_quotes[symbol] = quote
-        self.ledger.update_quote(quote)
+        with self._book_lock:
+            self.latest_quotes[symbol] = quote
+            self.ledger.update_quote(quote)
 
-        generated_trades: List[Trade] = []
-        pending_orders = [
-            order
-            for order in self.orders.values()
-            if order.symbol == symbol
-            and order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
-        ]
+            generated_trades: List[Trade] = []
+            pending_orders = [
+                order
+                for order in self.orders.values()
+                if order.symbol == symbol
+                and order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
+            ]
 
-        for order in pending_orders:
-            trade = self._try_match_order(order, quote)
-            if trade:
-                generated_trades.append(trade)
+            for order in pending_orders:
+                trade = self._try_match_order(order, quote)
+                if trade:
+                    generated_trades.append(trade)
 
-        # Quotes arrive continuously; only touch the disk when the book moved.
-        self._flush()
+            # Quotes arrive continuously; only touch the disk when the book moved.
+            self._flush()
 
-        return generated_trades
+            return generated_trades
 
     # -- matching ---------------------------------------------------------
     def _fx_rate(self, currency: str) -> float:
@@ -276,6 +333,12 @@ class VirtualMatchingEngine(BaseBroker):
             return None
 
         market = market_of(order.symbol)
+        # While the venue is shut the only quote available is the previous
+        # session's close. Matching against it would book a trade at a price
+        # that never traded, so let the order rest until the session opens.
+        if self._session_guarded(market) and not is_market_open(market):
+            return None
+
         tick = tick_size_for(market, quote.last)
         fill_price: Optional[float] = None
         slippage_factor = self.default_slippage_bps / 10000.0

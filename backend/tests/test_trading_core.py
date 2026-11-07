@@ -44,6 +44,8 @@ def test_portfolio_ledger_buy_and_sell():
     # 3. Price increases, test mark-to-market
     quote_aapl_up = Quote(symbol="AAPL", bid=160.0, ask=160.2, last=160.0, volume=1500)
     engine.on_quote(quote_aapl_up)
+    # get_position returns a snapshot; re-read it after the book moves.
+    pos = ledger.get_position("AAPL")
     assert pos.current_price == 160.0
     assert pos.unrealized_pnl == round((160.0 - 150.2) * 10, 2)
 
@@ -56,7 +58,7 @@ def test_portfolio_ledger_buy_and_sell():
     )
     assert sell_order.status == OrderStatus.FILLED
     assert sell_order.filled_avg_price == 160.0  # Filled at bid
-    assert pos.quantity == 5
+    assert ledger.get_position("AAPL").quantity == 5
     assert ledger.portfolio.realized_pnl == round((160.0 - 150.2) * 5, 2)
 
 
