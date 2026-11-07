@@ -315,6 +315,13 @@ export const zhCN = {
     invalidStopLimitPrice: '止损限价无效',
     invalidTrailingValue: '跟踪值无效',
     insufficientBalance: '余额不足',
+    // 多市场
+    perLot: '每手',
+    lotError: '数量必须是每手股数的整数倍',
+    priceBand: '涨跌停区间',
+    priceBandError: '价格超出当日涨跌停区间',
+    tickError: '价格不符合该市场的最小跳动单位',
+    unsupportedOnMarket: '该市场暂不支持此订单类型',
   },
 
   // 挂单列表
