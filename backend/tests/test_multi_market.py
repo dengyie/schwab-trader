@@ -382,3 +382,58 @@ class TestDayPriceGuard:
 
         daily = {"last": 1.0, "day_high": 345.765, "day_low": 338.59}
         assert _pick_day_price(self._quote(328.06), daily, [], 338.59, 345.765) is None
+
+
+class TestPositionMarkGuard:
+    """Regression: the tickers endpoint rejected the stale 328.06 print but the
+    position mark did not, so the portfolio still showed AAPL 6 @ 328.06 while
+    the watchlist showed 342.41 for the same symbol."""
+
+    def _ledger_with_long(self):
+        from app.engine.portfolio_ledger import PortfolioLedger
+        from app.models.trading import Position
+
+        ledger = PortfolioLedger(initial_capital=100_000.0)
+        ledger.portfolio.positions["AAPL"] = Position(
+            symbol="AAPL", quantity=6, avg_cost=337.46, current_price=342.41
+        )
+        return ledger
+
+    def _quote(self, last, low=338.59, high=345.765):
+        from app.models.trading import Quote
+
+        return Quote(symbol="AAPL", bid=last, ask=0.0, last=last, day_low=low, day_high=high)
+
+    def test_out_of_range_quote_does_not_move_the_mark(self):
+        ledger = self._ledger_with_long()
+        ledger.update_quote(self._quote(328.06))
+        assert ledger.portfolio.positions["AAPL"].current_price == 342.41
+
+    def test_in_range_quote_moves_the_mark(self):
+        ledger = self._ledger_with_long()
+        ledger.update_quote(self._quote(343.90))
+        assert ledger.portfolio.positions["AAPL"].current_price == 343.90
+
+    def test_quote_without_range_still_marks(self):
+        ledger = self._ledger_with_long()
+        ledger.update_quote(self._quote(328.06, low=None, high=None))
+        assert ledger.portfolio.positions["AAPL"].current_price == 328.06
+
+    def test_feed_stamps_the_cached_daily_range_onto_quotes(self):
+        """The guard is only useful if the quote actually carries the range."""
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+        from app.models.trading import Quote
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {
+            "AAPL": {"prev_close": 344.6, "day_high": 345.765, "day_low": 338.59}
+        }
+        raw = Quote(symbol="AAPL", bid=328.06, ask=0.0, last=328.06)
+
+        decorated = feed._decorate_daily(raw)
+
+        assert decorated.day_low == 338.59
+        assert decorated.day_high == 345.765
+        assert decorated.prev_close == 344.6
+        # The raw object is not mutated: callers keep owning their cache entry.
+        assert raw.day_low is None
