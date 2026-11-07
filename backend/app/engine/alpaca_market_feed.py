@@ -235,13 +235,14 @@ class AlpacaMarketFeedService:
         except Exception as err:
             logger.warning("Alpaca snapshot refresh failed: %s", err)
 
+    def ensure_daily_stats(self, symbols: Optional[List[str]] = None) -> None:
+        """Warm the daily context once per TTL (one batched call at most)."""
+        self.refresh_daily_stats(symbols)
+
     def get_daily_stats(self, symbol: str) -> Dict[str, float]:
-        """Daily context for one symbol, cached and refreshed in the background."""
-        sym = symbol.upper()
-        cached = self.daily_stats.get(sym)
-        if not cached or (time.time() - self._snapshot_ts) >= self.SNAPSHOT_TTL:
-            self.refresh_daily_stats([sym])
-        return self.daily_stats.get(sym) or {}
+        """Cached daily context for one symbol. Never touches the network:
+        ``ensure_daily_stats`` warms the whole catalog in one call."""
+        return self.daily_stats.get(symbol.upper()) or {}
 
     def subscribe_quote(self, callback: Callable[[Quote], None]) -> None:
         self.quote_listeners.append(callback)

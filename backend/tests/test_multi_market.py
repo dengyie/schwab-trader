@@ -273,3 +273,78 @@ class TestSnapshotParser:
         assert AlpacaDataAdapter.parse_snapshots_response(None) == {}
         assert AlpacaDataAdapter.parse_snapshots_response({"X": None}) == {}
         assert AlpacaDataAdapter.parse_snapshots_response("not a dict") == {}
+
+
+class TestDailyStatsWarmup:
+    """Regression: a cold watchlist used to populate only the first row.
+
+    The per-symbol path passed a single-symbol list through a TTL gate, so the
+    first cold symbol refreshed and every later one bailed out on the fresh
+    timestamp -- production showed SPY with a real change and the other 13 rows
+    at 0.0%.
+    """
+
+    def test_one_batched_call_covers_the_whole_catalog(self, monkeypatch):
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {}
+        feed._snapshot_ts = 0.0
+        feed._snapshot_lock = __import__("threading").Lock()
+        feed.symbols = {"SPY", "QQQ", "AAPL"}
+        calls = []
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, params=None):
+                calls.append(params["symbols"])
+                body = {
+                    sym: {"prevDailyBar": {"c": 100.0}, "dailyBar": {"o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 1000}}
+                    for sym in params["symbols"].split(",")
+                }
+
+                class R:
+                    status_code = 200
+
+                    @staticmethod
+                    def json():
+                        return body
+
+                return R()
+
+        monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client", FakeClient)
+        feed.headers = {}
+        feed.data_base_url = "https://example.invalid"
+        feed.feed = "iex"
+
+        feed.ensure_daily_stats(["SPY", "QQQ", "AAPL"])
+        assert len(calls) == 1
+        assert set(feed.daily_stats) == {"SPY", "QQQ", "AAPL"}
+        for sym in ("SPY", "QQQ", "AAPL"):
+            assert feed.get_daily_stats(sym)["prev_close"] == 100.0
+
+        # Inside the TTL the warm-up is free.
+        feed.ensure_daily_stats(["SPY", "QQQ", "AAPL"])
+        assert len(calls) == 1
+
+    def test_get_daily_stats_never_hits_the_network(self, monkeypatch):
+        from app.engine.alpaca_market_feed import AlpacaMarketFeedService
+
+        feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+        feed.daily_stats = {}
+        feed._snapshot_ts = 0.0
+        feed._snapshot_lock = __import__("threading").Lock()
+
+        def boom(*a, **k):
+            raise AssertionError("get_daily_stats must not fetch")
+
+        monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client", boom)
+        assert feed.get_daily_stats("SPY") == {}
