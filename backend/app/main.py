@@ -20,7 +20,7 @@ from app.models.trading import (
 )
 from app.engine.portfolio_ledger import PortfolioLedger
 from app.engine.matching_engine import VirtualMatchingEngine
-from app.engine.state_store import JsonStateStore
+from app.engine.state_store import JsonStateStore, resolve_state_dir
 from app.engine.market_feed import MarketFeedService
 from app.engine.alpaca_market_feed import AlpacaMarketFeedService
 from app.engine.alpaca_broker import AlpacaPaperBroker
@@ -58,7 +58,12 @@ feed = MultiMarketFeed(us_feed, intl_feed)
 ledger = PortfolioLedger(initial_capital=settings.initial_capital, fx=fx)
 # The virtual book must outlive a deploy: US positions live at Alpaca, but
 # HK / JP / CN are matched in-process and would otherwise be wiped on restart.
-state_store = JsonStateStore(settings.state_dir) if settings.state_dir else None
+state_dir = (
+    resolve_state_dir(settings.state_dir) if settings.state_persist_enabled else None
+)
+state_store = JsonStateStore(state_dir) if state_dir else None
+if state_dir:
+    logging.getLogger("app.main").info("Virtual book state directory: %s", state_dir)
 virtual_engine = VirtualMatchingEngine(
     ledger=ledger,
     default_slippage_bps=settings.default_slippage_bps,

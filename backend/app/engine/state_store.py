@@ -23,6 +23,37 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_STATE_SUBDIR = ".schwab-trader"
+
+
+def resolve_state_dir(configured: str = "") -> Optional[str]:
+    """Pick a directory the running process can actually write.
+
+    Preference: an explicit ``STATE_DIR``, then ``<cwd>/data`` (the deployed
+    backend tree, kept by the deploy), then ``~/.schwab-trader`` for hosts where
+    the code directory belongs to the deploy user rather than the service user.
+    Returns ``None`` when nothing is writable, which disables persistence rather
+    than failing every order.
+    """
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+    else:
+        candidates.append(Path.cwd() / "data")
+        candidates.append(Path.home() / DEFAULT_STATE_SUBDIR)
+
+    for directory in candidates:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / ".write-probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return str(directory)
+        except OSError as exc:
+            logger.warning("State dir %s unusable: %s", directory, exc)
+    logger.warning("No writable state dir; the virtual book will not persist")
+    return None
+
 
 class JsonStateStore:
     """Single-file JSON snapshot with atomic replace and corruption quarantine."""

@@ -626,3 +626,34 @@ class TestAlpacaPositionBasis:
         assert pos.currency == "USD"
         assert pos.cost_basis_usd == pytest.approx(6 * 337.456667, rel=1e-9)
         assert portfolio.unrealized_pnl == pytest.approx(6 * (342.41 - 337.456667), abs=1e-2)
+
+
+class TestStateDirResolution:
+    def test_explicit_directory_wins(self, tmp_path, monkeypatch):
+        from app.engine.state_store import resolve_state_dir
+
+        target = tmp_path / "explicit"
+        assert resolve_state_dir(str(target)) == str(target)
+
+    def test_falls_back_to_home_when_cwd_data_is_unusable(self, tmp_path, monkeypatch):
+        """The code dir can belong to the deploy user, not the service user."""
+        from app.engine import state_store as mod
+
+        blocker = tmp_path / "blocker"  # a regular file, so cwd/"data" cannot exist
+        blocker.write_text("x", encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(mod.Path, "cwd", classmethod(lambda cls: blocker))
+        monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: home))
+
+        assert mod.resolve_state_dir("") == str(home / mod.DEFAULT_STATE_SUBDIR)
+
+    def test_returns_none_when_nothing_is_writable(self, tmp_path, monkeypatch):
+        from app.engine import state_store as mod
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(mod.Path, "cwd", classmethod(lambda cls: blocker))
+        monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: blocker))
+
+        assert mod.resolve_state_dir("") is None
