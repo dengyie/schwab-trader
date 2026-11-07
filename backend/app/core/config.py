@@ -56,6 +56,18 @@ class Settings(BaseModel):
         ]
     )
 
+    # Non-US markets (HK / JP / CN) are quoted through Yahoo Finance. Set to 0
+    # to keep those venues dark without touching the US provider (used by the
+    # test suite so it stays hermetic).
+    intl_market_data_enabled: bool = Field(
+        default_factory=lambda: os.getenv("INTL_MARKET_DATA", "1") not in ("0", "false", "False")
+    )
+
+    # Set to 0 to serve fallback FX rates without any network access.
+    fx_enabled: bool = Field(
+        default_factory=lambda: os.getenv("FX_ENABLED", "1") not in ("0", "false", "False")
+    )
+
     # Default tracked tickers
     default_symbols: List[str] = [
         "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA",

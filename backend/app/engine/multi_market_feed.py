@@ -1,0 +1,118 @@
+"""
+Routes market-data reads to the feed that owns the symbol's market.
+
+US symbols keep the Alpaca streaming service (unchanged behaviour); every other
+venue is served by the Yahoo polling feed. The wrapper exposes the same surface
+the API and the websocket handler already use, so no caller needs to know which
+provider answered.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Callable, Dict, List, Optional
+
+from app.core.markets import resolve_symbol
+from app.models.trading import Bar, Quote, Trade
+
+logger = logging.getLogger(__name__)
+
+
+class MultiMarketFeed:
+    def __init__(self, us_feed, intl_feed, us_market_code: str = "US"):
+        self._us = us_feed
+        self._intl = intl_feed
+        self._us_code = us_market_code
+
+    # -- routing ----------------------------------------------------------
+    def _route(self, symbol: object):
+        ref = resolve_symbol(symbol)
+        if ref is None:
+            return None, None
+        if ref.market.code == self._us_code:
+            return ref.symbol, self._us
+        return ref.symbol, self._intl
+
+    # -- quotes -----------------------------------------------------------
+    def get_latest_quote(self, symbol: str) -> Optional[Quote]:
+        canonical, feed = self._route(symbol)
+        if feed is None:
+            return None
+        try:
+            return feed.get_latest_quote(canonical)
+        except Exception as exc:
+            logger.warning("Quote lookup failed for %s: %s", canonical, exc)
+            return None
+
+    def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
+        canonical, feed = self._route(symbol)
+        if feed is None:
+            return []
+        try:
+            if hasattr(feed, "get_bars"):
+                return feed.get_bars(canonical, timeframe=timeframe)
+            return feed.get_historical_bars(canonical)
+        except Exception as exc:
+            logger.warning("Bar lookup failed for %s (%s): %s", canonical, timeframe, exc)
+            return []
+
+    def get_historical_bars(self, symbol: str) -> List[Bar]:
+        return self.get_bars(symbol, timeframe="1m")
+
+    # -- subscriptions ----------------------------------------------------
+    def subscribe_quote(self, callback: Callable[[Quote], None]) -> None:
+        self._us.subscribe_quote(callback)
+        self._intl.subscribe_quote(callback)
+
+    def subscribe_bar(self, callback: Callable[[str, Bar], None]) -> None:
+        self._us.subscribe_bar(callback)
+        self._intl.subscribe_bar(callback)
+
+    def subscribe_trade(self, callback: Callable[[Trade], None]) -> None:
+        if hasattr(self._us, "subscribe_trade"):
+            self._us.subscribe_trade(callback)
+
+    # -- watch (websocket subscriptions) ----------------------------------
+    def activate(self, symbol: str) -> None:
+        canonical, feed = self._route(symbol)
+        if feed is not None and hasattr(feed, "activate"):
+            feed.activate(canonical)
+
+    def deactivate(self, symbol: str) -> None:
+        canonical, feed = self._route(symbol)
+        if feed is not None and hasattr(feed, "deactivate"):
+            feed.deactivate(canonical)
+
+    # -- lifecycle --------------------------------------------------------
+    async def start(self) -> None:
+        await self._us.start()
+        await self._intl.start()
+
+    async def stop(self) -> None:
+        for feed in (self._intl, self._us):
+            try:
+                await feed.stop()
+            except Exception:
+                pass
+
+    # -- attributes read by the API layer ---------------------------------
+    @property
+    def symbols(self) -> List[str]:
+        return list(dict.fromkeys(list(self._us.symbols) + list(self._intl.symbols)))
+
+    @property
+    def latest_quotes(self) -> Dict[str, Quote]:
+        merged: Dict[str, Quote] = dict(getattr(self._intl, "latest_quotes", {}))
+        merged.update(getattr(self._us, "latest_quotes", {}))
+        return merged
+
+    @property
+    def last_trade_prices(self) -> Dict[str, float]:
+        merged: Dict[str, float] = dict(getattr(self._intl, "last_trade_prices", {}))
+        merged.update(getattr(self._us, "last_trade_prices", {}))
+        return merged
+
+    @property
+    def historical_bars(self) -> Dict[str, List[Bar]]:
+        merged: Dict[str, List[Bar]] = dict(getattr(self._intl, "historical_bars", {}))
+        merged.update(getattr(self._us, "historical_bars", {}))
+        return merged

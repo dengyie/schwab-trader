@@ -34,6 +34,8 @@ jobs:
         env:
           MARKET_DATA_PROVIDER: simulation
           BROKER_PROVIDER: virtual
+          FX_ENABLED: '0'
+          INTL_MARKET_DATA: '0'
 
   frontend-tests:
     name: Frontend tests & build (vitest + tsc)

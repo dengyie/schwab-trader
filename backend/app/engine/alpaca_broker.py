@@ -238,7 +238,7 @@ class AlpacaPaperBroker(BaseBroker):
         self._last_order_status.clear()
         self._last_filled_qty.clear()
 
-    def get_market_clock(self) -> Optional[dict]:
+    def get_market_clock(self, market: Optional[str] = None) -> Optional[dict]:
         """Alpaca trading clock: tells the UI 'market closed' vs 'feed degraded'."""
         try:
             resp = self.client.get(f"{self.base_url}/clock")

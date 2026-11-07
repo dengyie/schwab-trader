@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
 from app import main
-from app.main import app, ledger, engine
+from app.main import app, ledger, engine, virtual_engine
 
 # Pin a deterministic token for the test session (settings are read from env at import).
 settings.admin_token = "test-token"
@@ -23,7 +23,7 @@ AUTH = {"X-Auth-Token": "test-token"}
 def reset_state():
     """Reset ledger and orders before each test."""
     ledger.reset(10000.0)
-    engine.orders.clear()
+    virtual_engine.orders.clear()
 
 
 def test_health_endpoint():
@@ -77,12 +77,23 @@ def test_market_endpoints():
 
 
 def test_market_clock_endpoint():
-    """Session clock endpoint: auth-gated, and honest 503 when the broker
-    cannot be asked (virtual engine has no real market hour concept)."""
+    """Session clock endpoint: auth-gated; per-market clocks are computed
+    locally, so every supported market answers instead of a 503."""
     with TestClient(app) as client:
         assert client.get("/api/market/clock").status_code == 401
-        # Virtual engine: clock unknown -> 503, never a fabricated session state
-        assert client.get("/api/market/clock", headers=AUTH).status_code == 503
+        data = client.get("/api/market/clock", headers=AUTH).json()
+        assert data["market"] == "US"
+        assert isinstance(data["is_open"], bool)
+        assert data["session"] in ("open", "break", "pre", "closed")
+        hk = client.get("/api/market/clock?market=HK", headers=AUTH).json()
+        assert hk["market"] == "HK"
+        assert hk["currency"] == "HKD"
+        # Unknown market is a 400, never a fabricated session state
+        assert client.get("/api/market/clock?market=XX", headers=AUTH).status_code == 400
+        # /api/markets catalog is present and self-consistent
+        markets = client.get("/api/markets", headers=AUTH).json()
+        codes = [m["code"] for m in markets["markets"]]
+        assert "US" in codes and "HK" in codes and "JP" in codes and "CN" in codes
 
 
 def test_order_submission_and_portfolio_rest():
@@ -212,3 +223,62 @@ def test_websocket_survives_malformed_frames():
             websocket.send_json({"action": "PING"})
             pong_msg = websocket.receive_json()
             assert pong_msg["type"] == "PONG"
+
+
+def test_multi_market_catalog_and_rules():
+    """Multi-market endpoints: catalog, per-market tickers, symbol routing and
+    exchange rule enforcement on the order API (no network in offline mode)."""
+    with TestClient(app) as client:
+        # Catalog is self-consistent for all four markets.
+        markets = client.get("/api/markets", headers=AUTH).json()
+        by_code = {m["code"]: m for m in markets["markets"]}
+        assert set(by_code) == {"US", "HK", "JP", "CN"}
+        assert by_code["HK"]["currency"] == "HKD"
+        assert by_code["HK"]["lot_size"] == 100
+        assert by_code["CN"]["settlement"] == "T+1"
+        assert by_code["JP"]["suffix"] == ".T"
+        assert "base_currency" in markets
+        assert markets["fx_rates"]["USD"] == 1.0
+
+        # International tickers are served (empty offline, never a crash).
+        hk_tickers = client.get("/api/market/tickers?market=HK", headers=AUTH)
+        assert hk_tickers.status_code == 200
+        assert isinstance(hk_tickers.json(), list)
+        assert client.get("/api/market/tickers?market=XX", headers=AUTH).status_code == 400
+
+        # Bare numeric symbols resolve with the market hint.
+        order = client.post("/api/orders", json={
+            "symbol": "0700",
+            "market": "HK",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 100,
+            "price": 400.0,
+        }, headers=AUTH)
+        assert order.status_code == 200
+        body = order.json()
+        assert body["symbol"] == "0700.HK"
+        assert body["market"] == "HK"
+        assert body["currency"] == "HKD"
+
+        # A-share board lot is enforced server-side.
+        bad_lot = client.post("/api/orders", json={
+            "symbol": "600519.SS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "quantity": 150,
+            "price": 1450.0,
+        }, headers=AUTH)
+        assert bad_lot.status_code == 400
+        assert "multiple of 100" in bad_lot.json()["detail"]
+
+        # Non-numeric tickers and nonsense are rejected, not sent upstream.
+        assert client.post("/api/orders", json={
+            "symbol": "../../etc", "side": "BUY", "order_type": "MARKET", "quantity": 1
+        }, headers=AUTH).status_code == 400
+
+        # Portfolio reports the base currency and FX rates.
+        portfolio = client.get("/api/portfolio", headers=AUTH).json()
+        assert portfolio["base_currency"] == "USD"
+        assert "fx_rates" in portfolio
+        assert "USD" in portfolio["fx_rates"]

@@ -67,7 +67,7 @@ class BaseBroker(ABC):
         """Resets the broker state / paper ledger."""
         pass
 
-    def get_market_clock(self) -> Optional[dict]:
+    def get_market_clock(self, market: Optional[str] = None) -> Optional[dict]:
         """
         Trading-session clock: {"is_open": bool, "next_open": iso, "next_close": iso}.
 

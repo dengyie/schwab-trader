@@ -1,0 +1,247 @@
+"""Multi-market execution and multi-currency accounting.
+
+These tests exercise the virtual engine end-to-end: board lots, tick sizes,
+price bands, T+1, FX conversion into the USD account, and the broker router
+that keeps US and non-US books in one view.
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.core.markets import MARKETS
+from app.engine.fx_service import FxService
+from app.engine.market_router import MarketRouterBroker
+from app.engine.matching_engine import VirtualMatchingEngine
+from app.engine.portfolio_ledger import PortfolioLedger
+from app.models.trading import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Quote,
+    Trade,
+)
+
+
+class FixedFx:
+    """Deterministic FX stub: 1 unit of currency = ``usd`` USD."""
+
+    def __init__(self, rates=None):
+        self.rates = {"USD": 1.0, "HKD": 0.128, "JPY": 0.0064, "CNY": 0.15}
+        if rates:
+            self.rates.update(rates)
+
+    def usd_per_unit(self, currency: str) -> float:
+        return self.rates.get((currency or "USD").upper(), 1.0)
+
+    def all_rates(self) -> dict:
+        return dict(self.rates)
+
+
+@pytest.fixture
+def fx():
+    return FixedFx()
+
+
+@pytest.fixture
+def engine(fx):
+    ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+    return VirtualMatchingEngine(
+        ledger=ledger,
+        default_slippage_bps=0.0,
+        default_commission_per_order=0.0,
+        fx=fx,
+        enforce_sessions=False,
+    )
+
+
+def quote(symbol, last, prev_close=None, bid=None, ask=None):
+    from app.core.markets import market_of
+
+    market = market_of(symbol)
+    return Quote(
+        symbol=symbol,
+        bid=bid if bid is not None else last,
+        ask=ask if ask is not None else last,
+        last=last,
+        market=market.code,
+        currency=market.currency,
+        prev_close=prev_close,
+    )
+
+
+class TestMultiCurrency:
+    def test_hk_buy_debits_usd_at_fx(self, engine, fx):
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=395.0))
+        order = engine.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=420.0
+        )
+        assert order.status == OrderStatus.FILLED
+        assert order.market == "HK"
+        assert order.currency == "HKD"
+
+        portfolio = engine.get_portfolio()
+        # 100 * 400 HKD at 0.128 = 5120 USD
+        assert portfolio.cash == pytest.approx(100000.0 - 5120.0, abs=1e-6)
+        pos = portfolio.positions["0700.HK"]
+        assert pos.currency == "HKD"
+        assert pos.quantity == 100
+        assert pos.avg_cost == pytest.approx(400.0)
+        assert pos.cost_basis_usd == pytest.approx(5120.0)
+        assert pos.market_value_usd(fx.usd_per_unit("HKD")) == pytest.approx(5120.0)
+
+    def test_jp_round_lot(self, engine):
+        engine.on_quote(quote("7203.T", 3000.0, prev_close=2990.0))
+        order = engine.submit_order(
+            "7203.T", OrderSide.BUY, OrderType.LIMIT, 100, price=3100.0
+        )
+        assert order.status == OrderStatus.FILLED
+        assert order.quantity == 100
+
+    def test_jp_fractional_lot_rejected(self, engine):
+        engine.on_quote(quote("7203.T", 3000.0, prev_close=2990.0))
+        with pytest.raises(ValueError, match="multiple of 100"):
+            engine.submit_order("7203.T", OrderSide.BUY, OrderType.LIMIT, 50, price=3100.0)
+
+    def test_cn_price_band_rejected(self, engine):
+        engine.on_quote(quote("600519.SS", 1450.0, prev_close=1450.0))
+        with pytest.raises(ValueError, match="price limit"):
+            engine.submit_order("600519.SS", OrderSide.BUY, OrderType.LIMIT, 100, price=1700.0)
+
+    def test_cn_t1_sell_blocked(self, engine):
+        engine.on_quote(quote("600519.SS", 1450.0, prev_close=1450.0))
+        engine.submit_order("600519.SS", OrderSide.BUY, OrderType.LIMIT, 100, price=1460.0)
+        with pytest.raises(ValueError, match="T\\+1"):
+            engine.submit_order("600519.SS", OrderSide.SELL, OrderType.LIMIT, 100, price=1500.0)
+
+    def test_us_sale_proceeds_feed_foreign_purchase(self, engine):
+        engine.on_quote(quote("SPY", 500.0, prev_close=500.0))
+        engine.submit_order("SPY", OrderSide.BUY, OrderType.LIMIT, 10, price=500.0)
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=400.0)
+        portfolio = engine.get_portfolio()
+        assert set(portfolio.positions) == {"SPY", "0700.HK"}
+        # Both positions are valued in USD for the account total.
+        assert portfolio.market_value == pytest.approx(5000.0 + 5120.0, abs=1e-6)
+        assert portfolio.total_equity == pytest.approx(
+            portfolio.cash + 10120.0, abs=1e-6
+        )
+
+    def test_realized_pnl_is_usd(self, engine, fx):
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=400.0)
+        engine.on_quote(quote("0700.HK", 420.0))
+        engine.submit_order("0700.HK", OrderSide.SELL, OrderType.LIMIT, 100, price=420.0)
+        portfolio = engine.get_portfolio()
+        # 20 HKD/share * 100 = 2000 HKD * 0.128 = 256 USD
+        assert portfolio.realized_pnl == pytest.approx(256.0, abs=1e-6)
+        assert portfolio.positions["0700.HK"].quantity == 0
+        assert portfolio.positions["0700.HK"].realized_pnl_usd == pytest.approx(256.0)
+
+    def test_insufficient_buying_power_rejects(self, fx):
+        ledger = PortfolioLedger(initial_capital=100.0, fx=fx)
+        engine = VirtualMatchingEngine(ledger=ledger, fx=fx, enforce_sessions=False)
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        order = engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=400.0)
+        assert order.status == OrderStatus.REJECTED
+        assert "buying power" in (order.reject_reason or "")
+
+
+class TestSessionGuard:
+    def test_non_us_market_order_blocked_when_closed(self, fx):
+        ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+        engine = VirtualMatchingEngine(
+            ledger=ledger, fx=fx, enforce_sessions_for=frozenset({"HK", "JP", "CN"})
+        )
+        engine.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        # A market order depends on a live session; a limit order does not.
+        with pytest.raises(ValueError, match="market is closed"):
+            # 2026-11-07 is a Saturday in every supported timezone
+            from app.core.markets import is_market_open
+
+            if is_market_open(MARKETS.require("HK")):
+                pytest.skip("HK market is open right now")
+            engine.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+
+    def test_us_market_order_not_guarded(self, fx):
+        ledger = PortfolioLedger(initial_capital=100000.0, fx=fx)
+        engine = VirtualMatchingEngine(
+            ledger=ledger, fx=fx, enforce_sessions_for=frozenset({"HK", "JP", "CN"})
+        )
+        engine.on_quote(quote("SPY", 500.0, prev_close=500.0))
+        order = engine.submit_order("SPY", OrderSide.BUY, OrderType.MARKET, 1)
+        assert order.status == OrderStatus.FILLED
+
+
+class TestRouter:
+    def _build(self, fx):
+        us_ledger = PortfolioLedger(initial_capital=50000.0, fx=fx)
+        us = VirtualMatchingEngine(ledger=us_ledger, fx=fx, enforce_sessions=False)
+        intl = VirtualMatchingEngine(
+            ledger=PortfolioLedger(initial_capital=50000.0, fx=fx),
+            fx=fx,
+            enforce_sessions=False,
+        )
+        return MarketRouterBroker(us, intl), us, intl
+
+    def test_routes_us_to_us_book(self, fx):
+        router, us, intl = self._build(fx)
+        router.on_quote(quote("SPY", 500.0))
+        order = router.submit_order("SPY", OrderSide.BUY, OrderType.LIMIT, 1, price=500.0)
+        assert order.status == OrderStatus.FILLED
+        assert len(us.get_orders()) == 1
+        assert len(intl.get_orders()) == 0
+
+    def test_routes_hk_to_intl_book(self, fx):
+        router, us, intl = self._build(fx)
+        router.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        order = router.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=400.0)
+        assert order.status == OrderStatus.FILLED
+        assert len(intl.get_orders()) == 1
+        assert len(us.get_orders()) == 0
+
+    def test_portfolio_merges_both_books(self, fx):
+        router, us, intl = self._build(fx)
+        router.on_quote(quote("SPY", 500.0))
+        router.submit_order("SPY", OrderSide.BUY, OrderType.LIMIT, 2, price=500.0)
+        router.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        router.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=400.0)
+
+        merged = router.get_portfolio()
+        assert set(merged.positions) == {"SPY", "0700.HK"}
+        assert merged.cash == pytest.approx(100000.0 - 1000.0 - 5120.0, abs=1e-6)
+
+    def test_cancel_searches_both_books(self, fx):
+        router, us, intl = self._build(fx)
+        router.on_quote(quote("0700.HK", 400.0, prev_close=400.0))
+        order = router.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=300.0
+        )
+        assert order.status == OrderStatus.PENDING
+        cancelled = router.cancel_order(order.order_id)
+        assert cancelled is not None
+        assert cancelled.status == OrderStatus.CANCELLED
+
+    def test_clock_per_market(self, fx):
+        router, _, _ = self._build(fx)
+        hk = router.get_market_clock("HK")
+        assert hk["market"] == "HK"
+        assert hk["currency"] == "HKD"
+        cn = router.get_market_clock("CN")
+        assert cn["market"] == "CN"
+        assert router.get_market_clock("XX") is None
+
+
+class TestFxService:
+    def test_fallback_rates_without_network(self):
+        service = FxService(enabled=False)
+        assert service.usd_per_unit("USD") == 1.0
+        # HKD fallback 7.83 per USD
+        assert service.usd_per_unit("HKD") == pytest.approx(1 / 7.83, rel=1e-6)
+        rates = service.all_rates()
+        assert set(rates) == {"USD", "HKD", "JPY", "CNY"}
+        for value in rates.values():
+            assert 0 < value <= 1.0
+
+    def test_unknown_currency_is_identity(self):
+        service = FxService(enabled=False)
+        assert service.usd_per_unit("XXX") == 1.0

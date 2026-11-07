@@ -59,7 +59,41 @@ class YahooFinanceAdapter:
             cls._shared_client = None
 
     @classmethod
-    def fetch_bars(cls, symbol: str, timeframe: str = "15m", client: Optional[httpx.Client] = None) -> List[Bar]:
+    def fetch_meta(
+        cls, symbol: str, client: Optional[httpx.Client] = None
+    ) -> Optional[Dict[str, object]]:
+        """Latest quote metadata for any Yahoo symbol.
+
+        Returns the chart ``meta`` block (price, previous close, day range,
+        volume, currency, exchange timezone) or ``None`` when the symbol is
+        unknown or the provider is unreachable. No price is ever invented.
+        """
+        sym = symbol.upper().replace("/", "-")
+        try:
+            cli = client or cls.get_client()
+            resp = cli.get(
+                f"{cls.BASE_URL}/{sym}",
+                params={"interval": "1m", "range": "1d", "includePrePost": "false"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            results = payload.get("chart", {}).get("result") or []
+            if not results:
+                return None
+            meta = results[0].get("meta") or {}
+            return meta if meta else None
+        except Exception as exc:
+            logger.warning("YahooFinanceAdapter fetch_meta error for %s: %s", sym, exc)
+            return None
+
+    @classmethod
+    def fetch_bars(
+        cls,
+        symbol: str,
+        timeframe: str = "15m",
+        client: Optional[httpx.Client] = None,
+        tz: Optional[ZoneInfo] = None,
+    ) -> List[Bar]:
         sym = symbol.upper().replace("/", "-")
         tf_key = timeframe.lower()
         if tf_key not in TIMEFRAME_SECONDS:
@@ -121,9 +155,12 @@ class YahooFinanceAdapter:
                     )
                 )
 
-            # If 4h requested, aggregate 1h bars into 4h bars aligned to time buckets
+            # If 4h requested, aggregate 1h bars into 4h bars aligned to the
+            # exchange's own session rather than to UTC midnight.
             if tf_key == "4h" and raw_bars:
-                return cls._aggregate_bars(raw_bars, bucket_seconds=14400)
+                return cls._aggregate_bars(
+                    raw_bars, bucket_seconds=14400, tz=tz or ET
+                )
 
             return raw_bars
         except Exception as e:
@@ -131,23 +168,26 @@ class YahooFinanceAdapter:
             return []
 
     @staticmethod
-    def _aggregate_bars(bars: List[Bar], bucket_seconds: int = 14400) -> List[Bar]:
+    def _aggregate_bars(
+        bars: List[Bar], bucket_seconds: int = 14400, tz: Optional[ZoneInfo] = None
+    ) -> List[Bar]:
         """
-        Aggregates 1h bars into 4h bars aligned to the US trading session.
+        Aggregates 1h bars into 4h bars aligned to the exchange's trading day.
 
-        Buckets are anchored to the first traded hour of each ET trading day
+        Buckets are anchored to the first traded hour of each local trading day
         instead of UTC midnight, so candles never merge two trading days and
-        boundary bars line up with the 09:30 ET open.
+        boundary bars line up with the local session open.
         """
         if not bars:
             return []
 
+        local_tz = tz or ET
         bars_per_bucket = max(1, int(bucket_seconds // 3600))
 
         buckets: Dict[str, List[Bar]] = {}
         seq_per_day: Dict[str, int] = {}
         for b in bars:
-            dt = datetime.fromtimestamp(b.time, tz=ET)
+            dt = datetime.fromtimestamp(b.time, tz=local_tz)
             day_key = dt.strftime("%Y-%m-%d")
             seq = seq_per_day.get(day_key, 0)
             bucket_key = f"{day_key}/{seq // bars_per_bucket}"

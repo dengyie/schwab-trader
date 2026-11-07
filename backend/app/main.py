@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -15,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.auth import token_matches
+from app.core.markets import resolve_symbol
 from app.models.trading import (
     Quote, Bar, Trade, Order, OrderSide, OrderType
 )
@@ -24,6 +24,10 @@ from app.engine.market_feed import MarketFeedService
 from app.engine.alpaca_market_feed import AlpacaMarketFeedService
 from app.engine.alpaca_broker import AlpacaPaperBroker
 from app.engine.base_broker import BaseBroker
+from app.engine.fx_service import FxService
+from app.engine.yahoo_feed import YahooQuoteFeed
+from app.engine.multi_market_feed import MultiMarketFeed
+from app.engine.market_router import MarketRouterBroker
 from app.api.websocket_manager import WebSocketManager
 from app.api.routes import create_api_router
 
@@ -33,7 +37,7 @@ if settings.market_data_provider == "alpaca":
         raise RuntimeError(
             "ALPACA_API_KEY and ALPACA_API_SECRET must be set via environment."
         )
-    feed = AlpacaMarketFeedService(
+    us_feed = AlpacaMarketFeedService(
         initial_symbols=settings.default_symbols,
         api_key=settings.alpaca_api_key,
         api_secret=settings.alpaca_api_secret,
@@ -42,14 +46,21 @@ if settings.market_data_provider == "alpaca":
         feed=settings.alpaca_feed
     )
 else:
-    feed = MarketFeedService(initial_symbols=settings.default_symbols)
+    us_feed = MarketFeedService(initial_symbols=settings.default_symbols)
+
+# Non-US venues (HK / JP / CN) are served by Yahoo; the US stream is untouched.
+fx = FxService(enabled=settings.fx_enabled)
+intl_feed = YahooQuoteFeed(symbols=[], enabled=settings.intl_market_data_enabled)
+feed = MultiMarketFeed(us_feed, intl_feed)
 
 # 2. Broker / Execution Provider Factory
-ledger = PortfolioLedger(initial_capital=settings.initial_capital)
+ledger = PortfolioLedger(initial_capital=settings.initial_capital, fx=fx)
 virtual_engine = VirtualMatchingEngine(
     ledger=ledger,
     default_slippage_bps=settings.default_slippage_bps,
-    default_commission_per_order=settings.default_commission
+    default_commission_per_order=settings.default_commission,
+    fx=fx,
+    enforce_sessions_for=frozenset({"HK", "JP", "CN"}),
 )
 
 if settings.broker_provider == "alpaca_paper":
@@ -57,16 +68,20 @@ if settings.broker_provider == "alpaca_paper":
         raise RuntimeError(
             "ALPACA_API_KEY and ALPACA_API_SECRET must be set via environment."
         )
-    broker: BaseBroker = AlpacaPaperBroker(
+    us_broker: BaseBroker = AlpacaPaperBroker(
         api_key=settings.alpaca_api_key,
         api_secret=settings.alpaca_api_secret,
         base_url=settings.alpaca_paper_base_url
     )
 else:
-    broker = virtual_engine
+    us_broker = virtual_engine
 
-# Compatibility aliases
-engine = broker
+# One account view across Alpaca (US) and the multi-market virtual engine.
+broker: BaseBroker = MarketRouterBroker(us_broker, virtual_engine)
+
+# Compatibility alias: legacy tooling/tests expected the local matching
+# engine; the account-facing broker is the multi-market router.
+engine = virtual_engine
 
 ws_manager = WebSocketManager()
 
@@ -183,7 +198,6 @@ app.add_middleware(
 app.include_router(create_api_router(broker, feed))
 
 
-_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 WS_AUTH_TIMEOUT_SEC = 5.0
 
 
@@ -209,12 +223,14 @@ class _RedactWsQueryFilter(logging.Filter):
         return True
 
 
-def _clean_symbol(value: object) -> str | None:
-    """Only real ticker shapes may reach the feed or broker from a socket."""
-    if not isinstance(value, str):
-        return None
-    sym = value.strip().upper()
-    return sym if _SYMBOL_RE.match(sym) else None
+def _clean_symbol(value: object, market: object = None) -> str | None:
+    """Only real ticker shapes may reach the feed or broker from a socket.
+
+    Accepts every supported market: ``SPY``, ``0700.HK``, ``7203.T``,
+    ``600519.SS``; ``market`` disambiguates a bare numeric code.
+    """
+    ref = resolve_symbol(value, market if isinstance(market, str) else None)
+    return ref.symbol if ref else None
 
 
 async def _send_portfolio_snapshot(websocket: WebSocket) -> None:
@@ -318,26 +334,29 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if action == "SUBSCRIBE":
-                sym = _clean_symbol(msg.get("symbol", "SPY"))
+                sym = _clean_symbol(msg.get("symbol", "SPY"), msg.get("market"))
                 if not sym:
                     await websocket.send_json({
                         "type": "SUBSCRIBE_ERROR", "error": "invalid symbol"
                     })
                     continue
                 ws_manager.subscribe(websocket, sym)
+                # Keep the polling feed awake for this specific symbol.
+                feed.activate(sym)
                 # Send immediate latest quote (off the event loop)
                 q = await asyncio.to_thread(feed.get_latest_quote, sym)
                 if q:
                     await websocket.send_json({"type": "QUOTE_UPDATE", "data": q.model_dump(mode="json")})
 
             elif action == "UNSUBSCRIBE":
-                sym = _clean_symbol(msg.get("symbol"))
+                sym = _clean_symbol(msg.get("symbol"), msg.get("market"))
                 if sym:
                     ws_manager.unsubscribe(websocket, sym)
+                    feed.deactivate(sym)
 
             elif action == "SUBMIT_ORDER":
                 try:
-                    sym = _clean_symbol(msg.get("symbol"))
+                    sym = _clean_symbol(msg.get("symbol"), msg.get("market"))
                     if not sym:
                         raise ValueError("invalid symbol")
                     q = await asyncio.to_thread(feed.get_latest_quote, sym)
