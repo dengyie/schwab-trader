@@ -79,6 +79,9 @@ export interface Position {
   updatedAt: number;
   takeProfitPrice?: string; // 止盈价
   stopLossPrice?: string;   // 止损价
+  /** 所属市场与计价币种：金额列据此显示 HK$/¥/CN¥。 */
+  market?: string;
+  currency?: string;
 }
 
 export interface AccountBalance {

@@ -16,6 +16,9 @@ export interface Quote {
   timestamp: string;
   bid_size?: number;
   ask_size?: number;
+  /** 所属市场（US/HK/JP/CN）与计价币种，由后端标注。 */
+  market?: string;
+  currency?: string;
 }
 
 export interface BackendPosition {
@@ -23,9 +26,17 @@ export interface BackendPosition {
   quantity: number;
   avg_cost: number;
   current_price: number;
+  /** Native-currency figures. */
   market_value: number;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
+  market?: string;
+  currency?: string;
+  /** USD (base currency) view of the same position. */
+  market_value_usd?: number;
+  unrealized_pnl_usd?: number;
+  realized_pnl?: number;
+  realized_pnl_usd?: number;
 }
 
 export interface Portfolio {
@@ -37,6 +48,9 @@ export interface Portfolio {
   unrealized_pnl: number;
   total_pnl: number;
   total_pnl_pct: number;
+  base_currency?: string;
+  /** 1 unit of foreign currency expressed in base currency. */
+  fx_rates?: Record<string, number>;
   positions: Record<string, BackendPosition>;
 }
 
@@ -52,6 +66,8 @@ export interface BackendOrder {
   filled_quantity: number;
   filled_avg_price: number;
   created_at: string;
+  market?: string;
+  currency?: string;
 }
 
 export interface MarketTrade {
