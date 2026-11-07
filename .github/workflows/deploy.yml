@@ -123,7 +123,7 @@ jobs:
           test -d "$stage/backend" && test -d "$stage/dist"
           mkdir -p "$backup"
           rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
-            "$live_backend/" "$backup/backend/"
+            --exclude 'data' "$live_backend/" "$backup/backend/"
           [ -d "$live_dist" ] && rsync -a "$live_dist/" "$backup/dist/" || true
 
           rollback() {
@@ -131,7 +131,7 @@ jobs:
             trap - EXIT
             if [ "$rc" -ne 0 ]; then
               echo "Deploy failed (exit $rc); restoring $backup" >&2
-              rsync -a --delete --exclude '.venv' "$backup/backend/" "$live_backend/"
+              rsync -a --delete --exclude '.venv' --exclude 'data' "$backup/backend/" "$live_backend/"
               if [ -d "$backup/dist" ]; then
                 rsync -a --delete "$backup/dist/" "$live_dist/"
               fi
@@ -143,9 +143,17 @@ jobs:
           }
           trap rollback EXIT
 
+          # 'data' holds the virtual HK/JP/CN book. It must survive the swap:
+          # excluding it keeps positions, cash and working orders across deploys.
           rsync -a --delete --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
+            --exclude 'data' \
             "$stage/backend/" "$live_backend/"
           rsync -a --delete "$stage/dist/" "$live_dist/"
+
+          # The service user (not the deploy user) must own the state directory.
+          svc_user=$(sudo -n /usr/bin/systemctl show -p User --value schwab-trader.service)
+          sudo -n /bin/mkdir -p "$live_backend/data"
+          sudo -n /bin/chown "$svc_user:$svc_user" "$live_backend/data"
 
           "$live_backend/.venv/bin/pip" install -q --disable-pip-version-check \
             -r "$live_backend/requirements.txt"

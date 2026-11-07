@@ -291,7 +291,13 @@ class AlpacaDataAdapter:
                     quantity=qty,
                     avg_cost=avg_cost,
                     current_price=current_price,
-                    realized_pnl=realized_pnl
+                    realized_pnl=realized_pnl,
+                    # Alpaca reports US positions in USD only. Without the USD
+                    # basis the field reads 0, and any USD total derived from
+                    # it silently overstates value.
+                    market="US",
+                    currency="USD",
+                    cost_basis_usd=round(qty * avg_cost, 4),
                 )
             except Exception:
                 continue

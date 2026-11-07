@@ -29,3 +29,6 @@ token.json
 .idea/
 .vscode/
 *.log
+
+# Runtime state (virtual HK/JP/CN book) — never commit
+backend/data/
