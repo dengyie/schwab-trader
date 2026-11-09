@@ -116,6 +116,7 @@ describe('reconcileOrders', () => {
       currency: 'USD',
       created_at: '2023-11-14T22:13:20.000Z',
       updated_at: '2023-11-14T22:14:20.000Z',
+      filled_at: '2023-11-14T22:13:55.000Z',
     }]);
 
     expect(filled.status).toBe('filled');
@@ -127,6 +128,24 @@ describe('reconcileOrders', () => {
       fee: '0',
       feeAsset: 'USD',
     });
+    // The fill is dated by execution, not by the row's last status update.
+    expect(filled.fills[0].time).toBe(Date.parse('2023-11-14T22:13:55.000Z'));
+  });
+
+  it('falls back to the status update when the broker sent no fill time', () => {
+    const [filled] = reconcileOrders([], [{
+      order_id: 'ord_5',
+      symbol: 'SPY',
+      side: 'SELL',
+      order_type: 'MARKET',
+      quantity: 1,
+      status: 'FILLED',
+      filled_quantity: 1,
+      filled_avg_price: 500,
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:14:20.000Z',
+    }]);
+
     expect(filled.fills[0].time).toBe(Date.parse('2023-11-14T22:14:20.000Z'));
   });
 

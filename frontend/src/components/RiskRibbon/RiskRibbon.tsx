@@ -103,7 +103,7 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
     : EMPTY;
   const profitFactorDisplay = !hasClosedTrades
     ? EMPTY
-    : Number.isFinite(performanceMetrics.profitFactor   )
+    : Number.isFinite(performanceMetrics.profitFactor)
       ? performanceMetrics.profitFactor.toFixed(2)
       : '∞';
   const realizedPnl = parseFloat(performanceMetrics.totalRealizedPnl) || 0;

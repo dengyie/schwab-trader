@@ -38,6 +38,18 @@ def _parse_alpaca_timestamp(ts_val: Any) -> datetime:
     return utc_now()
 
 
+def _parse_optional_timestamp(ts_val: Any) -> Optional[datetime]:
+    """Like ``_parse_alpaca_timestamp`` but preserves "absent" as ``None``.
+
+    Order history needs to distinguish a venue timestamp the broker actually
+    sent from one we made up at fetch time; inventing ``utc_now()`` here is what
+    made every historical fill look freshly executed.
+    """
+    if not ts_val:
+        return None
+    return _parse_alpaca_timestamp(ts_val)
+
+
 class AlpacaDataAdapter:
     """
     Normalizes Alpaca Market Data and Paper Trading API payloads.
@@ -349,6 +361,11 @@ class AlpacaDataAdapter:
         price = float(order_json.get("limit_price")) if order_json.get("limit_price") else None
         stop_price = float(order_json.get("stop_price")) if order_json.get("stop_price") else None
         created_at = _parse_alpaca_timestamp(order_json.get("created_at"))
+        # Prefer the venue's own timestamps. A lookup must never rewrite when an
+        # order last changed; falling back to created_at keeps history stable
+        # instead of claiming the row was touched on every poll.
+        updated_at = _parse_optional_timestamp(order_json.get("updated_at")) or created_at
+        filled_at = _parse_optional_timestamp(order_json.get("filled_at"))
 
         return Order(
             order_id=order_json.get("id") or order_json.get("client_order_id") or "ord_unknown",
@@ -363,5 +380,6 @@ class AlpacaDataAdapter:
             filled_quantity=filled_qty,
             filled_avg_price=filled_avg_price,
             created_at=created_at,
-            updated_at=utc_now()
+            updated_at=updated_at,
+            filled_at=filled_at,
         )

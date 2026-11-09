@@ -161,6 +161,53 @@ def test_alpaca_parse_order_to_domain():
     assert order.filled_avg_price == 142.50
 
 
+def test_alpaca_order_timestamps_come_from_the_venue():
+    # Order history is replayed from this lookup on every poll, so the timestamps
+    # must be the venue's own. Stamping updated_at = now() on each fetch made
+    # every historical fill look like it executed seconds ago: 1H volume totals
+    # included two-day-old trades and FIFO trade stats reordered themselves.
+    order_json = {
+        "id": "alpaca_ord_hist",
+        "symbol": "SPY",
+        "qty": "10",
+        "filled_qty": "10",
+        "filled_avg_price": "500.00",
+        "side": "buy",
+        "type": "market",
+        "status": "filled",
+        "created_at": "2026-11-02T19:59:00.123456789Z",
+        "updated_at": "2026-11-02T20:00:01.987654321Z",
+        "filled_at": "2026-11-02T20:00:00.500000Z",
+    }
+    order = AlpacaDataAdapter.parse_order_to_domain(order_json)
+
+    assert order.created_at == datetime(2026, 11, 2, 19, 59, 0, 123456, tzinfo=timezone.utc)
+    assert order.updated_at == datetime(2026, 11, 2, 20, 0, 1, 987654, tzinfo=timezone.utc)
+    assert order.filled_at == datetime(2026, 11, 2, 20, 0, 0, 500000, tzinfo=timezone.utc)
+
+
+def test_alpaca_order_without_venue_timestamps_stays_stable():
+    # Older/simplified payloads: no updated_at and no filled_at. The row must
+    # still describe the order's creation, not the moment it was read.
+    order_json = {
+        "id": "alpaca_ord_min",
+        "symbol": "AAPL",
+        "qty": "1",
+        "filled_qty": "0",
+        "side": "buy",
+        "type": "limit",
+        "limit_price": "200.00",
+        "status": "new",
+        "created_at": "2026-11-02T15:00:00Z",
+    }
+    first = AlpacaDataAdapter.parse_order_to_domain(order_json)
+    second = AlpacaDataAdapter.parse_order_to_domain(order_json)
+
+    assert first.filled_at is None
+    assert first.updated_at == first.created_at == second.updated_at
+    assert first.status == OrderStatus.PENDING
+
+
 def test_base_broker_inheritance():
     ledger = PortfolioLedger(initial_capital=50000.0)
     engine = VirtualMatchingEngine(ledger)

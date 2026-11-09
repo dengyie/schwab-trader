@@ -48,6 +48,8 @@ export interface BackendOrderRow {
   currency?: string;
   created_at?: string;
   updated_at?: string;
+  /** Venue execution time; falls back below for brokers that omit it. */
+  filled_at?: string;
 }
 
 /** How long an order may sit without a backend id while its POST is in flight. */
@@ -162,7 +164,9 @@ function backendFills(row: BackendOrderRow, backendId: string): Fill[] {
     quantity: quantity.toString(),
     fee: '0',
     feeAsset: row.currency || 'USD',
-    time: toTimestamp(row.updated_at ?? row.created_at),
+    // filled_at is the venue's execution time. updated_at only dates the last
+    // status change, so it is a fallback for older brokers, not the truth.
+    time: toTimestamp(row.filled_at ?? row.updated_at ?? row.created_at),
   }];
 }
 
