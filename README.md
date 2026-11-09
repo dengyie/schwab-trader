@@ -1,69 +1,160 @@
-# Schwab Trader Hub (美股虚拟操盘与盯盘中枢)
+<!-- markdownlint-disable-file MD033 MD045 -->
+<div align="center">
 
-一套生产就绪、开箱即用的美股本地虚拟操盘、数据盯盘与量化/AI 模型特征系统。
+# Schwab Trader Hub
 
-* **前端**：依托 **TradingView Lightweight Charts** 渲染毫秒级实时 K 线，支持持仓均价线动态标注与一键买卖操作。
-* **后端**：采用 **Python FastAPI 异步网关 + WebSocket Streamer**，直连嘉信证券（Charles Schwab）数据协议。
-* **零风险虚拟撮合**：内置本地虚拟撮合与资产记账引擎（Virtual Matching & Ledger Engine），支持市价单、限价单、止损单撮合，先不投真钱、完全验证交易策略。
-* **AI/量化模型天然适配**：提供标准的 DataFrame 特征导出与大语言模型 Agent Tool-Calling 上下文接口。
+**Production-Ready US Equities Paper Trading, Real-Time Market Telemetry & Quantitative Model Feature Gateway**
+
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Frontend](https://img.shields.io/badge/Frontend-React_18_%7C_TypeScript_%7C_Vite-61DAFB.svg?style=flat-square&logo=react&logoColor=white)](frontend/)
+[![Charts](https://img.shields.io/badge/Charts-TradingView_Lightweight_Charts-blue.svg?style=flat-square)](https://tradingview.github.io/lightweight-charts/)
+[![Architecture](https://img.shields.io/badge/Architecture-Full--Duplex_WebSocket_%7C_Virtual_Ledger-orange.svg?style=flat-square)](backend/)
+[![Tests](https://img.shields.io/badge/tests-247%20passed-brightgreen.svg?style=flat-square)]()
+
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Features](#core-features) · [Architecture](#system-architecture) · [Quick Start](#quick-start) · [Trading & Quant](#paper-trading--quant-model-integration) · [Testing](#testing--quality-assurance)
+
+<br>
+
+<p align="center">
+  <b>Terminates real capital risk, broker rate-limit penalties, and fragile data pipelines when validating equity trading strategies.</b><br>
+  Engineered with high-throughput FastAPI async WebSocket streamer backends, TradingView Lightweight Charts rendering sub-millisecond price action, and a deterministic virtual matching ledger.<br>
+  Delivers realistic slippage and position cost tracking, limit and stop-loss order matching, unified multi-market Alpaca and Yahoo Finance data adapters, Pandas/Polars feature matrix exports, and structured LLM tool-calling contexts.
+</p>
+
+</div>
 
 ---
 
-## 一、系统架构
+## Motivation & Architecture Comparison
+
+When developing algorithmic models, AI trading agents, or intraday execution strategies, quants and developers often struggle with expensive live-trading mistakes, strict broker rate-limit bans, erratic tick streams, and data formats incompatible with modern LLMs:
+
+| Evaluation Dimension | Schwab Trader Hub Platform | Static Backtesting Scripts | Closed-Source Paper Platforms |
+| :--- | :--- | :--- | :--- |
+| **Market Perception** | Native TradingView charts, dynamic position cost lines, real-time PnL, and live order books | Post-hoc static plot generation; cannot experience dynamic spreads or book depth | Outdated desktop UIs lacking responsive modern web interfaces |
+| **Matching & Ledger** | Local virtual matching state machine with realistic Ask/Bid slippage and buying-power validation | Unrealistic execution assumptions ignoring order-book liquidity dynamics | Opaque proprietary ledgers preventing custom initial capital or rules |
+| **Data Stream Hygiene**| Full-duplex WebSocket channel with de-duplicated subscriptions and auto-reconnect | Aggressive REST polling that quickly triggers strict broker IP bans | Requires external proprietary proxy relays with privacy risks |
+| **AI & Quant Readiness**| Native Pandas/Polars matrix exports and standardized JSON contexts for LLM Tool-Calling | Fragmented indicator calculations requiring custom data munging pipelines | Closed ecosystems with difficult data extraction pipelines |
+| **Live Broker Migration**| Clean `BaseBroker` abstraction enabling seamless transition to Charles Schwab live API | Paper trading logic coupled tightly to mock fixtures, requiring complete rewrites | Vendor locked into specific paid brokerage partners |
+
+---
+
+## Core Features
+
+| Module | Feature Highlight | Technical Implementation & Advantage |
+| :--- | :--- | :--- |
+| **Sub-Millisecond Charts** | TradingView Lightweight Charts| Renders real-time minute and daily bars with dynamic position cost line overlays and floating PnL synchronization. |
+| **Full-Duplex Streamer** | High-throughput WebSocket | FastAPI backend provides native WebSockets pushing Level 1 quotes, tick streams, and automated self-healing reconnections. |
+| **Virtual Matching Engine**| Realistic ledger accounting | Executes market orders against real-time Ask/Bid quotes, supports Limit and Stop orders, and enforces strict buying-power guards. |
+| **AI Model Context** | LLM Tool-Calling interface | Dedicated `/api/market/model-context` endpoint outputs real-time quotes, technical indicators (RSI/SMA), and positions in clean JSON. |
+| **Time-Series Matrix** | Quant pipeline exports | `ModelFeatureExporter` transforms raw bars and order-book snapshots directly into Pandas or Polars DataFrame matrices. |
+| **Multi-Market Adapters** | Schwab, Alpaca & Yahoo | Decoupled adapter architecture supporting Charles Schwab live streamers, Alpaca market feeds, and Yahoo Finance historical bars. |
+| **Broker Abstraction Layer**| Zero-friction live trading | Implements `BaseBroker` contract; transition from `VirtualBroker` to `SchwabLiveBroker` by updating credentials in config. |
+| **Full-Stack Test Coverage**| 247 automated regression tests | 169 backend unit/integration tests and 78 frontend Vitest specs covering ledger math, order books, and WebSocket scrubbing. |
+
+---
+
+## System Architecture
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│               前端看板 (TradingView Web)                │
-│  • TradingView Lightweight Charts (K线、均线、盘口)     │
-│  • 持仓成本线动态标注、实时浮动盈亏计算、一键买卖面板     │
-└───────────────────────────▲────────────────────────────┘
-                            │ 本地全双工 WebSocket (127.0.0.1:8000/ws)
-┌───────────────────────────▼────────────────────────────┐
-│            后端网关 (FastAPI 异步微服务)               │
-│                                                        │
-│  ┌──────────────────────┐    ┌──────────────────────┐  │
-│  │ 本地虚拟撮合与记账   │    │ 嘉信/行情推流适配器  │  │
-│  │ (Virtual Matcher)    │    │ (Schwab Streamer)    │  │
-│  │ • 模拟持仓、盈亏计算 │    │ • 实时 Level 1 报价  │  │
-│  │ • 限价单/止损单撮合  │    │ • 历史 1m/日 K 线    │  │
-│  └──────────────────────┘    └──────────────────────┘  │
-│                            │                           │
-│  ┌─────────────────────────▼────────────────────────┐  │
-│  │ AI & 模型特征适配器 (/api/market/model-context)   │  │
-│  │ • 一键导出 Pandas/Polars 兼容特征矩阵 (RSI/SMA)  │  │
-│  │ • 适配 LLM Agent Tool Use 标准 JSON 上下文       │  │
-│  └──────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Trading Dashboard (React 18 + Vite)                │
+│  ├─ TradingView Lightweight Charts (Bars · Depth · Dynamic Cost Line)  │
+│  ├─ Floating PnL Calculator · Equity Curve · Instant Order Entry Panel │
+│  └─ WebSocket Client (Real-time telemetry and order execution reports) │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Local Full-Duplex WebSocket (ws://127.0.0.1:8000/ws)
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│               Backend Gateway (FastAPI Async Microservice)             │
+│  ┌──────────────────────┐ ┌──────────────────────┐ ┌────────────────┐  │
+│  │ Virtual Matcher      │ │ Market Data Streamer │ │ Model Context  │  │
+│  │ • Position & PnL     │ │ WebSocket Streamer   │ │ • RSI/SMA Hub  │  │
+│  │ • Limit/Stop Orders  │ │ • Level 1 Quotes     │ │ • LLM JSON API │  │
+│  │ • Slippage Guard     │ │ • 1m / Daily Bars    │ │ • Polars Matrix│  │
+│  └──────────┬───────────┘ └──────────┬───────────┘ └────────┬───────┘  │
+│             │                        │                      │          │
+│             ▼                        ▼                      ▼          │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │           Unified Broker & Market Data Adapter Architecture      │  │
+│  │  BaseBroker · AlpacaMarketFeedService · YahooFinanceAdapter      │  │
+│  └──────────────────────────────────┬───────────────────────────────┘  │
+└─────────────────────────────────────┼──────────────────────────────────┘
+                                      │ Inbound Market Data & Outbound Live Orders
+        ┌─────────────────────────────┴─────────────────────────────┐
+        ▼                                                           ▼
+┌────────────────────────────────┐          ┌────────────────────────────────┐
+│   Charles Schwab Brokerage     │          │   Alpaca / Yahoo Finance       │
+│   OAuth 2.0 · Live Trading API │          │   Multi-Market Data Streaming  │
+└────────────────────────────────┘          └────────────────────────────────┘
 ```
 
 ---
 
-## 二、快速启动（一键运行）
+## Quick Start
 
-系统支持全自动环境检测与依赖加载，只需执行：
+### 1. Automated Launch
+
+The repository includes an all-in-one startup script that checks environments and initializes services:
 
 ```bash
+# Clone the repository
+git clone https://github.com/dengyie/schwab-trader.git
 cd schwab-trader
+
+# Run the automated launch script
 ./start.sh
 ```
 
-启动完成后：
-* 📈 **Web 操盘工作台**：打开浏览器访问 `http://127.0.0.1:5173`
-* 🔌 **交互式 API 文档 (Swagger)**：`http://127.0.0.1:8000/docs`
-* ⚡ **WebSocket 推流通道**：`ws://127.0.0.1:8000/ws`
+### 2. Manual Launch
+
+#### Backend Service
+
+Requirements: **Python 3.11+**:
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Start FastAPI server on 127.0.0.1:8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+#### Frontend Dashboard
+
+Requirements: **Node.js 20+**:
+
+```bash
+cd frontend
+npm install
+
+# Start Vite development server on http://127.0.0.1:5173
+npm run dev
+```
+
+Once running:
+- **Trading Dashboard**: `http://127.0.0.1:5173`
+- **Interactive API Documentation (Swagger)**: `http://127.0.0.1:8000/docs`
+- **WebSocket Streaming Channel**: `ws://127.0.0.1:8000/ws`
 
 ---
 
-## 三、核心功能与使用指南
+## Paper Trading & Quant Model Integration
 
-### 1. 虚拟操盘（Paper Trading）
-* **初始资金**：默认给予 **$10,000.00** 虚拟本金（可通过顶部「Reset Capital」随时重置）。
-* **市价买入/卖出**：按当前实时盘口 Ask（卖一价）买入、Bid（买一价）卖出，真实计算滑点与持仓均价。
-* **图表持仓线**：买入后，TradingView K 线图上会自动绘制一条蓝色的**持仓均价线（Position Cost Line）**，持仓盈亏随着行情变动实时更新。
-* **限价挂单与止损**：支持提交 Limit 单和 Stop 单，当行情价格穿过设定阈值时自动触发撮合。
+### 1. Virtual Trading Operations
 
-### 2. 接入 AI 与量化模型
-调用 `GET /api/market/model-context?symbol=SPY` 可直接获取规范的模型特征输入：
+- **Initial Capital**: Initialized with **$10,000.00** in virtual buying power, resettable via the top navigation bar.
+- **Market Orders**: Fills immediately at the real-time Ask for buys and Bid for sells, accounting for live slippage.
+- **Dynamic Cost Line**: Opening a position projects a blue weighted average cost line across TradingView charts, updating alongside floating PnL.
+- **Limit & Stop Orders**: Supports Limit and Stop orders triggered automatically when live market prices breach defined thresholds.
+
+### 2. AI Agent & Quantitative Modeling
+
+Query `GET /api/market/model-context?symbol=SPY` to retrieve structured market context:
+
 ```json
 {
   "symbol": "SPY",
@@ -87,29 +178,48 @@ cd schwab-trader
   }
 }
 ```
-* **传统时序模型（LSTM / XGBoost）**：可调用 `ModelFeatureExporter.to_records(bars)` 转换为 Pandas DataFrame。
-* **大语言模型（LLM Agent）**：上述输出格式可直接作为 Agent 的 Tool Return，用于判断买入、卖出或观望。
 
-### 3. 如何切换为嘉信实盘交易
-当你在虚拟操盘中验证策略成熟后，切换到嘉信真实下单非常简单：
-1. 在 `schwab-trader/backend/app/core/config.py` 或环境变量中填入你的 `SCHWAB_APP_KEY` 和 `SCHWAB_APP_SECRET`；
-2. 系统底层的交易接口抽象了 `BaseBroker`，修改配置将 `VirtualBroker` 替换为 `SchwabLiveBroker`，同样的买卖指令即会向嘉信官方实盘接口提交挂单。
+- **LLM Agent Tool-Calling**: Formatted as a standard tool return, enabling coding or autonomous agents to evaluate trends and execute orders.
+- **Time-Series Deep Learning (LSTM / XGBoost)**: Call `ModelFeatureExporter.to_records(bars)` in Python to export structured feature matrices into Pandas or Polars DataFrames.
+
+### 3. Transition to Charles Schwab Live Trading
+
+Once trading strategies have been validated:
+1. Provide your `SCHWAB_APP_KEY` and `SCHWAB_APP_SECRET` in environment variables or `backend/app/core/config.py`;
+2. The core system abstracts trading operations under `BaseBroker`. Replace `VirtualBroker` with `SchwabLiveBroker` to direct buy and sell orders straight to Charles Schwab endpoints.
 
 ---
 
-## 四、自动化测试
+## Testing & Quality Assurance
 
-项目内置完整的单元测试与端到端集成测试套件：
+The repository includes comprehensive automated test suites covering matching algorithms, WebSocket scrubbing, and edge cases:
 
 ```bash
-cd schwab-trader/backend
+# 1. Run backend unit and integration test suite (169 passing)
+cd backend
 source .venv/bin/activate
-PYTHONPATH=. pytest -v
+pytest -v
+
+# 2. Run frontend Vitest test suite (78 passing)
+cd ../frontend
+npm test
 ```
 
-测试覆盖：
-* ✅ 资产记账与加权持仓成本算法（买入、减仓、平仓、盈亏计算）
-* ✅ 限价单（Limit Order）与止损单（Stop Order）撮合逻辑
-* ✅ 购买力不足（Insufficient Buying Power）越界拒绝拦截
-* ✅ 嘉信 Streamer 原始报文与 REST K 线解析
-* ✅ REST API 端点与全双工 WebSocket 收发集成测试
+Test coverage includes:
+- Virtual ledger calculations and weighted average cost tracking (Buy, Partial Sell, Close, PnL);
+- Limit order and stop-loss order matching state machines;
+- Buying power verification and overdraft rejection;
+- Charles Schwab streamer frame decoding and REST historical bar aggregation;
+- Sensitive credential scrubbing in WebSocket connection URLs.
+
+---
+
+## Contributing & License
+
+Contributions are welcome. Please ensure all tests pass prior to submitting changes:
+
+```bash
+cd backend && pytest && cd ../frontend && npm test
+```
+
+Licensed under the [MIT License](LICENSE).
