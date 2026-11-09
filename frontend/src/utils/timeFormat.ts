@@ -17,22 +17,26 @@ export function formatRelativeTime(timestamp: number): string {
     return `${m}m ${s}s ago`;
   }
   
-  // 超过 1 小时显示绝对时间
-  return new Date(timestamp).toLocaleTimeString();
+  // 超过 1 小时显示绝对日期+时间，避免仅剩的 HH:MM:SS 被误读成今天。
+  return formatTime(timestamp, false);
 }
 
 /**
  * 格式化时间戳为 HH:MM:SS · Xs ago 格式
  */
 export function formatLastUpdateTime(timestamp: number): string {
+  const diff = Date.now() - timestamp;
+  // Old data already renders as an absolute date-time; appending the same
+  // clock again ("18:28:38 · 18:28:38") told the user nothing.
+  if (diff >= 3600_000) return formatTime(timestamp, false);
+
   const timeStr = new Date(timestamp).toLocaleTimeString('en-US', {
     hour12: false,
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   });
-  const relativeStr = formatRelativeTime(timestamp);
-  return `${timeStr} · ${relativeStr}`;
+  return `${timeStr} · ${formatRelativeTime(timestamp)}`;
 }
 
 /**

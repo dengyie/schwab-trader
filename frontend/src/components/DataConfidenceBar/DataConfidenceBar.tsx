@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useMarketStore, selectConnectionStatus, selectDataConfidence } from '../../store/marketStore';
+import { useMarketStore, selectConnectionStatus, selectDataConfidence, selectOrderBook } from '../../store/marketStore';
 import { useI18n } from '../../i18n';
 import { formatLastUpdateTime } from '../../utils/timeFormat';
 import { DiagnosticsDrawer } from './DiagnosticsDrawer';
@@ -10,15 +10,24 @@ export function DataConfidenceBar() {
   const { t } = useI18n();
   const connectionStatus = useMarketStore(selectConnectionStatus);
   const dataConfidence = useMarketStore(selectDataConfidence);
+  const orderBook = useMarketStore(selectOrderBook);
   const [showDrawer, setShowDrawer] = useState(false);
   const [lastUpdateTime, setLastUpdateTime] = useState('');
 
   const { level, reason } = dataConfidence;
+  const isClosed = level === 'closed';
+
+  // While the venue is closed, WS messages are just keepalives/snapshots: the
+  // honest "last update" is the quote's own timestamp, which stays frozen at
+  // the closing print instead of dancing with the local clock.
+  const displayTimestamp = isClosed && orderBook?.quoteTime
+    ? orderBook.quoteTime
+    : connectionStatus.lastMessageTime;
 
   useEffect(() => {
-    if (connectionStatus.lastMessageTime > 0) {
+    if (displayTimestamp > 0) {
       const updateTime = () => {
-        setLastUpdateTime(formatLastUpdateTime(connectionStatus.lastMessageTime));
+        setLastUpdateTime(formatLastUpdateTime(displayTimestamp));
       };
       updateTime();
       const interval = setInterval(updateTime, 1000);
@@ -26,7 +35,7 @@ export function DataConfidenceBar() {
     } else {
       setLastUpdateTime('—');
     }
-  }, [connectionStatus.lastMessageTime]);
+  }, [displayTimestamp]);
 
   const getStatusText = () => {
     switch (level) {
@@ -40,10 +49,19 @@ export function DataConfidenceBar() {
     }
   };
 
+  // Transport latency and message rate measure a live feed. After the close
+  // they only reflect keepalives, so reporting them would claim the market is
+  // moving.
   const getLatencyDisplay = () => {
+    if (isClosed) return '—';
     if (connectionStatus.state !== 'connected') return '—';
     if (connectionStatus.latencyMs < 1) return '<1ms';
     return `${Math.round(connectionStatus.latencyMs)}ms`;
+  };
+
+  const getMessageRateDisplay = () => {
+    if (isClosed) return '—';
+    return `${connectionStatus.messageRate}/s`;
   };
 
   return (
@@ -69,7 +87,7 @@ export function DataConfidenceBar() {
           </div>
           <div className={styles.metric}>
             <Icon name="bar-chart-2" size="xs" className={styles.metricIcon} />
-            <span className="tabular-nums">{connectionStatus.messageRate}/s</span>
+            <span className="tabular-nums">{getMessageRateDisplay()}</span>
           </div>
         </div>
 

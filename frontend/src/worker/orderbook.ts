@@ -26,6 +26,9 @@ interface OrderBookState {
   asks: Map<string, string>;
   lastUpdateId: number;
   localUpdateTime: number;
+  // Venue timestamp of the most recent quote. `localUpdateTime` only proves
+  // when this browser received a message; after the close that is misleading.
+  quoteTime: number;
   isInitialized: boolean;
   pendingUpdates: BinanceDepthUpdate[];
   lastResyncTime: number;
@@ -83,6 +86,7 @@ export class OrderBookManager {
       asks: new Map(),
       lastUpdateId: 0,
       localUpdateTime: 0,
+      quoteTime: 0,
       isInitialized: false,
       pendingUpdates: [],
       lastResyncTime: 0,
@@ -138,6 +142,8 @@ export class OrderBookManager {
     timestamp?: string;
   }): void {
     const { bid, ask, last } = data;
+    const quotedAt = data.timestamp ? Date.parse(data.timestamp) : NaN;
+    if (Number.isFinite(quotedAt) && quotedAt > 0) this.state.quoteTime = quotedAt;
 
     // No two-sided book: this venue publishes trades only (HK / JP / CN). The
     // book is emptied rather than filled with levels nobody quoted, and the
@@ -411,6 +417,7 @@ export class OrderBookManager {
       localUpdateTime: this.state.localUpdateTime > 0
         ? Date.now() - (performance.now() - this.state.localUpdateTime)
         : 0,
+      quoteTime: this.state.quoteTime,
       isStale: this.checkStale(),
       depth: Math.min(bids.length, asks.length),
     };

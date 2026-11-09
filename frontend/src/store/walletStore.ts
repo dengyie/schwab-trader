@@ -3,6 +3,7 @@ import { subscribeWithSelector, persist } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import Decimal from 'decimal.js';
 import { apiFetch } from '../services/apiClient';
+import { computeTradePerformance } from './trading/performance';
 import type {
   Account,
   WalletBalance,
@@ -19,6 +20,7 @@ import type {
   LedgerFilter,
   PerformanceMetrics,
 } from '../types/wallet';
+import type { PaperOrder } from '../types/trading';
 
 // ===== Constants =====
 const WITHDRAW_FEE_RATE = 0.001; // 0.1%
@@ -122,6 +124,7 @@ interface WalletState {
   getTotalEquity: (prices: Record<string, string>) => string;
   getFilteredLedger: (filter: LedgerFilter) => LedgerEntry[];
   updatePerformanceMetrics: (prices: Record<string, string>) => void;
+  syncPerformanceFromOrders: (orders: PaperOrder[]) => void;
   resetWallet: () => void;
 }
 
@@ -139,6 +142,7 @@ export const useWalletStore = create<WalletState>()(
         ledger: [],
         performanceMetrics: {
           totalTrades: 0,
+          closedTrades: 0,
           winRate: 0,
           profitFactor: 0,
           maxDrawdown: 0,
@@ -543,9 +547,20 @@ export const useWalletStore = create<WalletState>()(
           set({ performanceMetrics: m });
         },
 
+        // Trade statistics come from executed fills, never from open orders, so
+        // they are recomputed from broker truth on every order refresh.
+        syncPerformanceFromOrders: (orders) => {
+          const trades = computeTradePerformance(orders);
+          set((s) => ({ performanceMetrics: { ...s.performanceMetrics, ...trades } }));
+        },
+
         resetWallet: () => {
           get()._pendingTimers.forEach(clearTimeout);
-          set({ account: null, balances: createEmptyBalances(), paymentMethods: [], cryptoAddresses: [], deposits: [], withdraws: [], ledger: [] });
+          set({
+            account: null, balances: createEmptyBalances(), paymentMethods: [], cryptoAddresses: [],
+            deposits: [], withdraws: [], ledger: [],
+            performanceMetrics: { totalTrades: 0, closedTrades: 0, winRate: 0, profitFactor: 0, maxDrawdown: 0, peakEquity: '0', totalRealizedPnl: '0' },
+          });
         }
       }),
       {

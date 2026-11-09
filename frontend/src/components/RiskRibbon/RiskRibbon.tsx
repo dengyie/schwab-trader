@@ -1,17 +1,16 @@
 import { useMemo, useEffect } from 'react';
-import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, selectBalances, resolveAccountTotals } from '../../store/walletStore';
 import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
-import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useI18n } from '../../i18n';
 import { Icon } from '../Icon';
 import styles from './RiskRibbon.module.css';
 
 interface RiskMetrics {
-  positionSizePercent: number;  // Position size as % of total portfolio
-  unrealizedPnlPercent: number; // Unrealized P&L as % of entry
+  /** Whole account's position market value over total equity. */
+  positionSizePercent: number;
+  /** Account unrealized P&L over its cost basis. */
+  unrealizedPnlPercent: number;
   volatilityRisk: number;       // 0-100 based on microVolatility percentile
-  hasRealTimePrice: boolean;    // 是否有实时价格用于计算盈亏
 }
 
 interface RiskRibbonProps {
@@ -19,31 +18,33 @@ interface RiskRibbonProps {
   full?: boolean; // 新增 full 模式用于全屏展示
 }
 
+/** Placeholder for a metric the account has not produced a single sample for. */
+const EMPTY = '—';
+
 export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
   const { t } = useI18n();
   const balances = useWalletStore(selectBalances);
   const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const performanceMetrics = useWalletStore((state) => state.performanceMetrics);
   const updatePerformanceMetrics = useWalletStore((state) => state.updatePerformanceMetrics);
-  const positions = useTradingStore((state) => state.positions);
   const metrics = useMarketStore(selectMetrics);
   const orderBook = useMarketStore(selectOrderBook);
-  const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
 
   // 定期更新绩效指标
   useEffect(() => {
     if (!metrics) return;
-    
+
     const prices: Record<string, string> = {};
     if (metrics.mid && orderBook?.symbol) {
       prices[orderBook.symbol] = metrics.mid;
     }
-    
+
     updatePerformanceMetrics(prices);
   }, [metrics, orderBook?.symbol, updatePerformanceMetrics]);
 
-  const currentSymbol = orderBook?.symbol || selectedSymbol;
-
+  // Every figure below describes the whole account, never the symbol on screen:
+  // mixing a selected-symbol position with account-level win rate made the
+  // ribbon change meaning as the user clicked through the watchlist.
   const riskMetrics = useMemo((): RiskMetrics | null => {
     if (!metrics) return null;
 
@@ -51,51 +52,22 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
     // Broker equity already contains position value; adding it on top inflated
     // the denominator and understated position size.
     const accountEquity = resolveAccountTotals(brokerMetrics, usdBalance).totalEquity;
-    
-    let positionEntries: [string, any][] = [];
-    if (positions instanceof Map) {
-      positionEntries = Array.from(positions.entries());
-    } else if (typeof positions === 'object' && positions !== null) {
-      positionEntries = Object.entries(positions);
-    }
-
-    const activePosition = positionEntries.find(([symbol, pos]) => 
-      symbol === currentSymbol && pos.side === 'long' && parseFloat(pos.quantity) > 0
-    );
-
-    if (!activePosition) {
-      const hasOtherPositions = positionEntries.some(([_, pos]) =>
-        pos.side === 'long' && parseFloat(pos.quantity) > 0
-      );
-      
-      return {
-        positionSizePercent: 0,
-        unrealizedPnlPercent: 0,
-        volatilityRisk: 0,
-        hasRealTimePrice: !hasOtherPositions,
-      };
-    }
-
-    const [_, position] = activePosition;
-    const qty = parseFloat(position.quantity);
-    const avgEntry = parseFloat(position.avgEntryPrice);
-    const currentPrice = parseFloat(metrics.mid);
-    
-    const positionValue = qty * currentPrice;
-    const totalValue = accountEquity;
-    const positionSizePercent = totalValue > 0 ? (positionValue / totalValue) * 100 : 0;
-    
-    const unrealizedPnlPercent = avgEntry > 0 ? ((currentPrice - avgEntry) / avgEntry) * 100 : 0;
+    const positionValue = brokerMetrics?.positionValue ?? 0;
+    const unrealizedPnl = brokerMetrics?.unrealizedPnl ?? null;
     const volatility = metrics.microVolatility;
-    const volatilityRisk = Math.min(100, (volatility / 100) * 100);
+
+    const positionSizePercent = accountEquity > 0 ? (positionValue / accountEquity) * 100 : 0;
+    const costBasis = positionValue - (unrealizedPnl ?? 0);
+    const unrealizedPnlPercent = unrealizedPnl !== null && costBasis > 0
+      ? (unrealizedPnl / costBasis) * 100
+      : 0;
 
     return {
       positionSizePercent,
       unrealizedPnlPercent,
-      volatilityRisk,
-      hasRealTimePrice: currentPrice > 0,
+      volatilityRisk: Math.min(100, (volatility / 100) * 100),
     };
-  }, [balances, brokerMetrics, positions, metrics, currentSymbol]);
+  }, [balances, brokerMetrics, metrics]);
 
   if (!riskMetrics) return null;
 
@@ -121,6 +93,20 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
   };
 
   const riskLevel = getRiskColor(overallRisk);
+
+  // History metrics describe trades that have been settled by a sell. Before
+  // that the ratios are mathematically undefined, so they read '—' instead of
+  // a confident 0 that looks like real performance.
+  const hasClosedTrades = performanceMetrics.closedTrades > 0;
+  const winRateDisplay = hasClosedTrades
+    ? `${(performanceMetrics.winRate * 100).toFixed(1)}%`
+    : EMPTY;
+  const profitFactorDisplay = !hasClosedTrades
+    ? EMPTY
+    : Number.isFinite(performanceMetrics.profitFactor   )
+      ? performanceMetrics.profitFactor.toFixed(2)
+      : '∞';
+  const realizedPnl = parseFloat(performanceMetrics.totalRealizedPnl) || 0;
 
   if (full) {
     return (
@@ -173,11 +159,11 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
         <div className={styles.fullGrid}>
           <div className={styles.gridItem}>
             <span className={styles.itemLabel}>{t.riskRibbon.winRate}</span>
-            <span className={styles.itemValue}>{(performanceMetrics.winRate * 100).toFixed(1)}%</span>
+            <span className={styles.itemValue}>{winRateDisplay}</span>
           </div>
           <div className={styles.gridItem}>
             <span className={styles.itemLabel}>{t.riskRibbon.profitFactor}</span>
-            <span className={styles.itemValue}>{performanceMetrics.profitFactor.toFixed(2)}</span>
+            <span className={styles.itemValue}>{profitFactorDisplay}</span>
           </div>
           <div className={styles.gridItem}>
             <span className={styles.itemLabel}>{t.riskRibbon.maxDrawdown}</span>
@@ -185,8 +171,8 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
           </div>
           <div className={styles.gridItem}>
             <span className={styles.itemLabel}>累计盈亏</span>
-            <span className={`${styles.itemValue} ${parseFloat(performanceMetrics.totalRealizedPnl) >= 0 ? styles.positive : styles.negative}`}>
-              ${performanceMetrics.totalRealizedPnl}
+            <span className={`${styles.itemValue} ${realizedPnl >= 0 ? styles.positive : styles.negative}`}>
+              {hasClosedTrades ? `$${performanceMetrics.totalRealizedPnl}` : EMPTY}
             </span>
           </div>
         </div>
@@ -255,13 +241,17 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
         <div className={styles.perfItem} title={t.riskRibbon.winRate}>
           <span className={styles.perfLabel}>Win</span>
           <span className={styles.perfValue}>
-            {(performanceMetrics.winRate * 100).toFixed(0)}%
+            {hasClosedTrades ? `${(performanceMetrics.winRate * 100).toFixed(0)}%` : EMPTY}
           </span>
         </div>
         <div className={styles.perfItem} title={t.riskRibbon.profitFactor}>
           <span className={styles.perfLabel}>PF</span>
           <span className={styles.perfValue}>
-            {performanceMetrics.profitFactor.toFixed(2)}
+            {hasClosedTrades
+              ? (Number.isFinite(performanceMetrics.profitFactor)
+                  ? performanceMetrics.profitFactor.toFixed(2)
+                  : '∞')
+              : EMPTY}
           </span>
         </div>
         <div className={styles.perfItem} title={t.riskRibbon.maxDrawdown}>
@@ -272,8 +262,12 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
         </div>
         <div className={styles.perfItem} title={t.riskRibbon.totalRealizedPnl}>
           <span className={styles.perfLabel}>Real</span>
-          <span className={`${styles.perfValue} ${parseFloat(performanceMetrics.totalRealizedPnl) >= 0 ? styles.positive : styles.negative}`}>
-            {parseFloat(performanceMetrics.totalRealizedPnl) >= 0 ? '+' : ''}{performanceMetrics.totalRealizedPnl}
+          <span className={`${styles.perfValue} ${
+            !hasClosedTrades ? '' : realizedPnl >= 0 ? styles.positive : styles.negative
+          }`}>
+            {hasClosedTrades
+              ? `${realizedPnl >= 0 ? '+' : ''}${performanceMetrics.totalRealizedPnl}`
+              : EMPTY}
           </span>
         </div>
       </div>

@@ -716,6 +716,9 @@ export const useTradingStore = create<TradingState>()(
                 const orders = reconcileOrders(state.orders, rows);
                 return { orders, ocoOrders: reconcileOcoGroups(state.ocoOrders, orders) };
               });
+              // Trade statistics are a pure view over these reconciled fills.
+              useWalletStore.getState().syncPerformanceFromOrders(get().orders);
+
             } catch {
               // Offline or broker hiccup: keep the last known view.
             }
