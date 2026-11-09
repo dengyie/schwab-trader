@@ -16,12 +16,6 @@ export function SettingsPage() {
   
   const [activeSection, setActiveSection] = useState<SettingsSection>('profile');
 
-  // Render mobile layout
-  if (isMobile) {
-    return <MobileAccountPage />;
-  }
-
-  
   // Profile form state
   const [displayName, setDisplayName] = useState(user?.displayName || '');
   const [bio, setBio] = useState(user?.bio || '');
@@ -105,6 +99,13 @@ export function SettingsPage() {
     setQuoteAsset(asset);
     updatePreferences({ quoteAsset: asset });
   };
+
+  // Branch only after every hook above has run. Returning the mobile layout
+  // earlier changed the hook count when the viewport crossed the breakpoint
+  // (React error #310: "rendered more hooks than during the previous render").
+  if (isMobile) {
+    return <MobileAccountPage />;
+  }
 
   if (!user) {
     return (
