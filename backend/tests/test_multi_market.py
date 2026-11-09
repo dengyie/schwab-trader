@@ -984,3 +984,46 @@ class TestStateDirResolution:
         monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: blocker))
 
         assert mod.resolve_state_dir("") is None
+
+
+class _CapitalOnlyBroker:
+    """Stand-in for the US broker: records the reset amount it receives."""
+
+    def __init__(self, capital: float = 100000.0):
+        self.capital = capital
+
+    def get_portfolio(self):
+        from app.models.trading import Portfolio
+
+        return Portfolio(cash=self.capital, initial_capital=self.capital)
+
+    def reset(self, initial_capital: float = 100000.0) -> None:
+        self.capital = initial_capital
+
+
+class TestRouterReset:
+    def test_merged_starting_capital_matches_the_request(self, engine):
+        us = _CapitalOnlyBroker(100000.0)
+        router = MarketRouterBroker(us_broker=us, other_broker=engine)
+
+        router.reset(200000.0)
+
+        assert us.capital == pytest.approx(100000.0)
+        assert engine.get_portfolio().initial_capital == pytest.approx(100000.0)
+        assert router.get_portfolio().initial_capital == pytest.approx(200000.0)
+
+    def test_split_follows_each_brokers_current_share(self, engine):
+        us = _CapitalOnlyBroker(50000.0)
+        router = MarketRouterBroker(us_broker=us, other_broker=engine)
+
+        # Engine starts at 100000, so the 1:2 split gives 10000 / 20000.
+        router.reset(30000.0)
+
+        assert us.capital == pytest.approx(10000.0)
+        assert engine.get_portfolio().initial_capital == pytest.approx(20000.0)
+        assert router.get_portfolio().initial_capital == pytest.approx(30000.0)
+
+    def test_single_broker_receives_the_whole_amount(self, engine):
+        router = MarketRouterBroker(us_broker=engine, other_broker=engine)
+        router.reset(50000.0)
+        assert engine.get_portfolio().initial_capital == pytest.approx(50000.0)

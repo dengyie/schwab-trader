@@ -149,9 +149,34 @@ class MarketRouterBroker(BaseBroker):
             broker.register_fill_listener(listener)
 
     def reset(self, initial_capital: float = 100000.0) -> None:
-        for broker in self._all_brokers():
+        """Reset every broker so the *merged* starting capital equals the request.
+
+        Passing the full amount to each broker would make the account look
+        twice as large as requested (one Alpaca wallet plus one virtual
+        ledger). Split it in proportion to each broker's current starting
+        capital instead, keeping the existing US / non-US split.
+        """
+        brokers = self._all_brokers()
+        weights: List[float] = []
+        for broker in brokers:
             try:
-                broker.reset(initial_capital)
+                weights.append(max(0.0, float(broker.get_portfolio().initial_capital)))
+            except Exception as exc:
+                logger.warning("Initial capital unavailable for %s: %s", type(broker).__name__, exc)
+                weights.append(0.0)
+
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            weights = [1.0 for _ in brokers]
+            total_weight = float(len(brokers))
+
+        # Two decimals keeps the merged total exact to the cent.
+        shares = [round(initial_capital * weight / total_weight, 2) for weight in weights]
+        shares[-1] = round(initial_capital - sum(shares[:-1]), 2)
+
+        for broker, share in zip(brokers, shares):
+            try:
+                broker.reset(share)
             except Exception as exc:
                 logger.warning("Reset failed for %s: %s", type(broker).__name__, exc)
 

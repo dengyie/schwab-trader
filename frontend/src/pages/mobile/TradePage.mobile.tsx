@@ -35,7 +35,7 @@ export function MobileTradePage() {
   const metrics = useMarketStore(selectMetrics);
   const subscribe = useMarketStore((state) => state.subscribe);
   const unsubscribe = useMarketStore((state) => state.unsubscribe);
-  const updateOrderBookForMatching = useTradingStore((state) => state.updateOrderBookForMatching);
+  const evaluateOrderTriggers = useTradingStore((state) => state.evaluateOrderTriggers);
   const positions = useTradingStore((state) => state.positions);
   const balances = useWalletStore((state) => state.balances);
   const brokerMetrics = useWalletStore((state) => state.brokerMetrics) as BrokerMetrics | null;
@@ -112,12 +112,12 @@ export function MobileTradePage() {
     return () => unsubscribe();
   }, [selectedSymbol, subscribe, unsubscribe]);
 
-  // Update orderbook for matching engine
+  // Evaluate client-side conditional/trailing triggers against the book.
   useEffect(() => {
     if (orderBook) {
-      updateOrderBookForMatching(orderBook);
+      evaluateOrderTriggers(orderBook);
     }
-  }, [orderBook, updateOrderBookForMatching]);
+  }, [orderBook, evaluateOrderTriggers]);
 
   // Swipe handling
   const handleTouchStart = (e: React.TouchEvent) => {

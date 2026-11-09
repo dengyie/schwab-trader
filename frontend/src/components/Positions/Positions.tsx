@@ -153,7 +153,7 @@ export function Positions() {
   const accountPnlPercent = totalUnrealizedPnl.div(accountTotal.gt(0) ? accountTotal : 1).times(100).toNumber();
 
   const handleReset = () => {
-    resetAccount();
+    void resetAccount();
     toast.info(t.common.reset);
   };
 

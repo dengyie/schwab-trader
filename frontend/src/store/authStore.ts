@@ -96,7 +96,9 @@ export const useAuthStore = create<AuthState>()(
           useWalletStore.getState().resetWallet();
         });
         import('./tradingStore').then(({ useTradingStore }) => {
-          useTradingStore.getState().resetAccount();
+          // Logging out only clears this browser; it must never reset the
+          // broker account that other sessions may still be using.
+          useTradingStore.getState().clearLocalState();
         });
 
         set({

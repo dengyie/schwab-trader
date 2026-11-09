@@ -409,6 +409,8 @@ export const useMarketStore = create<MarketState>()(
                   if (backendMsg.portfolio) {
                     useWalletStore.getState().syncFromBackendPortfolio(backendMsg.portfolio);
                   }
+                  // Fills move positions and order status, not just cash.
+                  void useWalletStore.getState().fetchPortfolio();
                 }
                 break;
               }

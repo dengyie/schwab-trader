@@ -33,7 +33,7 @@ export function TradePage() {
   const orderBook = useMarketStore(selectOrderBook);
   const subscribe = useMarketStore((state) => state.subscribe);
   const unsubscribe = useMarketStore((state) => state.unsubscribe);
-  const updateOrderBookForMatching = useTradingStore((state) => state.updateOrderBookForMatching);
+  const evaluateOrderTriggers = useTradingStore((state) => state.evaluateOrderTriggers);
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
   
   const [selectedPrice, setSelectedPrice] = useState<{ value: string; timestamp: number } | undefined>();
@@ -57,9 +57,9 @@ export function TradePage() {
 
   useEffect(() => {
     if (orderBook) {
-      updateOrderBookForMatching(orderBook);
+      evaluateOrderTriggers(orderBook);
     }
-  }, [orderBook, updateOrderBookForMatching]);
+  }, [orderBook, evaluateOrderTriggers]);
 
   // Render mobile layout
   if (isMobile) {

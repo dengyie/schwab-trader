@@ -188,7 +188,12 @@ export const useWalletStore = create<WalletState>()(
           // Broker equity already includes position market value, so only USD
           // carries it. USDT is a legacy crypto placeholder and stays zero —
           // writing equity into both currencies double-counted the account.
-          const newBalances = state.balances.map(b => {
+          //
+          // Frozen amounts are local order reservations that no longer exist:
+          // the broker holds every resting order and already excludes its
+          // commitment from `cash`. Carrying a stale `frozen` forward would
+          // show cash that is both spent and locked.
+          const newBalances = state.balances.map(b => ({ ...b, frozen: '0' })).map(b => {
             if (b.asset === 'USD') {
               return {
                 ...b,
