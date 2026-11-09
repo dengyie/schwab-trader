@@ -30,7 +30,7 @@ export function SettingsPage() {
   
   // Preferences state
   const [currentTheme, setCurrentTheme] = useState<'light' | 'dark' | 'system'>(preferences.theme);
-  const [quoteAsset, setQuoteAsset] = useState<'USDT' | 'BTC'>(preferences.quoteAsset);
+  const [quoteAsset, setQuoteAsset] = useState<'USD' | 'BTC'>(preferences.quoteAsset);
 
   useEffect(() => {
     if (user) {
@@ -95,7 +95,7 @@ export function SettingsPage() {
     updatePreferences({ language: lang });
   };
 
-  const handleQuoteAssetChange = (asset: 'USDT' | 'BTC') => {
+  const handleQuoteAssetChange = (asset: 'USD' | 'BTC') => {
     setQuoteAsset(asset);
     updatePreferences({ quoteAsset: asset });
   };
@@ -389,10 +389,10 @@ export function SettingsPage() {
               </h4>
               <div className={styles.optionGroup}>
                 <button
-                  className={`${styles.optionBtn} ${quoteAsset === 'USDT' ? styles.selected : ''}`}
-                  onClick={() => handleQuoteAssetChange('USDT')}
+                  className={`${styles.optionBtn} ${quoteAsset === 'USD' ? styles.selected : ''}`}
+                  onClick={() => handleQuoteAssetChange('USD')}
                 >
-                  <span>USDT</span>
+                  <span>USD</span>
                 </button>
                 <button
                   className={`${styles.optionBtn} ${quoteAsset === 'BTC' ? styles.selected : ''}`}

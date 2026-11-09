@@ -645,7 +645,7 @@ export const enUS: Locale = {
     assets: 'Assets',
     balance: 'Balance',
     totalBalance: 'Total Balance',
-    value: 'Value (USDT)',
+    value: 'Value (USD)',
     avgPrice: 'Avg Entry Price',
     unrealizedPnl: 'Unrealized P&L',
     actions: 'Actions',

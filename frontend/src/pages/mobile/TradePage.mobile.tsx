@@ -190,7 +190,7 @@ export function MobileTradePage() {
           <div className={styles.symbolSection}>
             <button className={styles.symbolBtn} onClick={() => setShowSymbolSelector(true)}>
               <span className={styles.symbolName}>{baseAsset}</span>
-              <span className={styles.symbolQuote}>/USDT</span>
+              <span className={styles.symbolQuote}>/USD</span>
               <Icon name="chevron-down" size="xs" />
             </button>
           </div>

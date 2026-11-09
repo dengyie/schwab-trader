@@ -17,7 +17,7 @@ export interface User {
 export interface UserPreferences {
   language: 'zh-CN' | 'en-US';
   theme: 'light' | 'dark' | 'system';
-  quoteAsset: 'USDT' | 'BTC';
+  quoteAsset: 'USD' | 'BTC';
   notifications: {
     priceThreshold: number;
     orderFills: boolean;
@@ -43,7 +43,7 @@ interface AuthState {
 const defaultPreferences: UserPreferences = {
   language: 'zh-CN',
   theme: 'dark',
-  quoteAsset: 'USDT',
+  quoteAsset: 'USD',
   notifications: {
     priceThreshold: 5,
     orderFills: true,

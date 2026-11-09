@@ -58,6 +58,23 @@ export interface BrokerMetrics {
   totalPnlPct: number | null;
 }
 
+/**
+ * The broker portfolio snapshot as it arrives over REST and the socket.
+ *
+ * Only ``cash``/``total_equity`` are guaranteed; every other figure is optional
+ * because the backend omits what the venue did not report rather than guessing.
+ */
+export interface BrokerPortfolio {
+  cash: number;
+  total_equity: number;
+  market_value?: number;
+  unrealized_pnl?: number;
+  realized_pnl?: number;
+  initial_capital?: number;
+  total_pnl_pct?: number;
+  positions?: Record<string, any>;
+}
+
 export interface AccountTotals {
   /** Broker total equity — already cash + market value of positions. */
   totalEquity: number;
@@ -121,7 +138,7 @@ interface WalletState {
   // Initial Grant (only once per account)
   
   // Backend Portfolio Sync
-  syncFromBackendPortfolio: (data: { cash: number; total_equity: number; positions?: Record<string, any> }) => void;
+  syncFromBackendPortfolio: (data: BrokerPortfolio) => void;
   fetchPortfolio: () => Promise<void>;
   
   // Strict Balance Actions
@@ -190,16 +207,7 @@ export const useWalletStore = create<WalletState>()(
 
         removeCryptoAddress: (id) => set((state) => ({ cryptoAddresses: state.cryptoAddresses.filter((a) => a.id !== id) })),
 
-        syncFromBackendPortfolio: (data: {
-          cash: number;
-          total_equity: number;
-          market_value?: number;
-          unrealized_pnl?: number;
-          realized_pnl?: number;
-          positions?: Record<string, any>;
-          initial_capital?: number;
-          total_pnl_pct?: number;
-        }) => {
+        syncFromBackendPortfolio: (data: BrokerPortfolio) => {
           const state = get();
           const cashStr = (data.cash ?? 0).toFixed(2);
           const totalStr = (data.total_equity ?? data.cash ?? 0).toFixed(2);
@@ -267,14 +275,25 @@ export const useWalletStore = create<WalletState>()(
         fetchPortfolio: async () => {
           try {
             const res = await apiFetch('/portfolio');
-            if (res.ok) {
-              const data = await res.json();
-              get().syncFromBackendPortfolio(data);
-              const { useTradingStore } = await import('./tradingStore');
-              useTradingStore.getState().syncPositionsFromBackend(data.positions || {});
-              useTradingStore.getState().fetchOrders();
+            if (!res.ok) {
+              // A 401 already cleared the token and signed the user out in
+              // apiFetch; anything else is a broker hiccup, and keeping the
+              // last known view beats blanking the account.
+              if (res.status !== 401) {
+                console.warn(`[wallet] portfolio sync failed: HTTP ${res.status}`);
+              }
+              return;
             }
-          } catch {}
+            const data = await res.json();
+            get().syncFromBackendPortfolio(data);
+            const { useTradingStore } = await import('./tradingStore');
+            useTradingStore.getState().syncPositionsFromBackend(data.positions || {});
+            useTradingStore.getState().fetchOrders();
+          } catch (error) {
+            // Offline or timed out: keep the previous snapshot, but leave a
+            // trace so a permanently failing sync is not silent.
+            console.warn('[wallet] portfolio sync failed', error);
+          }
         },
 
         createDeposit: (asset, amount, sourceType, sourceId) => {
@@ -597,7 +616,32 @@ export const useWalletStore = create<WalletState>()(
       }),
       {
         name: 'paper-wallet-storage',
-        version: 3,
+        version: 4,
+        /**
+         * Every browser that synced a portfolio before version 4 persisted its
+         * balances but not ``ledgerLinked`` (the key did not exist). A shallow
+         * merge would leave the flag at its ``false`` default and put a funded
+         * account back on the "initialize a wallet" guide on its first reload.
+         *
+         * A non-zero balance is itself the proof of the ledger: the only paths
+         * that raise one run after a broker sync (``syncFromBackendPortfolio``
+         * rewrites USD from ``total_equity``, and the deposit/withdraw actions
+         * only ever move what that sync put there). So the upgrade recovers the
+         * fact it can no longer read, instead of asking the user to onboard
+         * again onto money that is already theirs.
+         */
+        migrate: (persisted, fromVersion) => {
+          const state = (persisted ?? {}) as Partial<WalletState>;
+          // Zustand reports the stored version as undefined when the payload
+          // predates versioning at all; both cases are older than 4.
+          const from = typeof fromVersion === 'number' ? fromVersion : 0;
+          if (from < 4 && typeof state.ledgerLinked !== 'boolean') {
+            state.ledgerLinked = (state.balances ?? []).some(
+              (b) => new Decimal(b.total ?? '0').gt(0),
+            );
+          }
+          return state as unknown as WalletState;
+        },
         partialize: (s) => ({ account: s.account, balances: s.balances, ledgerLinked: s.ledgerLinked, paymentMethods: s.paymentMethods, cryptoAddresses: s.cryptoAddresses, deposits: s.deposits, withdraws: s.withdraws, ledger: s.ledger }),
         onRehydrateStorage: () => (s) => {
           if (s) {

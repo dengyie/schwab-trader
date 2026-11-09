@@ -194,13 +194,19 @@ async def _broadcast_order_filled(trade: Trade, order: Order) -> None:
         "type": "ORDER_FILLED",
         "trade": trade.model_dump(mode="json"),
         "order": order.model_dump(mode="json"),
-        "portfolio": {
-            "cash": p.cash if p else 0.0,
-            "total_equity": p.total_equity if p else 0.0,
-            "unrealized_pnl": p.unrealized_pnl if p else 0.0,
-            "realized_pnl": p.realized_pnl if p else 0.0,
-        }
     }
+    if p is not None:
+        payload["portfolio"] = {
+            "cash": p.cash,
+            "total_equity": p.total_equity,
+            "market_value": p.market_value,
+            "unrealized_pnl": p.unrealized_pnl,
+            "realized_pnl": p.realized_pnl,
+        }
+    # A failed refresh omits the snapshot instead of broadcasting zeros: the
+    # client treats holdings as unknown, never as an emptied account (the REST
+    # route answers 503 for the same reason). The client refetches on every
+    # fill anyway, so the next snapshot it can read is the authoritative one.
     await ws_manager.broadcast(payload)
 
 

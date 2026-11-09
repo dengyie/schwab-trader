@@ -644,7 +644,7 @@ export const zhCN = {
     assets: '资产',
     balance: '余额',
     totalBalance: '总余额',
-    value: '价值 (USDT)',
+    value: '价值 (USD)',
     avgPrice: '成本均价',
     unrealizedPnl: '未实现盈亏',
     actions: '操作',
