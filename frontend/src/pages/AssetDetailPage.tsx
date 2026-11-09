@@ -651,23 +651,13 @@ export function AssetDetailPage() {
         return sum + parseFloat(fill.price) * parseFloat(fill.quantity) * fx;
       }, 0);
     
-    // Win rate calculation
-    const tradesWithPnl = filledOrders.filter(o => {
-      const pos = getPosition(o.symbol);
-      return pos && parseFloat(pos.avgEntryPrice) > 0;
-    });
-    const winningTrades = tradesWithPnl.filter(o => {
-      const pos = getPosition(o.symbol);
-      if (!pos) return false;
-      // 持仓的盈亏是券商按最新价算好的（原始币种）；用已实现盈亏占比拆出
-      // 「按当前价卖出是否盈利」并不成立，因此逐单只判断方向：
-      // buy 在价格上涨后算盈利，sell 在没有未实现亏损时算盈利。
-      const unrealized = parseFloat(pos.unrealizedPnl || '0');
-      return o.side === 'buy' ? unrealized > 0 : unrealized <= 0;
-    });
-    const winRate = tradesWithPnl.length > 0 
-      ? (winningTrades.length / tradesWithPnl.length) * 100 
-      : 0;
+    // Win rate is account-level FIFO over closed lots (performanceMetrics), and
+    // it only means something once a sell has actually closed one. Classifying
+    // open fills by the direction of today's unrealized PnL is not a win rate:
+    // it counted every still-open buy as a loss the moment price dipped, and it
+    // printed a number even for an account that had never sold anything.
+    const hasClosedTrades = performanceMetrics.closedTrades > 0;
+    const winRate = hasClosedTrades ? performanceMetrics.winRate * 100 : null;
     
     // Best performing asset
     const bestAsset = assetList
@@ -681,9 +671,10 @@ export function AssetDetailPage() {
       totalTrades: filledOrders.length,
       volume24h,
       winRate,
+      hasClosedTrades,
       bestAsset,
     };
-  }, [orders, triggers, positionList, assetList, getPosition, usdPerUnit]);
+  }, [orders, triggers, positionList, assetList, getPosition, usdPerUnit, performanceMetrics]);
 
   // Recent activity
   const recentActivity = useMemo(() => {
@@ -864,7 +855,9 @@ export function AssetDetailPage() {
                 <Icon name="target" size="xs" />
               </div>
               <div className={styles.metricContent}>
-                <span className={styles.metricValue}>{tradingStats.winRate.toFixed(1)}%</span>
+                <span className={styles.metricValue}>
+                  {tradingStats.winRate === null ? '—' : `${tradingStats.winRate.toFixed(1)}%`}
+                </span>
                 <span className={styles.metricLabel}>Win Rate</span>
               </div>
             </div>
@@ -1022,10 +1015,26 @@ export function AssetDetailPage() {
           />
           <StatCard
             label="Win Rate"
-            value={`${tradingStats.winRate.toFixed(0)}%`}
-            subValue={tradingStats.winRate >= 50 ? 'Above average' : 'Below average'}
+            value={
+              tradingStats.winRate === null
+                ? '—'
+                : `${tradingStats.winRate.toFixed(0)}%`
+            }
+            subValue={
+              tradingStats.winRate === null
+                ? 'No closed trades yet'
+                : tradingStats.winRate >= 50
+                  ? 'Above average'
+                  : 'Below average'
+            }
             icon="target"
-            color={tradingStats.winRate >= 50 ? 'green' : 'red'}
+            color={
+              tradingStats.winRate === null
+                ? 'blue'
+                : tradingStats.winRate >= 50
+                  ? 'green'
+                  : 'red'
+            }
           />
         </div>
       </section>

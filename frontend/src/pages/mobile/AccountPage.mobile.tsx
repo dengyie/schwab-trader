@@ -234,7 +234,7 @@ export function MobileAccountPage() {
           <div className={styles.listGroup}>
             <button className={styles.listItem} onClick={() => {
               trigger('selection');
-              const nextAsset = preferences.quoteAsset === 'USDT' ? 'BTC' : 'USDT';
+              const nextAsset = preferences.quoteAsset === 'USD' ? 'BTC' : 'USD';
               updatePreferences({ quoteAsset: nextAsset });
             }}>
               <div className={styles.itemLeft}>

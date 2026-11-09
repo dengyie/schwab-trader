@@ -22,6 +22,10 @@ export function WalletPage() {
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const stage = useWalletStore((state) => state.getOnboardingStage());
+  // A funded broker account is provisioned even before its first sync lands:
+  // the persisted ledger flag and the store's own sync set it. Without this
+  // guard a reload shows the initialize-wallet guide for one round trip.
+  const ledgerLinked = useWalletStore((state) => state.ledgerLinked);
   const [activeTab, setActiveTab] = useState<WalletTab>('overview');
   const [depositOpen, setDepositOpen] = useState(false);
   const [withdrawOpen, setWithdrawOpen] = useState(false);
@@ -95,7 +99,7 @@ export function WalletPage() {
 
       {/* Main Content */}
       <div className={styles.mainContentArea}>
-        {stage === 'not_created' ? (
+        {stage === 'not_created' && !ledgerLinked ? (
           <div className={styles.onboardingWrapper}>
             <OnboardingGuide stage={stage} />
           </div>

@@ -1,6 +1,22 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useWalletStore, resolveAccountTotals } from './walletStore';
 
+// Captured before any test mutates the store, so a reload test can start from
+// the same empty state a fresh browser boots with.
+const pristine = useWalletStore.getState();
+const STORAGE_KEY = 'paper-wallet-storage';
+
+const balanceRows = (usdTotal: string) => [
+  { asset: 'USD', available: usdTotal, frozen: '0', total: usdTotal },
+  { asset: 'USDT', available: '0', frozen: '0', total: '0' },
+];
+
+const seedStorage = (version: number | null, state: Record<string, unknown>) => {
+  const payload: Record<string, unknown> = { state };
+  if (version !== null) payload.version = version;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+};
+
 describe('WalletStore - broker portfolio sync', () => {
   beforeEach(() => {
     useWalletStore.getState().resetWallet();
@@ -129,7 +145,7 @@ describe('resolveAccountTotals - one account total for every panel', () => {
     expect(st.getOnboardingStage()).toBe("funded");
   });
 
-  it('stays provisioned across a reload even though broker figures are not persisted', () => {
+  it('stays provisioned across a reload even though broker figures are not persisted', async () => {
     useWalletStore.getState().syncFromBackendPortfolio({ cash: 190000, total_equity: 195846.87 });
     const options = (useWalletStore as unknown as {
       persist: { getOptions: () => { partialize: (s: unknown) => Record<string, unknown> } };
@@ -141,10 +157,41 @@ describe('resolveAccountTotals - one account total for every panel', () => {
     expect(persisted).not.toHaveProperty('brokerMetrics');
     expect(persisted.ledgerLinked).toBe(true);
 
-    // A page may read the stage before its first sync response lands.
-    useWalletStore.setState({ brokerMetrics: null });
+    // A real reload: boot empty, put the persisted payload in storage, rehydrate.
+    useWalletStore.setState(pristine, true);
+    seedStorage(4, persisted);
+    await useWalletStore.persist.rehydrate();
+
     expect(useWalletStore.getState().account).toBeNull();
+    expect(useWalletStore.getState().brokerMetrics).toBeNull();
     expect(useWalletStore.getState().getOnboardingStage()).toBe('funded');
+  });
+
+});
+
+describe('WalletStore - upgrade from a version 3 payload', () => {
+  // Version 3 persisted balances but never `ledgerLinked`. Zustand only runs
+  // `migrate` when the stored version is a number different from the current
+  // one, which is exactly this case (verified against zustand 4.5.7).
+  it('recovers the ledger fact from a funded balances snapshot', async () => {
+    useWalletStore.setState(pristine, true);
+    seedStorage(3, { account: null, balances: balanceRows('195846.87') });
+    await useWalletStore.persist.rehydrate();
+
+    const state = useWalletStore.getState();
+    expect(state.ledgerLinked).toBe(true);
+    expect(state.account).toBeNull();
+    expect(state.getOnboardingStage()).toBe('funded');
+  });
+
+  it('does not invent a ledger for an empty version 3 wallet', async () => {
+    useWalletStore.setState(pristine, true);
+    seedStorage(3, { account: null, balances: balanceRows('0') });
+    await useWalletStore.persist.rehydrate();
+
+    const state = useWalletStore.getState();
+    expect(state.ledgerLinked).toBe(false);
+    expect(state.getOnboardingStage()).toBe('not_created');
   });
 
   it('returns to onboarding after a wallet reset', () => {
