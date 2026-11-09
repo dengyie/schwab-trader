@@ -184,6 +184,7 @@ export function paperOrderFromBackendRow(row: BackendOrderRow): PaperOrder | nul
     clientOrderId: backendId,
     backendId,
     symbol: row.symbol,
+    currency: row.currency,
     side: toSide(row.side),
     type: orderType,
     price,
