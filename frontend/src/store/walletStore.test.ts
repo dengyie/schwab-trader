@@ -128,4 +128,31 @@ describe('resolveAccountTotals - one account total for every panel', () => {
     const st = useWalletStore.getState();
     expect(st.getOnboardingStage()).toBe("funded");
   });
+
+  it('stays provisioned across a reload even though broker figures are not persisted', () => {
+    useWalletStore.getState().syncFromBackendPortfolio({ cash: 190000, total_equity: 195846.87 });
+    const options = (useWalletStore as unknown as {
+      persist: { getOptions: () => { partialize: (s: unknown) => Record<string, unknown> } };
+    }).persist.getOptions();
+    const persisted = options.partialize(useWalletStore.getState());
+
+    // Stale numbers must not outlive their session, but the fact that this
+    // browser has a broker ledger must: otherwise the next reload onboards again.
+    expect(persisted).not.toHaveProperty('brokerMetrics');
+    expect(persisted.ledgerLinked).toBe(true);
+
+    // A page may read the stage before its first sync response lands.
+    useWalletStore.setState({ brokerMetrics: null });
+    expect(useWalletStore.getState().account).toBeNull();
+    expect(useWalletStore.getState().getOnboardingStage()).toBe('funded');
+  });
+
+  it('returns to onboarding after a wallet reset', () => {
+    useWalletStore.getState().syncFromBackendPortfolio({ cash: 190000, total_equity: 195846.87 });
+    useWalletStore.getState().resetWallet();
+
+    expect(useWalletStore.getState().ledgerLinked).toBe(false);
+    expect(useWalletStore.getState().brokerMetrics).toBeNull();
+    expect(useWalletStore.getState().getOnboardingStage()).toBe('not_created');
+  });
 });

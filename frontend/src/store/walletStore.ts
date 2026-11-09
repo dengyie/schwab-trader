@@ -91,6 +91,14 @@ interface WalletState {
   account: Account | null;
   balances: WalletBalance[];
   brokerMetrics: BrokerMetrics | null;
+  /**
+   * True once this browser has received a broker portfolio snapshot.
+   *
+   * ``brokerMetrics`` is deliberately not persisted (stale numbers must not
+   * outlive their session), so this flag is what tells a reloaded page that the
+   * ledger exists and the wallet is already provisioned.
+   */
+  ledgerLinked: boolean;
   paymentMethods: PaymentMethod[];
   cryptoAddresses: CryptoAddress[];
   deposits: Deposit[];
@@ -139,6 +147,7 @@ export const useWalletStore = create<WalletState>()(
         account: null,
         balances: createEmptyBalances(),
         brokerMetrics: null,
+        ledgerLinked: false,
         paymentMethods: [],
         cryptoAddresses: [],
         deposits: [],
@@ -242,6 +251,7 @@ export const useWalletStore = create<WalletState>()(
 
           set({
             balances: newBalances,
+            ledgerLinked: true,
             brokerMetrics: {
               cash: data.cash ?? 0,
               totalEquity: data.total_equity ?? data.cash ?? 0,
@@ -509,12 +519,12 @@ export const useWalletStore = create<WalletState>()(
           // only a browser placeholder for it (it lives in localStorage and an
           // onboarding click creates it), so once portfolio figures have synced
           // this wallet is provisioned whether or not that click ever happened.
-          if (!s.account && !s.brokerMetrics) return 'not_created';
+          if (!s.account && !s.ledgerLinked) return 'not_created';
           if (s.paymentMethods.length === 0 && s.cryptoAddresses.length === 0) {
             // A funded broker account needs no local funding channel: the funds
             // are already there, so the "link a card" step is not an onboarding
             // step for it, only an upsell the wallet page can offer.
-            if (!s.brokerMetrics || !s.balances.some(b => new Decimal(b.total).gt(0))) {
+            if (!s.ledgerLinked || !s.balances.some(b => new Decimal(b.total).gt(0))) {
               return 'no_payment_method';
             }
           }
@@ -580,6 +590,7 @@ export const useWalletStore = create<WalletState>()(
             deposits: [], withdraws: [], ledger: [],
             // A reset wallet must not keep serving the previous broker snapshot.
             brokerMetrics: null,
+            ledgerLinked: false,
             performanceMetrics: { totalTrades: 0, closedTrades: 0, winRate: 0, profitFactor: 0, maxDrawdown: 0, peakEquity: '0', totalRealizedPnl: '0' },
           });
         }
@@ -587,7 +598,7 @@ export const useWalletStore = create<WalletState>()(
       {
         name: 'paper-wallet-storage',
         version: 3,
-        partialize: (s) => ({ account: s.account, balances: s.balances, paymentMethods: s.paymentMethods, cryptoAddresses: s.cryptoAddresses, deposits: s.deposits, withdraws: s.withdraws, ledger: s.ledger }),
+        partialize: (s) => ({ account: s.account, balances: s.balances, ledgerLinked: s.ledgerLinked, paymentMethods: s.paymentMethods, cryptoAddresses: s.cryptoAddresses, deposits: s.deposits, withdraws: s.withdraws, ledger: s.ledger }),
         onRehydrateStorage: () => (s) => {
           if (s) {
             s._pendingTimers = new Map();
