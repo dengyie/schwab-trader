@@ -18,7 +18,7 @@ export function DepositDrawer({ isOpen, onClose }: DepositDrawerProps) {
   const createDeposit = useWalletStore((state) => state.createDeposit);
   const confirmDeposit = useWalletStore((state) => state.confirmDeposit);
 
-  const [asset, setAsset] = useState<'USDT' | 'CNY'>('USDT');
+  const [asset, setAsset] = useState<'USD' | 'CNY'>('USD');
   const [amount, setAmount] = useState('');
   const [sourceType, setSourceType] = useState<'bank' | 'crypto'>('crypto');
   const [sourceId, setSourceId] = useState('');
@@ -67,7 +67,7 @@ export function DepositDrawer({ isOpen, onClose }: DepositDrawerProps) {
 
   const handleClose = () => {
     // Reset form
-    setAsset('USDT');
+    setAsset('USD');
     setAmount('');
     setSourceType('crypto');
     setSourceId('');
@@ -149,10 +149,10 @@ export function DepositDrawer({ isOpen, onClose }: DepositDrawerProps) {
                 </label>
                 <div className={styles.assetButtons}>
                   <button
-                    className={`${styles.assetButton} ${asset === 'USDT' ? styles.active : ''}`}
-                    onClick={() => setAsset('USDT')}
+                    className={`${styles.assetButton} ${asset === 'USD' ? styles.active : ''}`}
+                    onClick={() => setAsset('USD')}
                   >
-                    USDT
+                    USD
                   </button>
                   <button
                     className={`${styles.assetButton} ${asset === 'CNY' ? styles.active : ''}`}

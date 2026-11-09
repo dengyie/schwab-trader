@@ -22,7 +22,7 @@ export function WithdrawDrawer({ isOpen, onClose }: WithdrawDrawerProps) {
   const withdraws = useWalletStore(selectWithdraws);
   const createWithdraw = useWalletStore((state) => state.createWithdraw);
 
-  const [asset, setAsset] = useState('USDT');
+  const [asset, setAsset] = useState('USD');
   const [amount, setAmount] = useState('');
   const [destinationType, setDestinationType] = useState<'bank' | 'crypto'>('crypto');
   const [destinationId, setDestinationId] = useState('');
@@ -64,14 +64,14 @@ export function WithdrawDrawer({ isOpen, onClose }: WithdrawDrawerProps) {
     const numAmount = parseFloat(amount);
     if (isNaN(numAmount) || numAmount <= 0) return '0';
     const feeByRate = new Decimal(numAmount).times(WITHDRAW_FEE_RATE);
-    return Decimal.max(feeByRate, MIN_WITHDRAW_FEE).toFixed(asset === 'USDT' ? 2 : 8);
+    return Decimal.max(feeByRate, MIN_WITHDRAW_FEE).toFixed(asset === 'USD' ? 2 : 8);
   }, [amount, asset]);
 
   // Calculate receive amount
   const receiveAmount = useMemo(() => {
     const numAmount = parseFloat(amount);
     if (isNaN(numAmount) || numAmount <= 0) return '0';
-    return new Decimal(numAmount).minus(fee).toFixed(asset === 'USDT' ? 2 : 8);
+    return new Decimal(numAmount).minus(fee).toFixed(asset === 'USD' ? 2 : 8);
   }, [amount, fee, asset]);
 
   const handleDestinationTypeChange = (type: 'bank' | 'crypto') => {
@@ -104,7 +104,7 @@ export function WithdrawDrawer({ isOpen, onClose }: WithdrawDrawerProps) {
   };
 
   const handleClose = () => {
-    setAsset('USDT');
+    setAsset('USD');
     setAmount('');
     setDestinationType('crypto');
     setDestinationId('');
@@ -121,7 +121,7 @@ export function WithdrawDrawer({ isOpen, onClose }: WithdrawDrawerProps) {
       // For simplicity, subtract min fee first
       const maxWithFee = available.minus(MIN_WITHDRAW_FEE).div(1 + WITHDRAW_FEE_RATE);
       const maxAmount = Decimal.max(maxWithFee, 0);
-      setAmount(maxAmount.toFixed(asset === 'USDT' ? 2 : 8));
+      setAmount(maxAmount.toFixed(asset === 'USD' ? 2 : 8));
     }
   };
 

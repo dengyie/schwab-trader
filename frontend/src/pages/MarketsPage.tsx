@@ -120,11 +120,12 @@ export function MarketsPage() {
         filtered = filtered.filter(m => (m.ticker?.priceChangePercent ?? 0) < 0);
         break;
       case 'High Volume':
-        // Get top 20% by volume
+        // Top quintile by quote volume, never fewer than five, so a small
+        // catalog still has a meaningful "busiest" tab.
         const sortedByVol = [...filtered].sort((a, b) => 
           (b.ticker?.quoteVolume24h ?? 0) - (a.ticker?.quoteVolume24h ?? 0)
         );
-        const topCount = Math.max(20, Math.floor(sortedByVol.length * 0.2));
+        const topCount = Math.max(Math.min(5, sortedByVol.length), Math.floor(sortedByVol.length * 0.2));
         const topSymbols = new Set(sortedByVol.slice(0, topCount).map(m => m.symbol));
         filtered = filtered.filter(m => topSymbols.has(m.symbol));
         break;
@@ -156,8 +157,10 @@ export function MarketsPage() {
       ? active.reduce((acc, m) => acc + (m.ticker?.priceChangePercent ?? 0), 0) / active.length 
       : 0;
     
-    // High volume count (top 20%)
-    const highVolCount = Math.max(20, Math.floor(active.length * 0.2));
+    // High volume count: same top-quintile rule as the 'High Volume' filter.
+    const highVolCount = active.length > 0
+      ? Math.max(Math.min(5, active.length), Math.floor(active.length * 0.2))
+      : 0;
     
     // Find top gainer
     const topGainer = active.length > 0 ? active.reduce((best, current) => {
@@ -248,7 +251,7 @@ export function MarketsPage() {
           </div>
           <span className={styles.statValue}>${formatVolume(stats.totalVol)}</span>
           <div className={styles.volumeSubtext}>
-            <span>Aggregate USDT Volume</span>
+            <span>Aggregate USD Volume</span>
           </div>
         </div>
 
@@ -265,7 +268,7 @@ export function MarketsPage() {
             <div className={styles.assetHighlight}>
               <div className={styles.assetMain}>
                 <span className={styles.assetSymbol}>{parseSymbol(stats.topGainer.symbol).base}</span>
-                <span className={styles.assetQuote}>/ USDT</span>
+                <span className={styles.assetQuote}>/ {stats.topGainer.ticker.currency ?? parseSymbol(stats.topGainer.symbol).quote}</span>
               </div>
               <div className={styles.assetMetrics}>
                 <span className={`${styles.changeValue} price-up`}>
@@ -294,7 +297,7 @@ export function MarketsPage() {
             <div className={styles.assetHighlight}>
               <div className={styles.assetMain}>
                 <span className={styles.assetSymbol}>{parseSymbol(stats.volumeLeader.symbol).base}</span>
-                <span className={styles.assetQuote}>/ USDT</span>
+                <span className={styles.assetQuote}>/ {stats.volumeLeader.ticker.currency ?? parseSymbol(stats.volumeLeader.symbol).quote}</span>
               </div>
               <div className={styles.assetMetrics}>
                 <span className={styles.volumeValue}>
@@ -392,7 +395,7 @@ export function MarketsPage() {
                     <td>
                       <div className={styles.assetCell}>
                         <span className={styles.base}>{parseSymbol(m.symbol).base}</span>
-                        <span className={styles.quote}>/USDT</span>
+                        <span className={styles.quote}>/{m.ticker?.currency ?? parseSymbol(m.symbol).quote}</span>
                       </div>
                     </td>
                     <td className="tabular-nums font-medium">

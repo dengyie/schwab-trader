@@ -24,7 +24,7 @@ import type { PaperOrder } from '../types/trading';
 
 // ===== Constants =====
 const WITHDRAW_FEE_RATE = 0.001; // 0.1%
-const MIN_WITHDRAW_FEE = 1; // 1 USDT minimum
+const MIN_WITHDRAW_FEE = 1; // minimum flat fee, in the withdrawn asset
 // Deposit/Withdraw timing constants (reserved for future use)
 // const DEPOSIT_CONFIRM_MIN_MS = 3000;
 // const DEPOSIT_CONFIRM_MAX_MS = 10000;
@@ -505,8 +505,19 @@ export const useWalletStore = create<WalletState>()(
 
         getOnboardingStage: () => {
           const s = get();
-          if (!s.account) return 'not_created';
-          if (s.paymentMethods.length === 0 && s.cryptoAddresses.length === 0) return 'no_payment_method';
+          // The broker ledger is the real account. The local wallet account is
+          // only a browser placeholder for it (it lives in localStorage and an
+          // onboarding click creates it), so once portfolio figures have synced
+          // this wallet is provisioned whether or not that click ever happened.
+          if (!s.account && !s.brokerMetrics) return 'not_created';
+          if (s.paymentMethods.length === 0 && s.cryptoAddresses.length === 0) {
+            // A funded broker account needs no local funding channel: the funds
+            // are already there, so the "link a card" step is not an onboarding
+            // step for it, only an upsell the wallet page can offer.
+            if (!s.brokerMetrics || !s.balances.some(b => new Decimal(b.total).gt(0))) {
+              return 'no_payment_method';
+            }
+          }
           if (!s.balances.some(b => new Decimal(b.total).gt(0))) return 'no_funds';
           return 'funded';
         },
@@ -567,6 +578,8 @@ export const useWalletStore = create<WalletState>()(
           set({
             account: null, balances: createEmptyBalances(), paymentMethods: [], cryptoAddresses: [],
             deposits: [], withdraws: [], ledger: [],
+            // A reset wallet must not keep serving the previous broker snapshot.
+            brokerMetrics: null,
             performanceMetrics: { totalTrades: 0, closedTrades: 0, winRate: 0, profitFactor: 0, maxDrawdown: 0, peakEquity: '0', totalRealizedPnl: '0' },
           });
         }

@@ -22,7 +22,7 @@ export function AssetBalancesPanel({ onDeposit, onWithdraw }: AssetBalancesPanel
     return balances.filter((b) => {
       const matchesSearch = b.asset.toLowerCase().includes(search.toLowerCase());
       const isNotSmall = !hideSmall || new Decimal(b.total).gt(0.00000001);
-      const isEssential = b.asset === 'USDT' || new Decimal(b.total).gt(0);
+      const isEssential = b.asset === 'USD' || new Decimal(b.total).gt(0);
       return matchesSearch && (hideSmall ? isNotSmall : isEssential);
     });
   }, [balances, search, hideSmall]);
@@ -33,10 +33,10 @@ export function AssetBalancesPanel({ onDeposit, onWithdraw }: AssetBalancesPanel
 
   const formatAmount = (amount: string, asset: string) => {
     const dec = new Decimal(amount);
-    if (asset === 'USDT') {
+    if (asset === 'USD') {
       return dec.toFixed(2);
     }
-    // For crypto, show more precision
+    // For other assets, show more precision
     if (dec.eq(0)) return '0';
     if (dec.lt(0.0001)) return dec.toExponential(4);
     return dec.toFixed(8).replace(/\.?0+$/, '');
