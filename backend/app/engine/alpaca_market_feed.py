@@ -45,8 +45,19 @@ class AlpacaMarketFeedService:
     # this often. During a session the range moves; after the close it is
     # static, so a far longer TTL keeps the same consolidated close for the
     # rest of the day/weekend without hammering upstream.
-    SNAPSHOT_TTL = 45.0
-    SNAPSHOT_TTL_CLOSED = 900.0
+    #
+    # Each refresh costs one Yahoo chart request per symbol, and the payload
+    # is parsed on the single uvicorn worker's event loop. A 45s TTL meant
+    # 14 requests every 45s even with nobody connected; that parse load was
+    # enough to starve the loop and push /api/health past 20 seconds. Three
+    # minutes keeps the consolidated close honest while leaving the worker
+    # idle between user interactions.
+    SNAPSHOT_TTL = 180.0
+    SNAPSHOT_TTL_CLOSED = 3600.0
+    # Chart prewarming exists only to make the first chart load instant. With
+    # no client connected there is nothing to prewarm for, so the loop sleeps
+    # instead of re-fetching multi-thousand-bar candle payloads forever.
+    IDLE_PREWARM_SECONDS = 30.0
 
     def __init__(
         self,
@@ -89,6 +100,9 @@ class AlpacaMarketFeedService:
         self._ws_task: Optional[asyncio.Task] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._prewarm_task: Optional[asyncio.Task] = None
+        # Optional callable returning True while a client is subscribed to a
+        # symbol. ``main`` attaches it; None keeps background prewarming on.
+        self.subscriber_probe: Optional[Callable[[], bool]] = None
 
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
@@ -334,6 +348,8 @@ class AlpacaMarketFeedService:
         if not syms:
             return
 
+        # The timestamp is set before the (slow) upstream sweep so a second
+        # caller waits for the TTL instead of starting a duplicate burst.
         with self._snapshot_lock:
             now = time.time()
             ttl = self._daily_ttl()
@@ -589,11 +605,30 @@ class AlpacaMarketFeedService:
             except Exception:
                 pass
 
+    def _has_chart_subscribers(self) -> bool:
+        """True while at least one websocket client is watching a quote or a bar.
+
+        Registered by ``main`` so the loop can tell "somebody is on a chart"
+        from "the server is sitting idle" without importing the websocket
+        manager into the feed.
+        """
+        probe = getattr(self, "subscriber_probe", None)
+        if not callable(probe):
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            return True
+
     async def _prewarm_cache_loop(self) -> None:
         """
         Background task:
         Smoothly pre-warms key candles (15m, 1h, 1d) for core symbols (SPY, QQQ, AAPL, NVDA, TSLA) in RAM.
         Runs gently with rate-limit protection so user requests are served in < 1ms.
+
+        Skipped entirely while no client is connected: candle payloads are
+        megabytes of JSON parsed on the event loop, and prewarming for an
+        empty room is what kept the worker pegged once the tab was closed.
         """
         await asyncio.sleep(2.0)
         core_symbols = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA"]
@@ -601,6 +636,9 @@ class AlpacaMarketFeedService:
 
         while self._running:
             try:
+                if not self._has_chart_subscribers():
+                    await asyncio.sleep(self.IDLE_PREWARM_SECONDS)
+                    continue
                 for sym in core_symbols:
                     if not self._running:
                         break

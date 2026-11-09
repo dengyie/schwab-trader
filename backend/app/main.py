@@ -143,6 +143,14 @@ broker: BaseBroker = MarketRouterBroker(us_broker, virtual_engine)
 
 ws_manager = WebSocketManager()
 
+# Chart prewarming is only useful while somebody is actually looking at a
+# chart. Hand the feed a presence check instead of letting it re-parse the
+# same multi-thousand-bar payloads for an empty server.
+if hasattr(us_feed, "subscriber_probe"):
+    us_feed.subscriber_probe = lambda: any(
+        bool(symbols) for symbols in ws_manager.active_connections.values()
+    )
+
 logger = logging.getLogger("app.main")
 
 # Used to schedule coroutines from worker threads (e.g. broker fill polling)
