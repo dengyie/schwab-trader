@@ -1,235 +1,135 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { useTradingStore } from './tradingStore';
 import { useWalletStore } from './walletStore';
 import { useMarketStore } from './marketStore';
 import { useMarketsStore } from './marketsStore';
 
-describe('TradingStore - Order Freeze & Cancellation', () => {
-  beforeEach(() => {
-    useWalletStore.getState().resetWallet();
-    // Fund the account the way production does: a broker portfolio snapshot.
-    // (The old createEmptyBalances placeholder grant was removed.)
-    useWalletStore.getState().syncFromBackendPortfolio({ cash: 100000, total_equity: 100000 });
-    useTradingStore.setState({ orders: [], positions: new Map(), ocoOrders: [] });
-    useMarketStore.setState({
-      dataConfidence: {
-        level: 'live',
-        canTrade: true,
-        canTrustMetrics: true,
-        lastLiveTime: Date.now(),
-        degradedSince: 0,
-        details: {
-          wsConnected: true,
-          sequenceContinuous: true,
-          latencyOk: true,
-          updateFrequencyOk: true,
-          queueHealthy: true,
-        },
+const originalFetch = globalThis.fetch;
+
+let requested: Array<{ url: string; method: string; body: any }> = [];
+
+function json(data: unknown, ok = true, status = 200) {
+  return { ok, status, json: async () => data } as any;
+}
+
+function book(bid: string, ask: string) {
+  return {
+    symbol: 'SPY',
+    bids: [{ price: bid, quantity: '100' }],
+    asks: [{ price: ask, quantity: '100' }],
+  } as any;
+}
+
+function submission() {
+  return requested.find((r) => r.url.endsWith('/orders') && r.method === 'POST');
+}
+
+beforeEach(() => {
+  requested = [];
+  useWalletStore.getState().resetWallet();
+  useWalletStore.getState().syncFromBackendPortfolio({ cash: 100000, total_equity: 100000 });
+  useTradingStore.setState({ orders: [], positions: new Map(), ocoOrders: [] });
+  useMarketsStore.setState({ markets: [] as any, status: 'ready' });
+  useMarketStore.setState({
+    dataConfidence: {
+      level: 'live',
+      canTrade: true,
+      canTrustMetrics: true,
+      lastLiveTime: Date.now(),
+      degradedSince: 0,
+      details: {
+        wsConnected: true,
+        sequenceContinuous: true,
+        latencyOk: true,
+        updateFrequencyOk: true,
+        queueHealthy: true,
       },
-      metrics: {
-        mid: '500.00',
-        spread: '0.05',
-        spreadBps: 1,
-        spreadStatus: 'normal',
-        depthImbalance: 0,
-        microprice: '500.00',
-        vwap5m: '500.00',
-        vwap15m: '500.00',
-        realizedVol15m: 0.01,
-        realizedVol1h: 0.01,
-        high24h: '510.00',
-        low24h: '490.00',
-        volume24h: '100000',
-      },
-    });
+    },
+    metrics: { mid: '100.00' } as any,
   });
 
-  it('correctly freezes balance on trailing stop and unfreezes on cancellation without locking funds', async () => {
-    const wallet = useWalletStore.getState();
-    const usdBefore = wallet.getBalance('USD');
-    expect(usdBefore).toBeDefined();
-    expect(parseFloat(usdBefore!.available)).toBeGreaterThan(0);
-    expect(parseFloat(usdBefore!.frozen)).toBe(0);
-
-    const trading = useTradingStore.getState();
-    // Create buy trailing stop: 10 SPY @ $500 mid * 1.1 = $5500 freeze
-    const order = trading.createTrailingStopOrder({
-      symbol: 'SPY',
-      side: 'buy',
-      quantity: '10',
-      trailingType: 'amount',
-      trailingValue: '5.00',
+  globalThis.fetch = async (url: any, init?: any) => {
+    const target = String(url);
+    const method = String(init?.method || 'GET').toUpperCase();
+    requested.push({
+      url: target,
+      method,
+      body: init?.body ? JSON.parse(init.body as string) : undefined,
     });
 
-    expect(order).toBeDefined();
-    expect(order!.clientOrderId).toBeDefined();
-
-    // Verify wallet frozen balance is > 0
-    const usdDuring = useWalletStore.getState().getBalance('USD');
-    expect(parseFloat(usdDuring!.frozen)).toBeGreaterThan(0);
-
-    // Cancel order
-    const cancelled = await useTradingStore.getState().cancelOrder(order!.clientOrderId);
-    expect(cancelled).toBe(true);
-
-    const updatedOrder = useTradingStore.getState().orders.find(o => o.clientOrderId === order!.clientOrderId);
-    expect(updatedOrder?.status).toBe('cancelled');
-
-    // Verify wallet frozen balance is cleanly reset to 0
-    const usdAfter = useWalletStore.getState().getBalance('USD');
-    expect(parseFloat(usdAfter!.frozen)).toBe(0);
-    expect(parseFloat(usdAfter!.available)).toBe(parseFloat(usdBefore!.available));
-  });
-
-  it('correctly calculates proportional unfreezing for partially filled orders without magic numbers', async () => {
-    const wallet = useWalletStore.getState();
-    const usdBefore = wallet.getBalance('USD');
-    const orderId = 'test_partially_filled_order';
-    const freezeAmount = '5000.00000000';
-
-    // Freeze $5000
-    wallet.freezeBalance('USD', freezeAmount, orderId, 'order');
-    expect(parseFloat(wallet.getBalance('USD')!.frozen)).toBe(5000);
-
-    // Order was 10 units, 4 already filled, 6 remaining
-    useTradingStore.setState({
-      orders: [
-        {
-          clientOrderId: orderId,
-          symbol: 'SPY',
-          side: 'buy',
-          type: 'limit',
-          price: '500.00',
-          quantity: '10',
-          filledQty: '4',
-          avgPrice: '500.00',
-          status: 'open',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          fills: [],
-          frozenAmount: freezeAmount,
-          frozenAsset: 'USD',
-        },
-      ],
-    });
-
-    // Cancel remaining order: should unfreeze exactly 6/10 * 5000 = $3000
-    const cancelled = await useTradingStore.getState().cancelOrder(orderId);
-    expect(cancelled).toBe(true);
-
-    const usdAfter = useWalletStore.getState().getBalance('USD');
-    // Frozen should now be 5000 - 3000 = 2000
-    expect(parseFloat(usdAfter!.frozen)).toBe(2000);
-  });
-
-  it('hydrates and updates backend orders correctly via fetchOrders', async () => {
-    const mockBackendOrders = [
-      {
-        order_id: 'backend_ord_1',
-        symbol: 'NVDA',
-        side: 'BUY',
-        order_type: 'LIMIT',
-        quantity: 5,
-        price: 200.0,
-        status: 'OPEN',
-        filled_quantity: 0,
-        filled_avg_price: 0,
-        created_at: new Date(1700000000000).toISOString(),
-        updated_at: new Date(1700000000000).toISOString(),
-      },
-      {
-        order_id: 'backend_ord_2',
-        symbol: 'AAPL',
-        side: 'SELL',
-        order_type: 'MARKET',
-        quantity: 10,
-        price: null,
-        status: 'FILLED',
-        filled_quantity: 10,
-        filled_avg_price: 230.5,
-        created_at: new Date(1700000001000).toISOString(),
-        updated_at: new Date(1700000001000).toISOString(),
-      },
-    ];
-
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => mockBackendOrders,
-    } as any);
-
-    try {
-      useTradingStore.setState({ orders: [] });
-      await useTradingStore.getState().fetchOrders();
-
-      const orders = useTradingStore.getState().orders;
-      expect(orders).toHaveLength(2);
-
-      const ord1 = orders.find(o => o.backendId === 'backend_ord_1');
-      expect(ord1).toBeDefined();
-      expect(ord1?.symbol).toBe('NVDA');
-      expect(ord1?.side).toBe('buy');
-      expect(ord1?.type).toBe('limit');
-      expect(ord1?.price).toBe('200');
-      expect(ord1?.quantity).toBe('5');
-      expect(ord1?.status).toBe('open');
-
-      const ord2 = orders.find(o => o.backendId === 'backend_ord_2');
-      expect(ord2).toBeDefined();
-      expect(ord2?.symbol).toBe('AAPL');
-      expect(ord2?.side).toBe('sell');
-      expect(ord2?.status).toBe('filled');
-      expect(ord2?.filledQty).toBe('10');
-    } finally {
-      globalThis.fetch = originalFetch;
+    if (target.endsWith('/orders') && method === 'POST') {
+      return json({ order_id: 'ord_new', status: 'OPEN' });
     }
-  });
+    if (target.endsWith('/orders') && method === 'GET') {
+      return json([]);
+    }
+    if (target.endsWith('/portfolio/reset')) {
+      return json({ status: 'reset' });
+    }
+    if (target.endsWith('/portfolio')) {
+      return json({
+        cash: 100000,
+        total_equity: 100000,
+        initial_capital: 200000,
+        positions: {},
+      });
+    }
+    return json({});
+  };
 });
 
-describe('TradingStore - non-US orders are delegated to the backend', () => {
-  let requested: Array<{ url: string; body: any }> = [];
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
 
-  beforeEach(() => {
-    requested = [];
-    useWalletStore.getState().resetWallet();
-    useWalletStore.getState().syncFromBackendPortfolio({ cash: 100000, total_equity: 100000 });
-    useTradingStore.setState({ orders: [], positions: new Map(), ocoOrders: [] });
-    useMarketStore.setState({
-      dataConfidence: {
-        level: 'live',
-        canTrade: true,
-        canTrustMetrics: true,
-        lastLiveTime: Date.now(),
-        degradedSince: 0,
-        details: {
-          wsConnected: true,
-          sequenceContinuous: true,
-          latencyOk: true,
-          updateFrequencyOk: true,
-          queueHealthy: true,
-        },
-      },
-      metrics: { mid: '419.80' } as any,
+describe('order submission', () => {
+  it('sends US orders to the backend instead of running a local ledger', () => {
+    const before = useWalletStore.getState().getBalance('USD')!;
+    const order = useTradingStore.getState().createOrder({
+      symbol: 'SPY',
+      side: 'buy',
+      type: 'market',
+      quantity: '10',
+    }, '500.00');
+
+    expect(order).not.toBeNull();
+    expect(order!.status).toBe('pending');
+
+    const post = submission();
+    expect(post).toBeDefined();
+    expect(post!.body).toMatchObject({
+      symbol: 'SPY',
+      side: 'BUY',
+      order_type: 'MARKET',
+      quantity: 10,
+      market: 'US',
     });
-    // 市场注册表：港股每手 100 股、币种 HKD。
+    expect(post!.body.price).toBeUndefined();
+
+    const after = useWalletStore.getState().getBalance('USD')!;
+    expect(after.frozen).toBe(before.frozen);
+    expect(after.available).toBe(before.available);
+  });
+
+  it('rounds foreign orders to a whole board lot and tags the market', () => {
     useMarketsStore.setState({
-      markets: [
-        {
-          code: 'HK', name: 'Hong Kong', currency: 'HKD', timezone: 'Asia/Hong_Kong',
-          exchange: 'HKEX', sessions: [], lot_size: 100, settlement: 'T+0', suffix: '.HK',
-          price_limit_pct: null, decimals: 2, catalog: ['0700.HK'],
-        },
-      ],
+      markets: [{
+        code: 'HK',
+        name: 'Hong Kong',
+        currency: 'HKD',
+        timezone: 'Asia/Hong_Kong',
+        exchange: 'HKEX',
+        sessions: [],
+        lot_size: 100,
+        settlement: 'T+0',
+        suffix: '.HK',
+        price_limit_pct: null,
+        decimals: 2,
+        catalog: ['0700.HK'],
+      }] as any,
       status: 'ready',
     });
 
-    globalThis.fetch = async (url: any, init?: any) => {
-      requested.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
-      return { ok: true, json: async () => ({ order_id: 'hk_1', status: 'OPEN' }) } as any;
-    };
-  });
-
-  it('sends the market hint and lot-rounded quantity instead of a USD order', () => {
     const order = useTradingStore.getState().createOrder({
       symbol: '0700.HK',
       side: 'buy',
@@ -238,33 +138,181 @@ describe('TradingStore - non-US orders are delegated to the backend', () => {
       quantity: '250',
     }, '419.80');
 
-    expect(order).toBeDefined();
-    const submit = requested.find((r) => r.url.includes('/orders'));
-    expect(submit).toBeDefined();
-    expect(submit!.body.market).toBe('HK');
-    expect(submit!.body.symbol).toBe('0700.HK');
-    // 250 股向上/向下都必须是 100 的整数倍 -> 200
-    expect(submit!.body.quantity).toBe(200);
+    expect(order).not.toBeNull();
+    expect(submission()!.body).toMatchObject({
+      symbol: '0700.HK',
+      market: 'HK',
+      quantity: 200,
+      order_type: 'LIMIT',
+      price: 419.8,
+    });
   });
 
-  it('does not freeze the USD wallet for a foreign-currency order', () => {
-    const before = useWalletStore.getState().getBalance('USD');
-    useTradingStore.getState().createOrder({
-      symbol: '0700.HK', side: 'buy', type: 'limit', price: '419.80', quantity: '100',
-    }, '419.80');
+  it('rejects a quantity below one board lot without contacting the broker', () => {
+    useMarketsStore.setState({
+      markets: [{
+        code: 'HK', name: 'Hong Kong', currency: 'HKD', timezone: 'Asia/Hong_Kong',
+        exchange: 'HKEX', sessions: [], lot_size: 100, settlement: 'T+0', suffix: '.HK',
+        price_limit_pct: null, decimals: 2, catalog: ['0700.HK'],
+      }] as any,
+      status: 'ready',
+    });
 
-    const after = useWalletStore.getState().getBalance('USD');
-    // 港币订单由后端虚拟撮合引擎结算，本地 USD 钱包不能被占用。
-    expect(parseFloat(after!.frozen)).toBe(parseFloat(before!.frozen));
-    expect(parseFloat(after!.available)).toBe(parseFloat(before!.available));
-  });
-
-  it('rejects a quantity below one board lot', () => {
     const order = useTradingStore.getState().createOrder({
-      symbol: '0700.HK', side: 'buy', type: 'limit', price: '419.80', quantity: '50',
+      symbol: '0700.HK',
+      side: 'buy',
+      type: 'limit',
+      price: '419.80',
+      quantity: '50',
     }, '419.80');
 
     expect(order).toBeNull();
-    expect(requested.find((r) => r.url.includes('/orders'))).toBeUndefined();
+    expect(submission()).toBeUndefined();
+  });
+});
+
+describe('client-side conditional orders', () => {
+  it('keeps a stop local until it crosses, then submits a market order', () => {
+    const order = useTradingStore.getState().createOrder({
+      symbol: 'SPY',
+      side: 'sell',
+      type: 'stop_market',
+      quantity: '10',
+      triggerPrice: '90',
+    }, '100.00');
+
+    expect(order).not.toBeNull();
+    expect(order!.status).toBe('open');
+    expect(submission()).toBeUndefined();
+
+    // Establish the reference price, then cross the trigger.
+    useTradingStore.getState().evaluateOrderTriggers(book('95.00', '95.10'));
+    expect(submission()).toBeUndefined();
+
+    useTradingStore.getState().evaluateOrderTriggers(book('89.00', '89.10'));
+    const post = submission();
+    expect(post).toBeDefined();
+    expect(post!.body).toMatchObject({
+      symbol: 'SPY',
+      side: 'SELL',
+      order_type: 'MARKET',
+      quantity: 10,
+    });
+
+    const triggered = useTradingStore.getState().orders.find((o) => o.clientOrderId === order!.clientOrderId);
+    expect(triggered?.isTriggered).toBe(true);
+  });
+});
+
+describe('OCO orders', () => {
+  it('submits the winning leg as a limit and cancels its sibling', () => {
+    const oco = useTradingStore.getState().createOCOOrder({
+      symbol: 'SPY',
+      side: 'sell',
+      quantity: '10',
+      limitPrice: '110',
+      stopPrice: '90',
+      stopLimitPrice: '89',
+    });
+
+    expect(oco).not.toBeNull();
+    expect(submission()).toBeUndefined();
+
+    useTradingStore.getState().evaluateOrderTriggers(book('100.00', '100.10'));
+    useTradingStore.getState().evaluateOrderTriggers(book('111.00', '111.10'));
+
+    const post = submission();
+    expect(post!.body).toMatchObject({
+      symbol: 'SPY',
+      side: 'SELL',
+      order_type: 'LIMIT',
+      quantity: 10,
+      price: 110,
+    });
+    expect(useTradingStore.getState().ocoOrders[0].status).toBe('triggered');
+    expect(useTradingStore.getState().orders.find((o) => !o.isTriggered)?.status).toBe('cancelled');
+  });
+});
+
+describe('broker reconciliation', () => {
+  it('removes a phantom order the backend does not know', async () => {
+    useTradingStore.setState({
+      orders: [{
+        clientOrderId: 'local_ghost',
+        backendId: 'ord_ghost',
+        symbol: '600519.SS',
+        side: 'buy',
+        type: 'limit',
+        price: '1453',
+        quantity: '100',
+        filledQty: '100',
+        avgPrice: '1453',
+        status: 'filled',
+        createdAt: 1,
+        updatedAt: 1,
+        fills: [],
+      }],
+    });
+
+    await useTradingStore.getState().fetchOrders();
+    expect(useTradingStore.getState().orders).toHaveLength(0);
+  });
+
+  it('cancels a broker-backed order only after the DELETE succeeds', async () => {
+    useTradingStore.setState({
+      orders: [{
+        clientOrderId: 'c1', backendId: 'ord_x', symbol: 'SPY', side: 'buy', type: 'limit',
+        price: '100', quantity: '10', filledQty: '0', avgPrice: '0', status: 'open',
+        createdAt: 1, updatedAt: 1, fills: [],
+      }],
+    });
+
+    const ok = await useTradingStore.getState().cancelOrder('c1');
+    expect(ok).toBe(true);
+    expect(requested.some((r) => r.url.includes('/orders/ord_x') && r.method === 'DELETE')).toBe(true);
+    expect(useTradingStore.getState().orders.find((o) => o.clientOrderId === 'c1')?.status).toBe('cancelled');
+  });
+
+  it('does not report success when the broker rejects the cancellation', async () => {
+    globalThis.fetch = async (url: any, init?: any) => {
+      const target = String(url);
+      if (String(init?.method || 'GET').toUpperCase() === 'DELETE') {
+        return json({ detail: 'already filled' }, false, 409);
+      }
+      return json([]);
+    };
+    useTradingStore.setState({
+      orders: [{
+        clientOrderId: 'c2', backendId: 'ord_y', symbol: 'SPY', side: 'buy', type: 'limit',
+        price: '100', quantity: '10', filledQty: '0', avgPrice: '0', status: 'open',
+        createdAt: 1, updatedAt: 1, fills: [],
+      }],
+    });
+
+    const ok = await useTradingStore.getState().cancelOrder('c2');
+    expect(ok).toBe(false);
+  });
+});
+
+describe('account reset', () => {
+  it('resets the broker account using its reported initial capital', async () => {
+    useTradingStore.setState({
+      positions: new Map([['600519.SS', {
+        symbol: '600519.SS',
+        side: 'long',
+        quantity: '100',
+        avgEntryPrice: '1453',
+        unrealizedPnl: '0',
+        realizedPnl: '0',
+        updatedAt: 1,
+      }]]),
+    });
+
+    await useTradingStore.getState().resetAccount();
+
+    const reset = requested.find((r) => r.url.endsWith('/portfolio/reset'));
+    expect(reset?.method).toBe('POST');
+    expect(reset?.body).toEqual({ initial_capital: 200000 });
+    expect(useTradingStore.getState().positions.size).toBe(0);
   });
 });

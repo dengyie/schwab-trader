@@ -262,7 +262,12 @@ async def _send_portfolio_snapshot(websocket: WebSocket) -> None:
                         "quantity": pos.quantity,
                         "avg_cost": pos.avg_cost,
                         "current_price": pos.current_price,
-                        "unrealized_pnl": pos.unrealized_pnl
+                        "unrealized_pnl": pos.unrealized_pnl,
+                        "realized_pnl": pos.realized_pnl,
+                        # Multi-market context: the position table formats
+                        # native-currency amounts from these two fields.
+                        "market": pos.market,
+                        "currency": pos.currency,
                     }
                     for sym, pos in p.positions.items()
                     if pos.quantity > 0
