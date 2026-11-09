@@ -49,6 +49,8 @@ export interface PaperOrder {
   ocoGroupId?: string;
   ocoLinkedOrderId?: string;
   backendId?: string;
+  /** 计价币种（USD/HKD/JPY/CNY）；金额列据此显示，不假设全部为美元。 */
+  currency?: string;
   frozenAmount?: string;
   frozenAsset?: string;
   trailingActivationPrice?: string;

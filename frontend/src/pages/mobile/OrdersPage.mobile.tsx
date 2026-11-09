@@ -55,6 +55,7 @@ function OrderCard({ order, onCancel, onSelect }: {
   const status = getStatusConfig(order.status);
   const isBuy = order.side === 'buy';
   const canCancel = ['pending', 'open', 'partial'].includes(order.status);
+  const currency = (order.currency || 'USD').toUpperCase();
   const fillPercent = parseFloat(order.quantity) > 0
     ? (parseFloat(order.filledQty) / parseFloat(order.quantity)) * 100
     : 0;
@@ -64,7 +65,7 @@ function OrderCard({ order, onCancel, onSelect }: {
       <div className={styles.cardHeader}>
         <div className={styles.symbolRow}>
           <span className={styles.symbolName}>{order.symbol.replace('USDT', '')}</span>
-          <span className={styles.symbolQuote}>/USDT</span>
+          <span className={styles.symbolQuote}>/{currency}</span>
           <span className={`${styles.sideBadge} ${isBuy ? styles.buy : styles.sell}`}>
             {isBuy ? 'BUY' : 'SELL'}
           </span>
@@ -128,6 +129,8 @@ function TradeCard({ fill, order }: {
   order: PaperOrder;
 }) {
   const isBuy = order.side === 'buy';
+  const currency = (fill.feeAsset || order.currency || 'USD').toUpperCase();
+  const currencySymbol = currency === 'HKD' ? 'HK$' : currency === 'JPY' ? '¥' : currency === 'CNY' ? 'CN¥' : '$';
   const value = parseFloat(fill.price) * parseFloat(fill.quantity);
 
   return (
@@ -135,7 +138,7 @@ function TradeCard({ fill, order }: {
       <div className={styles.cardHeader}>
         <div className={styles.symbolRow}>
           <span className={styles.symbolName}>{order.symbol.replace('USDT', '')}</span>
-          <span className={styles.symbolQuote}>/USDT</span>
+          <span className={styles.symbolQuote}>/{currency}</span>
           <span className={`${styles.sideBadge} ${isBuy ? styles.buy : styles.sell}`}>
             {isBuy ? 'BUY' : 'SELL'}
           </span>
@@ -154,7 +157,7 @@ function TradeCard({ fill, order }: {
         </div>
         <div className={styles.tradeItem}>
           <span className={styles.tradeLabel}>Value</span>
-          <span className={`${styles.tradeValue} tabular-nums`}>${value.toFixed(2)}</span>
+          <span className={`${styles.tradeValue} tabular-nums`}>{currencySymbol}{value.toFixed(2)}</span>
         </div>
         <div className={styles.tradeItem}>
           <span className={styles.tradeLabel}>Fee</span>

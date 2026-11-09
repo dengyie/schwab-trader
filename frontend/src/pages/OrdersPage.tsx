@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback } from 'react';
 import { useTradingStore } from '../store/tradingStore';
 import { useAutomationStore } from '../store/automationStore';
 import { useI18n } from '../i18n';
+import { useMarketsStore } from '../store/marketsStore';
 import { Icon, IconName } from '../components/Icon';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import { MobileOrdersPage } from './mobile';
@@ -49,11 +50,13 @@ function formatQuantity(qty: string): string {
   return num.toFixed(6);
 }
 
-// 格式化美元
-function formatUSD(value: number): string {
-  if (value >= 1000000) return `$${(value / 1000000).toFixed(2)}M`;
-  if (value >= 1000) return `$${(value / 1000).toFixed(2)}K`;
-  return `$${value.toFixed(2)}`;
+// 格式化金额 - 使用订单自身的计价币种，而不是假设所有资产都以美元计价。
+function formatMoney(value: number, currency = 'USD'): string {
+  const code = currency.toUpperCase();
+  const symbol = code === 'HKD' ? 'HK$' : code === 'JPY' ? '¥' : code === 'CNY' ? 'CN¥' : '$';
+  if (value >= 1000000) return `${symbol}${(value / 1000000).toFixed(2)}M`;
+  if (value >= 1000) return `${symbol}${(value / 1000).toFixed(2)}K`;
+  return `${symbol}${value.toFixed(2)}`;
 }
 
 // 获取状态显示
@@ -163,6 +166,7 @@ function OrderTableRow({
   const status = getStatusConfig(order.status);
   const canCancel = ['pending', 'open', 'partial'].includes(order.status);
   const isBuy = order.side === 'buy';
+  const currency = (order.currency || 'USD').toUpperCase();
   
   const filledValue = order.fills.reduce((sum, fill) => {
     return sum + parseFloat(fill.price) * parseFloat(fill.quantity);
@@ -180,7 +184,7 @@ function OrderTableRow({
       <td className={styles.symbolCell}>
         <div className={styles.symbolWrapper}>
           <span className={styles.symbolName}>{order.symbol.replace('USDT', '')}</span>
-          <span className={styles.symbolQuote}>/USDT</span>
+          <span className={styles.symbolQuote}>/{currency}</span>
         </div>
       </td>
       <td className={styles.sideCell}>
@@ -215,7 +219,7 @@ function OrderTableRow({
         {order.avgPrice && parseFloat(order.avgPrice) > 0 ? formatPrice(order.avgPrice) : '—'}
       </td>
       <td className={`${styles.valueCell} tabular-nums`}>
-        {filledValue > 0 ? formatUSD(filledValue) : '—'}
+        {filledValue > 0 ? formatMoney(filledValue, currency) : '—'}
       </td>
       <td className={styles.statusCell}>
         <div className={`${styles.statusBadge} ${status.className}`}>
@@ -258,7 +262,9 @@ function TradeTableRow({
   locale?: string;
 }) {
   const isBuy = order.side === 'buy';
+  const currency = (fill.feeAsset || order.currency || 'USD').toUpperCase();
   const value = parseFloat(fill.price) * parseFloat(fill.quantity);
+  const currencySymbol = currency === 'HKD' ? 'HK$' : currency === 'JPY' ? '¥' : currency === 'CNY' ? 'CN¥' : '$';
   
   return (
     <tr className={styles.tradeRow}>
@@ -268,7 +274,7 @@ function TradeTableRow({
       <td className={styles.symbolCell}>
         <div className={styles.symbolWrapper}>
           <span className={styles.symbolName}>{order.symbol.replace('USDT', '')}</span>
-          <span className={styles.symbolQuote}>/USDT</span>
+          <span className={styles.symbolQuote}>/{currency}</span>
         </div>
       </td>
       <td className={styles.sideCell}>
@@ -283,10 +289,10 @@ function TradeTableRow({
         {formatQuantity(fill.quantity)}
       </td>
       <td className={`${styles.valueCell} tabular-nums`}>
-        {formatUSD(value)}
+        {formatMoney(value, currency)}
       </td>
       <td className={`${styles.feeCell} tabular-nums`}>
-        ${parseFloat(fill.fee).toFixed(4)}
+        {currencySymbol}{parseFloat(fill.fee).toFixed(4)}
       </td>
     </tr>
   );
@@ -306,6 +312,8 @@ function OrderDetailDrawer({
   
   const status = getStatusConfig(order.status);
   const isBuy = order.side === 'buy';
+  const currency = (order.currency || 'USD').toUpperCase();
+  const currencySymbol = currency === 'HKD' ? 'HK$' : currency === 'JPY' ? '¥' : currency === 'CNY' ? 'CN¥' : '$';
   const filledValue = order.fills.reduce((sum, fill) => 
     sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
   const totalFee = order.fills.reduce((sum, fill) => sum + parseFloat(fill.fee), 0);
@@ -370,13 +378,13 @@ function OrderDetailDrawer({
             <div className={styles.detailRow}>
               <span className={styles.detailLabel}>Total Value</span>
               <span className={`${styles.detailValue} tabular-nums`}>
-                {filledValue > 0 ? formatUSD(filledValue) : '—'}
+                {filledValue > 0 ? formatMoney(filledValue, currency) : '—'}
               </span>
             </div>
             <div className={styles.detailRow}>
               <span className={styles.detailLabel}>Total Fees</span>
               <span className={`${styles.detailValue} tabular-nums`}>
-                ${totalFee.toFixed(4)}
+                {currencySymbol}{totalFee.toFixed(4)}
               </span>
             </div>
           </div>
@@ -431,21 +439,29 @@ function OrderDetailDrawer({
 
 // 性能分析面板
 function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fill: PaperOrder['fills'][0]; order: PaperOrder }[] }) {
+  const fxRates = useMarketsStore((state) => state.fxRates);
+  const usdPerUnit = (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1;
+  // Each fill is priced in its venue's currency; account totals are reported in
+  // the base currency, so convert per fill instead of adding HKD to USD.
+  const usdValue = (fill: PaperOrder['fills'][0]) =>
+    parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
   // 计算各种统计数据
   const filledOrders = orders.filter(o => o.status === 'filled');
   
   // 按交易对分组
   const bySymbol = useMemo(() => {
-    const map = new Map<string, { volume: number; trades: number; fees: number }>();
+    const map = new Map<string, { volume: number; trades: number; fees: number; currency: string; usdVolume: number }>();
     trades.forEach(({ fill, order }) => {
-      const current = map.get(order.symbol) || { volume: 0, trades: 0, fees: 0 };
+      const currency = (fill.feeAsset || order.currency || 'USD').toUpperCase();
+      const current = map.get(order.symbol) || { volume: 0, trades: 0, fees: 0, currency, usdVolume: 0 };
       current.volume += parseFloat(fill.price) * parseFloat(fill.quantity);
+      current.usdVolume += usdValue(fill);
       current.trades += 1;
       current.fees += parseFloat(fill.fee);
       map.set(order.symbol, current);
     });
-    return Array.from(map.entries()).sort((a, b) => b[1].volume - a[1].volume);
-  }, [trades]);
+    return Array.from(map.entries()).sort((a, b) => b[1].usdVolume - a[1].usdVolume);
+  }, [trades, fxRates]);
 
   // 按日期分组
   const byDate = useMemo(() => {
@@ -453,22 +469,23 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
     trades.forEach(({ fill }) => {
       const date = new Date(fill.time).toLocaleDateString('en-CA'); // YYYY-MM-DD format
       const current = map.get(date) || { volume: 0, trades: 0 };
-      current.volume += parseFloat(fill.price) * parseFloat(fill.quantity);
+      current.volume += usdValue(fill);
       current.trades += 1;
       map.set(date, current);
     });
     return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0])).slice(-7);
-  }, [trades]);
+  }, [trades, fxRates]);
 
   const totalVolume = trades.reduce((sum, { fill }) => 
-    sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
-  const totalFees = trades.reduce((sum, { fill }) => sum + parseFloat(fill.fee), 0);
+    sum + usdValue(fill), 0);
+  const totalFees = trades.reduce(
+    (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
   const avgOrderSize = trades.length > 0 ? totalVolume / trades.length : 0;
   
   // 买卖比例
   const buyVolume = trades
     .filter(({ order }) => order.side === 'buy')
-    .reduce((sum, { fill }) => sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
+    .reduce((sum, { fill }) => sum + usdValue(fill), 0);
   const sellVolume = totalVolume - buyVolume;
   const buyRatio = totalVolume > 0 ? (buyVolume / totalVolume) * 100 : 50;
 
@@ -478,7 +495,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
       <div className={styles.analyticsRow}>
         <div className={styles.analyticsStat}>
           <span className={styles.analyticsLabel}>Total Volume</span>
-          <span className={styles.analyticsValue}>{formatUSD(totalVolume)}</span>
+          <span className={styles.analyticsValue}>{formatMoney(totalVolume)}</span>
         </div>
         <div className={styles.analyticsStat}>
           <span className={styles.analyticsLabel}>Total Trades</span>
@@ -486,7 +503,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
         </div>
         <div className={styles.analyticsStat}>
           <span className={styles.analyticsLabel}>Avg Trade Size</span>
-          <span className={styles.analyticsValue}>{formatUSD(avgOrderSize)}</span>
+          <span className={styles.analyticsValue}>{formatMoney(avgOrderSize)}</span>
         </div>
         <div className={styles.analyticsStat}>
           <span className={styles.analyticsLabel}>Total Fees</span>
@@ -511,8 +528,8 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
             <span className={styles.ratioLabelSell}>Sell {(100 - buyRatio).toFixed(1)}%</span>
           </div>
           <div className={styles.ratioValues}>
-            <span>{formatUSD(buyVolume)}</span>
-            <span>{formatUSD(sellVolume)}</span>
+            <span>{formatMoney(buyVolume)}</span>
+            <span>{formatMoney(sellVolume)}</span>
           </div>
         </div>
 
@@ -526,7 +543,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
                   <span className={styles.symbolName}>{symbol.replace('USDT', '')}</span>
                   <span className={styles.symbolTrades}>{data.trades} trades</span>
                 </div>
-                <span className={styles.symbolVolume}>{formatUSD(data.volume)}</span>
+                <span className={styles.symbolVolume}>{formatMoney(data.volume, data.currency)}</span>
               </div>
             ))}
             {bySymbol.length === 0 && (
@@ -547,7 +564,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
                   <div 
                     className={styles.bar}
                     style={{ height: `${Math.max(height, 4)}%` }}
-                    title={`${date}: ${formatUSD(data.volume)}`}
+                    title={`${date}: ${formatMoney(data.volume)}`}
                   />
                   <span className={styles.barLabel}>
                     {new Date(date).toLocaleDateString('en-US', { weekday: 'short' })}
@@ -603,17 +620,22 @@ export function OrdersPage() {
   const [timeFilter, setTimeFilter] = useState<TimeFilter>('all');
   const [symbolFilter, setSymbolFilter] = useState<string>('all');
   const [sideFilter, setSideFilter] = useState<'all' | 'buy' | 'sell'>('all');
-
-  // Render mobile layout
-  if (isMobile) {
-    return <MobileOrdersPage />;
-  }
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedOrder, setSelectedOrder] = useState<PaperOrder | null>(null);
-  
+
   const orders = useTradingStore((state) => state.orders);
   const cancelOrder = useTradingStore((state) => state.cancelOrder);
   const triggers = useAutomationStore((state) => state.triggers);
+  const currencyOf = useMarketsStore((state) => state.currencyOf);
+  const fxRates = useMarketsStore((state) => state.fxRates);
+
+  const usdPerUnit = (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1;
+
+  // Render mobile layout — after every hook, so the hook order never changes
+  // when the viewport crosses the mobile breakpoint.
+  if (isMobile) {
+    return <MobileOrdersPage />;
+  }
 
   // 时间过滤
   const filterByTime = useCallback((timestamp: number) => {
@@ -666,9 +688,13 @@ export function OrdersPage() {
   const stats = useMemo(() => {
     const filled = orders.filter(o => o.status === 'filled').length;
     const totalTrades = allTrades.length;
+    // Prices are venue-currency; totals are converted to the USD base currency.
+    const usdValue = (fill: PaperOrder['fills'][0]) =>
+      parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
     const totalVolume = allTrades.reduce((sum, { fill }) => 
-      sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
-    const totalFees = allTrades.reduce((sum, { fill }) => sum + parseFloat(fill.fee), 0);
+      sum + usdValue(fill), 0);
+    const totalFees = allTrades.reduce(
+      (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
     const avgFillPrice = totalTrades > 0 
       ? allTrades.reduce((sum, { fill }) => sum + parseFloat(fill.price), 0) / totalTrades 
       : 0;
@@ -677,7 +703,7 @@ export function OrdersPage() {
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
     const recentTrades = allTrades.filter(({ fill }) => fill.time > oneHourAgo);
     const recentVolume = recentTrades.reduce((sum, { fill }) => 
-      sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
+      sum + usdValue(fill), 0);
     
     // 每日交易量趋势
     const dailyVolumes: number[] = [];
@@ -690,7 +716,7 @@ export function OrdersPage() {
       
       const dayVolume = allTrades
         .filter(({ fill }) => fill.time >= dayStart.getTime() && fill.time < dayEnd.getTime())
-        .reduce((sum, { fill }) => sum + parseFloat(fill.price) * parseFloat(fill.quantity), 0);
+        .reduce((sum, { fill }) => sum + usdValue(fill), 0);
       dailyVolumes.push(dayVolume);
     }
 
@@ -705,7 +731,7 @@ export function OrdersPage() {
       dailyVolumes,
       triggerCount: triggers.filter(t => t.enabled).length,
     };
-  }, [orders, allTrades, openOrders.length, triggers]);
+  }, [orders, allTrades, openOrders.length, triggers, fxRates]);
   
   const handleCancel = (clientOrderId: string) => {
     cancelOrder(clientOrderId);
@@ -751,14 +777,14 @@ export function OrdersPage() {
           />
           <StatCard 
             label="Total Volume" 
-            value={formatUSD(stats.totalVolume)} 
+            value={formatMoney(stats.totalVolume)} 
             icon="bar-chart-2"
             sparkData={stats.dailyVolumes}
             sparkColor="blue"
           />
           <StatCard 
             label="1H Volume" 
-            value={formatUSD(stats.recentVolume)} 
+            value={formatMoney(stats.recentVolume)} 
             icon="clock"
           />
           <StatCard 
@@ -838,7 +864,7 @@ export function OrdersPage() {
             >
               <option value="all">All Assets</option>
               {uniqueSymbols.map(s => (
-                <option key={s} value={s}>{s.replace('USDT', '')}/USDT</option>
+                <option key={s} value={s}>{s}/{currencyOf(s)}</option>
               ))}
             </select>
 
