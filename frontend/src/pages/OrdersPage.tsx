@@ -631,12 +631,6 @@ export function OrdersPage() {
 
   const usdPerUnit = (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1;
 
-  // Render mobile layout — after every hook, so the hook order never changes
-  // when the viewport crosses the mobile breakpoint.
-  if (isMobile) {
-    return <MobileOrdersPage />;
-  }
-
   // 时间过滤
   const filterByTime = useCallback((timestamp: number) => {
     if (timeFilter === 'all') return true;
@@ -736,6 +730,13 @@ export function OrdersPage() {
   const handleCancel = (clientOrderId: string) => {
     cancelOrder(clientOrderId);
   };
+
+  // Branch only after every hook above has run. Returning the mobile layout
+  // earlier changed the hook count when the viewport crossed the breakpoint
+  // (React error #310: "rendered more hooks than during the previous render").
+  if (isMobile) {
+    return <MobileOrdersPage />;
+  }
 
   return (
     <div className={styles.container}>

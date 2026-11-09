@@ -29,11 +29,6 @@ interface MarketData {
 export function MarketsPage() {
   const isMobile = useIsMobile();
 
-  // Render mobile layout
-  if (isMobile) {
-    return <MobileMarketsPage />;
-  }
-
   const { t: _t } = useI18n();
   const navigate = useNavigate();
   const [markets, setMarkets] = useState<MarketData[]>([]);
@@ -203,6 +198,13 @@ export function MarketsPage() {
     if (sortField === field) setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc');
     else { setSortField(field); setSortOrder('desc'); }
   };
+
+  // Branch only after every hook above has run. Returning the mobile layout
+  // earlier changed the hook count when the viewport crossed the breakpoint
+  // (React error #310: "rendered more hooks than during the previous render").
+  if (isMobile) {
+    return <MobileMarketsPage />;
+  }
 
   return (
     <div className={styles.container}>
