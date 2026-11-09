@@ -73,3 +73,45 @@ def test_prewarm_loop_does_no_work_while_nobody_is_connected(monkeypatch):
 def test_daily_context_is_not_swept_more_often_than_a_few_minutes():
     assert AlpacaMarketFeedService.SNAPSHOT_TTL >= 120.0
     assert AlpacaMarketFeedService.SNAPSHOT_TTL_CLOSED > AlpacaMarketFeedService.SNAPSHOT_TTL
+
+
+def _utc(stamp: str):
+    from datetime import datetime, timezone
+
+    return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+
+
+def test_fast_open_check_agrees_with_the_full_clock():
+    from app.core.markets import MARKETS, is_market_open, market_clock
+
+    moments = [
+        "2026-11-09T13:00:00",  # before the US open
+        "2026-11-09T15:00:00",  # mid-session
+        "2026-11-09T23:00:00",  # after the close
+        "2026-11-07T15:00:00",  # Saturday
+        "2026-11-08T15:00:00",  # Sunday
+    ]
+    for market in MARKETS.all():
+        for stamp in moments:
+            moment = _utc(stamp)
+            assert is_market_open(market, moment) is market_clock(market, moment)["is_open"], (
+                market.code,
+                stamp,
+            )
+
+
+def test_wall_clock_clock_is_cheap_under_a_tick_storm():
+    import time as _time
+
+    from app.core.markets import MARKETS, is_market_open
+
+    us = MARKETS.require("US")
+    started = _time.perf_counter()
+    for _ in range(20_000):
+        is_market_open(us)
+    per_call_us = (_time.perf_counter() - started) / 20_000 * 1e6
+
+    # Un-memoised this rebuilt ~14 days of sessions (and their ISO strings),
+    # which is what put the worker at 100% CPU; a tick must stay well under
+    # 50us.
+    assert per_call_us < 50, per_call_us

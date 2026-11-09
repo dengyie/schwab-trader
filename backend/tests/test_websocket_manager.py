@@ -42,3 +42,24 @@ def test_disconnect_is_idempotent():
     # Closing an already-removed socket must not raise key errors.
     manager.disconnect(fake_socket)
     manager.disconnect(fake_socket)
+
+
+def test_subscribers_only_counts_authenticated_watchers():
+    manager = WebSocketManager()
+    assert manager.has_subscribers() is False
+
+    # Accepted but not yet trusted: it may never receive a quote.
+    pending = object()
+    manager.active_connections[pending] = {"SPY"}
+    assert manager.has_subscribers() is False
+
+    watcher = object()
+    manager.active_connections[watcher] = set()
+    manager.mark_authenticated(watcher)
+    assert manager.has_subscribers() is False
+
+    manager.subscribe(watcher, "spy")
+    assert manager.has_subscribers() is True
+
+    manager.unsubscribe(watcher, "SPY")
+    assert manager.has_subscribers() is False
