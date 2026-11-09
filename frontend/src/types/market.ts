@@ -21,7 +21,8 @@ export interface OrderBook {
   bids: OrderBookLevel[];  // 买盘，价格降序
   asks: OrderBookLevel[];  // 卖盘，价格升序
   lastUpdateId: number;    // 最后更新ID（用于增量合并校验）
-  localUpdateTime: number; // 本地更新时间
+  localUpdateTime: number; // 本地接收到更新的时间（墙钟 epoch）
+  quoteTime: number;       // 行情源自身的报价时间（墙钟 epoch），收盘后仍是最后一次成交时刻
   isStale: boolean;        // 是否过期（>500ms 未更新）
   depth: number;           // 当前档位深度
 }

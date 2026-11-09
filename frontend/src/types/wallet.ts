@@ -109,7 +109,8 @@ export type LedgerFilter = 'all' | 'deposit' | 'withdraw' | 'trade' | 'fee';
 
 // ===== Performance Metrics =====
 export interface PerformanceMetrics {
-  totalTrades: number;
+  totalTrades: number;      // 已成交笔数 (fills)
+  closedTrades: number;     // 已平仓笔数 (卖出结算)，为 0 时胜率/盈亏比无意义
   winRate: number;          // 胜率 (0-1)
   profitFactor: number;     // 盈亏比
   maxDrawdown: number;      // 最大回撤 %

@@ -11,6 +11,7 @@
  */
 import Decimal from 'decimal.js';
 import type {
+  Fill,
   OCOOrder,
   OrderSide,
   OrderStatus,
@@ -44,6 +45,7 @@ export interface BackendOrderRow {
   filled_qty?: number | string | null;
   filled_avg_price?: number | string | null;
   avg_price?: number | string | null;
+  currency?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -143,6 +145,27 @@ export function reconcilePositions(
 // Orders
 // ---------------------------------------------------------------------------
 
+/**
+ * The broker persists an order's aggregate fill (quantity + average price)
+ * instead of the individual executions. Rebuild the single fill the UI needs
+ * so trade history, PnL statistics and the orders page reflect real activity;
+ * a cancelled order without a fill simply yields no fills.
+ */
+function backendFills(row: BackendOrderRow, backendId: string): Fill[] {
+  const quantity = num(row.filled_quantity ?? row.filled_qty);
+  const price = num(row.filled_avg_price ?? row.avg_price);
+  if (quantity.lte(0) || price.lte(0)) return [];
+
+  return [{
+    fillId: `${backendId}:fill`,
+    price: price.toString(),
+    quantity: quantity.toString(),
+    fee: '0',
+    feeAsset: row.currency || 'USD',
+    time: toTimestamp(row.updated_at ?? row.created_at),
+  }];
+}
+
 export function paperOrderFromBackendRow(row: BackendOrderRow): PaperOrder | null {
   const backendId = row.order_id || row.id;
   if (!backendId || !row.symbol) return null;
@@ -166,7 +189,7 @@ export function paperOrderFromBackendRow(row: BackendOrderRow): PaperOrder | nul
     status: mapBackendStatus(row.status),
     createdAt: toTimestamp(row.created_at),
     updatedAt: toTimestamp(row.updated_at),
-    fills: [],
+    fills: backendFills(row, backendId),
     triggerPrice,
   };
 }

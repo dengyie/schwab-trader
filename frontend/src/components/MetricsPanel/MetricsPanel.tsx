@@ -222,7 +222,7 @@ export function MetricsPanel({ compact = false }: MetricsPanelProps) {
         </span>
         <span className={styles.depthLabel}>{t.dataConfidence?.lastUpdate || 'Update'}:</span>
         <span className={`${styles.depthValue} tabular-nums`}>
-          {new Date(orderBook.localUpdateTime || Date.now()).toLocaleTimeString()}
+          {new Date(orderBook.quoteTime || orderBook.localUpdateTime || Date.now()).toLocaleTimeString()}
         </span>
       </div>
     </div>

@@ -305,6 +305,25 @@ describe('OrderBookManager', () => {
       const orderBook = manager.getOrderBook();
       expect(orderBook.localUpdateTime).toBe(0);
     });
+
+    it('keeps the venue quote time after the local clock moves on', () => {
+      manager.applyQuote({
+        symbol: 'SPY',
+        bid: 500,
+        ask: 500.05,
+        timestamp: '2026-11-06T21:00:00Z',
+      });
+
+      const orderBook = manager.getOrderBook();
+      expect(orderBook.quoteTime).toBe(Date.parse('2026-11-06T21:00:00Z'));
+      // The receive time stays a separate wall-clock value.
+      expect(orderBook.localUpdateTime).toBeGreaterThan(1e12);
+    });
+
+    it('leaves quote time unset when the feed omits a timestamp', () => {
+      manager.applyQuote({ symbol: 'SPY', bid: 500, ask: 500.05, last: 500.02 });
+      expect(manager.getOrderBook().quoteTime).toBe(0);
+    });
   });
 
   describe('stale detection', () => {

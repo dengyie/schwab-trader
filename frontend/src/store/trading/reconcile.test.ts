@@ -103,8 +103,47 @@ describe('reconcileOrders', () => {
     expect(merged[0].avgPrice).toBe('99.5');
   });
 
-  it('imports a broker order that was placed in another session', () => {
-    const merged = reconcileOrders([], [{
+  it('rebuilds the executed fill from a filled broker row', () => {
+    const [filled] = reconcileOrders([], [{
+      order_id: 'ord_3',
+      symbol: 'NVDA',
+      side: 'BUY',
+      order_type: 'MARKET',
+      quantity: 3,
+      status: 'FILLED',
+      filled_quantity: 3,
+      filled_avg_price: 207.47,
+      currency: 'USD',
+      created_at: '2023-11-14T22:13:20.000Z',
+      updated_at: '2023-11-14T22:14:20.000Z',
+    }]);
+
+    expect(filled.status).toBe('filled');
+    expect(filled.fills).toHaveLength(1);
+    expect(filled.fills[0]).toMatchObject({
+      fillId: 'ord_3:fill',
+      quantity: '3',
+      price: '207.47',
+      fee: '0',
+      feeAsset: 'USD',
+    });
+    expect(filled.fills[0].time).toBe(Date.parse('2023-11-14T22:14:20.000Z'));
+  });
+
+  it('keeps no fills for an order the broker never executed', () => {
+    const [open] = reconcileOrders([], [{
+      order_id: 'ord_4',
+      symbol: 'SPY',
+      side: 'BUY',
+      order_type: 'LIMIT',
+      quantity: 2,
+      price: 700,
+    }]);
+
+    expect(open.fills).toEqual([]);
+  });
+
+  it('imports a broker order that was placed in another session', () => {    const merged = reconcileOrders([], [{
       order_id: 'ord_2',
       symbol: '0700.HK',
       side: 'SELL',
