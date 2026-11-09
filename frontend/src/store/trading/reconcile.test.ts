@@ -69,6 +69,29 @@ describe('reconcilePositions', () => {
     });
     expect(next.size).toBe(0);
   });
+
+  it('carries the broker valuation so the overview can price cross-market holdings', () => {
+    const next = reconcilePositions(new Map(), {
+      '0700.HK': {
+        quantity: 100,
+        avg_cost: 400,
+        current_price: 418.4,
+        market_value: 41840,
+        market_value_usd: 5335.78,
+        unrealized_pnl: 1840,
+        unrealized_pnl_usd: 234.65,
+        market: 'HK',
+        currency: 'HKD',
+      },
+    });
+
+    const hk = next.get('0700.HK');
+    expect(hk?.currentPrice).toBe('418.4');
+    expect(hk?.marketValue).toBe('41840');
+    expect(hk?.marketValueUsd).toBe('5335.78');
+    expect(hk?.unrealizedPnlUsd).toBe('234.65');
+    expect(hk?.currency).toBe('HKD');
+  });
 });
 
 describe('reconcileOrders', () => {
