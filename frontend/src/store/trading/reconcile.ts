@@ -25,7 +25,11 @@ export interface BackendPosition {
   symbol?: string;
   quantity?: number | string | null;
   avg_cost?: number | string | null;
+  current_price?: number | string | null;
+  market_value?: number | string | null;
+  market_value_usd?: number | string | null;
   unrealized_pnl?: number | string | null;
+  unrealized_pnl_usd?: number | string | null;
   realized_pnl?: number | string | null;
   market?: string;
   currency?: string;
@@ -131,6 +135,12 @@ export function reconcilePositions(
       // keep the locally known figure across refreshes when it exists.
       realizedPnl: prior?.realizedPnl ?? text(raw.realized_pnl),
       updatedAt: Date.now(),
+      // 券商快照里的估值：展示持仓市值/AI 雷达都要用真实报价，
+      // 不能再用本地拼接的 "SYMBOLUSDT" 行情来估值。
+      currentPrice: text(raw.current_price, prior?.currentPrice),
+      marketValue: text(raw.market_value, prior?.marketValue),
+      marketValueUsd: text(raw.market_value_usd, prior?.marketValueUsd),
+      unrealizedPnlUsd: text(raw.unrealized_pnl_usd, prior?.unrealizedPnlUsd),
       // TP/SL are client-side automation targets, not broker data — they must
       // survive a position refresh for the same symbol.
       takeProfitPrice: prior?.takeProfitPrice,

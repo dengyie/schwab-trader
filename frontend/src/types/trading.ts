@@ -84,6 +84,14 @@ export interface Position {
   /** 所属市场与计价币种：金额列据此显示 HK$/¥/CN¥。 */
   market?: string;
   currency?: string;
+  /** 券商快照里该标的的最近成交价（已折算为本地货币计价）。 */
+  currentPrice?: string;
+  /** 持仓市值 = quantity × currentPrice，计价币种为 currency。 */
+  marketValue?: string;
+  /** 同一市值折算成 USD；跨市场汇总时用它。 */
+  marketValueUsd?: string;
+  /** 未实现盈亏折算成 USD。 */
+  unrealizedPnlUsd?: string;
 }
 
 export interface AccountBalance {

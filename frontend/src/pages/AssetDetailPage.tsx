@@ -1,12 +1,17 @@
-import { useMemo, useState, useCallback, useRef } from 'react';
+import { useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useWalletStore, selectBalances, selectAccount } from '../store/walletStore';
+import {
+  useWalletStore, selectAccount,
+} from '../store/walletStore';
 import { useTradingStore } from '../store/tradingStore';
 import { useWatchlistStore } from '../store/watchlistStore';
 import { useAutomationStore } from '../store/automationStore';
+import { useMarketsStore } from '../store/marketsStore';
 import { useI18n } from '../i18n';
 import { Icon, IconName } from '../components/Icon';
 import { Sparkline } from '../components/Chart/Sparkline';
+import { formatMoney } from '../utils/money';
+import type { Position } from '../types/trading';
 import styles from './AssetDetailPage.module.css';
 import Decimal from 'decimal.js';
 
@@ -26,20 +31,31 @@ function formatPercent(value: number): string {
   return `${prefix}${value.toFixed(2)}%`;
 }
 
+/** 账户汇总一律以 USD 计（券商 base_currency）。 */
+function usd(value: number): string {
+  return formatMoney(value, 'USD');
+}
+
+/** 盈亏带正符号，便于扫读。 */
+function usdSigned(value: number): string {
+  return formatMoney(value, 'USD', { signed: true });
+}
+
 // 增强型投资组合图表组件
 function PortfolioChart({ 
-  data, 
-  color, 
+  data,
+  color,
   height = 100,
-  timeRange 
+  timeRange,
+  fmt
 }: { 
   data: number[]; 
   color: string; 
   height?: number;
   timeRange: TimeRange;
+  fmt: (v: number) => string;
 }) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
   
   if (data.length < 2) return null;
   
@@ -95,19 +111,14 @@ function PortfolioChart({
   const changeValue = endValue - startValue;
   const changePercent = startValue !== 0 ? ((changeValue / startValue) * 100).toFixed(2) : '0.00';
   
-  // 格式化数值
-  const formatValue = (v: number) => {
-    if (v >= 1000000) return `$${(v / 1000000).toFixed(1)}M`;
-    if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`;
-    return `$${v.toFixed(0)}`;
-  };
+  // 格式化数值（币种由调用方传入，美元以外的账户不能套 "$"）
+  const formatValue = fmt;
   
   const hoveredPoint = hoveredIndex !== null ? points[hoveredIndex] : null;
   
   return (
     <div className={styles.portfolioChart}>
       <svg 
-        ref={svgRef}
         width="100%" 
         height="100%"
         viewBox={`0 0 ${chartWidth} ${chartHeight}`}
@@ -452,16 +463,21 @@ export function AssetDetailPage() {
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   
   // Store data
-  const balances = useWalletStore(selectBalances);
   const account = useWalletStore(selectAccount);
+  const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const performanceMetrics = useWalletStore((state) => state.performanceMetrics);
-  const ledger = useWalletStore((state) => state.ledger);
   const positions = useTradingStore((state) => state.positions);
   const orders = useTradingStore((state) => state.orders);
   const triggers = useAutomationStore((state) => state.triggers);
   const executionLogs = useAutomationStore((state) => state.executionLogs);
   const symbols = useWatchlistStore((state) => state.symbols);
   const setSelectedSymbol = useWatchlistStore((state) => state.setSelectedSymbol);
+  const fxRates = useMarketsStore((state) => state.fxRates);
+
+  const usdPerUnit = useCallback(
+    (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1,
+    [fxRates],
+  );
 
   // Helper to get position
   const getPosition = useCallback((symbol: string) => {
@@ -471,49 +487,87 @@ export function AssetDetailPage() {
     return undefined;
   }, [positions]);
 
-  // Processed asset list
+  // 账户持仓（Map 或持久化后的对象都要兼容）
+  const positionList = useMemo<Position[]>(() => {
+    if (!positions) return [];
+    if (positions instanceof Map) return [...positions.values()];
+    return Object.values(positions) as Position[];
+  }, [positions]);
+
+  // 资产列表：现金 + 券商持仓。金额统一折算成 USD 汇总，
+  // 价格列保留标的自己的计价币种。
   const assetList = useMemo(() => {
-    if (!balances) return [];
-    return balances.filter(b => new Decimal(b.total || 0).gt(0) || b.asset === 'USDT').map(balance => {
-      const symbol = `${balance.asset}USDT`;
-      const position = getPosition(symbol);
-      const marketInfo = symbols?.find(s => s.symbol === symbol);
-      
-      const currentPrice = marketInfo?.price || '0';
-      const avgPrice = position?.avgEntryPrice || '0';
-      const priceChange24h = marketInfo?.change24h || 0;
-      
-      let unrealizedPnl = new Decimal(0);
-      let unrealizedPnlPercent = new Decimal(0);
-      
-      if (new Decimal(avgPrice).gt(0) && new Decimal(currentPrice).gt(0)) {
-        const qty = new Decimal(balance.total || 0);
-        unrealizedPnl = qty.times(new Decimal(currentPrice).minus(avgPrice));
-        unrealizedPnlPercent = new Decimal(currentPrice).minus(avgPrice).div(avgPrice).times(100);
-      }
+    const rows: Array<{
+      asset: string;
+      symbol: string;
+      currency: string;
+      total: string;
+      available: string;
+      frozen: string;
+      currentPrice: string;
+      avgPrice: string;
+      priceChange24h: number;
+      unrealizedPnl: number;
+      unrealizedPnlPercent: number;
+      value: number;
+      isCash: boolean;
+      sparklineData: number[];
+    }> = [];
 
-      const value = new Decimal(balance.total || 0).times(balance.asset === 'USDT' ? 1 : currentPrice);
-
-      // Generate mock sparkline data based on price change
-      const sparklineData = Array.from({ length: 24 }, (_, i) => {
-        const base = parseFloat(currentPrice) || 100;
-        const trend = parseFloat(String(priceChange24h)) > 0 ? 1 : -1;
-        return base * (1 - (trend * 0.02 * (24 - i) / 24) + (Math.random() - 0.5) * 0.01);
-      });
-
-      return {
-        ...balance,
-        symbol,
-        currentPrice,
-        avgPrice,
-        priceChange24h,
-        unrealizedPnl: unrealizedPnl.toNumber(),
-        unrealizedPnlPercent: unrealizedPnlPercent.toNumber(),
-        value: value.toNumber(),
-        sparklineData,
-      };
+    const cash = brokerMetrics?.cash ?? 0;
+    rows.push({
+      asset: 'USD',
+      symbol: 'USD',
+      currency: 'USD',
+      total: String(cash),
+      available: String(cash),
+      frozen: '0',
+      currentPrice: '1',
+      avgPrice: '1',
+      priceChange24h: 0,
+      unrealizedPnl: 0,
+      unrealizedPnlPercent: 0,
+      value: cash,
+      isCash: true,
+      sparklineData: [],
     });
-  }, [balances, getPosition, symbols]);
+
+    for (const pos of positionList) {
+      const qty = new Decimal(pos.quantity || 0);
+      if (!qty.gt(0)) continue;
+      const currency = (pos.currency || 'USD').toUpperCase();
+      const fx = usdPerUnit(currency);
+      const priceNative = new Decimal(pos.currentPrice || pos.avgEntryPrice || 0);
+      const avgNative = new Decimal(pos.avgEntryPrice || 0);
+      const valueUsd = pos.marketValueUsd
+        ? new Decimal(pos.marketValueUsd)
+        : qty.times(priceNative).times(fx);
+      const pnlUsd = pos.unrealizedPnlUsd
+        ? new Decimal(pos.unrealizedPnlUsd)
+        : qty.times(priceNative.minus(avgNative)).times(fx);
+      const costUsd = qty.times(avgNative).times(fx);
+      const pnlPct = costUsd.gt(0) ? pnlUsd.div(costUsd).times(100) : new Decimal(0);
+
+      rows.push({
+        asset: pos.symbol,
+        symbol: pos.symbol,
+        currency,
+        total: qty.toString(),
+        available: qty.toString(),
+        frozen: '0',
+        currentPrice: priceNative.toString(),
+        avgPrice: avgNative.toString(),
+        priceChange24h: 0,
+        unrealizedPnl: pnlUsd.toNumber(),
+        unrealizedPnlPercent: pnlPct.toNumber(),
+        value: valueUsd.toNumber(),
+        isCash: false,
+        sparklineData: [],
+      });
+    }
+
+    return rows;
+  }, [brokerMetrics, positionList, usdPerUnit]);
 
   // Filtered and sorted asset list
   const filteredAssets = useMemo(() => {
@@ -534,106 +588,68 @@ export function AssetDetailPage() {
     });
   }, [assetList, searchQuery, sortField, sortOrder]);
 
-  // Portfolio totals with enhanced metrics
+  // Portfolio totals: the broker snapshot is the single source of truth.
+  // 汇总一律用 USD：港股/日股/A 股的市值不能直接和美元现金相加。
   const totals = useMemo(() => {
-    const totalValue = assetList.reduce((acc, asset) => acc + asset.value, 0);
-    const totalUnrealizedPnl = assetList.reduce((acc, asset) => acc + asset.unrealizedPnl, 0);
-    
-    // Calculate realized P&L from all positions
-    let totalRealizedPnl = 0;
-    if (positions instanceof Map) {
-      positions.forEach((pos) => {
-        if (pos && pos.realizedPnl) {
-          totalRealizedPnl += parseFloat(pos.realizedPnl);
-        }
-      });
-    } else if (typeof positions === 'object' && positions !== null) {
-      Object.values(positions).forEach((pos: any) => {
-        if (pos && pos.realizedPnl) {
-          totalRealizedPnl += parseFloat(pos.realizedPnl);
-        }
-      });
-    }
-    
+    const totalValue = brokerMetrics?.totalEquity
+      ?? assetList.reduce((acc, asset) => acc + asset.value, 0);
+    const availableBalance = brokerMetrics?.cash
+      ?? (assetList.find(a => a.isCash)?.value ?? 0);
+    const positionValue = brokerMetrics?.positionValue
+      ?? (totalValue - availableBalance);
+    const totalUnrealizedPnl = brokerMetrics?.unrealizedPnl
+      ?? assetList.reduce((acc, asset) => acc + asset.unrealizedPnl, 0);
+    const totalRealizedPnl = brokerMetrics?.realizedPnl ?? 0;
+
     // Total P&L (realized + unrealized)
     const totalPnl = totalRealizedPnl + totalUnrealizedPnl;
-    
-    // Available balance (USDT)
-    const usdtBalance = balances?.find(b => b.asset === 'USDT');
-    const availableBalance = parseFloat(usdtBalance?.available || '0');
-    
-    // Position value (total value minus USDT)
-    const usdtValue = parseFloat(usdtBalance?.total || '0');
-    const positionValue = totalValue - usdtValue;
-    
-    // Calculate initial capital from ledger (sum of all deposits)
-    const initialCapital = ledger
-      .filter(entry => entry.type === 'DEPOSIT' && entry.asset === 'USDT')
-      .reduce((sum, entry) => sum + parseFloat(entry.amount), 0);
-    // Fallback to 400000 if no deposits found (initial grant)
-    const baseCapital = initialCapital > 0 ? initialCapital : 400000;
-    const roi = baseCapital > 0 ? ((totalValue - baseCapital) / baseCapital) * 100 : 0;
-    
-    // P&L percentage
-    const pnlPercent = totalValue > 0 ? (totalPnl / (totalValue - totalPnl)) * 100 : 0;
-    
-    // Calculate 24h change (weighted average)
-    const totalChange24h = assetList.reduce((acc, asset) => {
-      const weight = asset.value / (totalValue || 1);
-      return acc + (parseFloat(String(asset.priceChange24h)) * weight);
-    }, 0);
-    
-    return { 
-      totalValue, 
+
+    // ROI 用券商口径（以初始资金为分母）；没有快照时才退回自算。
+    const initialCapital = brokerMetrics?.initialCapital ?? 0;
+    const roi = brokerMetrics?.totalPnlPct
+      ?? (initialCapital > 0 ? (totalPnl / initialCapital) * 100 : 0);
+
+    // P&L percentage against the cost basis implied by the current equity.
+    const pnlPercent = totalValue > 0 && totalValue - totalPnl > 0
+      ? (totalPnl / (totalValue - totalPnl)) * 100
+      : 0;
+
+    return {
+      totalValue,
       totalUnrealizedPnl,
       totalRealizedPnl,
-      totalPnl, 
-      pnlPercent, 
-      totalChange24h,
+      totalPnl,
+      pnlPercent,
+      totalChange24h: 0,
       availableBalance,
       positionValue,
       roi,
     };
-  }, [assetList, positions, balances]);
+  }, [assetList, brokerMetrics]);
 
-  // Portfolio history data (simulated)
-  const portfolioHistoryData = useMemo(() => {
-    const base = totals.totalValue;
-    const points = timeRange === '1D' ? 24 : timeRange === '7D' ? 7 * 24 : timeRange === '30D' ? 30 : 90;
-    const history: number[] = [];
-    let current = base * 0.85;
-    
-    for (let i = 0; i < points; i++) {
-      const change = (Math.random() - 0.45) * (base * 0.02);
-      current += change;
-      history.push(current);
-    }
-    history[points - 1] = base;
-    return history;
-  }, [totals.totalValue, timeRange]);
+  // 券商不提供逐日净值曲线；没有真实历史就不要用随机数伪造走势。
+  const portfolioHistoryData = useMemo<number[]>(() => [], []);
 
-  // Trading stats
+  // Trading stats. 成交额按标的币种换算成 USD，否则港币/日元成交会被
+  // 当成美元累加；价格同样优先用券商快照，本地行情只是回退。
   const tradingStats = useMemo(() => {
     const filledOrders = orders.filter(o => o.status === 'filled');
     const openOrders = orders.filter(o => ['pending', 'open', 'partial'].includes(o.status));
     const activeTriggers = triggers.filter(t => t.enabled && t.status === 'armed');
     
     // Calculate position count
-    let positionCount = 0;
-    if (positions instanceof Map) {
-      positions.forEach((pos) => {
-        if (pos && parseFloat(pos.quantity) > 0) positionCount++;
-      });
-    }
+    const positionCount = positionList.filter(pos => parseFloat(pos.quantity) > 0).length;
     
-    // Calculate 24h volume
+    // Calculate 24h volume (USD)
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-    const recentTrades = orders
+    const volume24h = orders
       .filter(o => o.fills.length > 0)
-      .flatMap(o => o.fills)
-      .filter(f => f.time > oneDayAgo);
-    const volume24h = recentTrades.reduce((sum, f) => 
-      sum + parseFloat(f.price) * parseFloat(f.quantity), 0);
+      .flatMap(o => o.fills.map(f => ({ fill: f, currency: o.currency })))
+      .filter(({ fill }) => fill.time > oneDayAgo)
+      .reduce((sum, { fill, currency }) => {
+        const fx = currency ? usdPerUnit(currency) : 1;
+        return sum + parseFloat(fill.price) * parseFloat(fill.quantity) * fx;
+      }, 0);
     
     // Win rate calculation
     const tradesWithPnl = filledOrders.filter(o => {
@@ -641,12 +657,13 @@ export function AssetDetailPage() {
       return pos && parseFloat(pos.avgEntryPrice) > 0;
     });
     const winningTrades = tradesWithPnl.filter(o => {
-      // Simplified: if buy and current price > order price, it's winning
-      const marketInfo = symbols?.find(s => s.symbol === o.symbol);
-      if (!marketInfo) return false;
-      const currentPrice = parseFloat(marketInfo.price || '0');
-      const orderPrice = parseFloat(o.avgPrice || o.price || '0');
-      return o.side === 'buy' ? currentPrice > orderPrice : currentPrice < orderPrice;
+      const pos = getPosition(o.symbol);
+      if (!pos) return false;
+      // 持仓的盈亏是券商按最新价算好的（原始币种）；用已实现盈亏占比拆出
+      // 「按当前价卖出是否盈利」并不成立，因此逐单只判断方向：
+      // buy 在价格上涨后算盈利，sell 在没有未实现亏损时算盈利。
+      const unrealized = parseFloat(pos.unrealizedPnl || '0');
+      return o.side === 'buy' ? unrealized > 0 : unrealized <= 0;
     });
     const winRate = tradesWithPnl.length > 0 
       ? (winningTrades.length / tradesWithPnl.length) * 100 
@@ -654,7 +671,7 @@ export function AssetDetailPage() {
     
     // Best performing asset
     const bestAsset = assetList
-      .filter(a => a.unrealizedPnlPercent !== 0)
+      .filter(a => !a.isCash && a.unrealizedPnlPercent !== 0)
       .sort((a, b) => b.unrealizedPnlPercent - a.unrealizedPnlPercent)[0];
     
     return {
@@ -666,7 +683,7 @@ export function AssetDetailPage() {
       winRate,
       bestAsset,
     };
-  }, [orders, triggers, positions, assetList, getPosition, symbols]);
+  }, [orders, triggers, positionList, assetList, getPosition, usdPerUnit]);
 
   // Recent activity
   const recentActivity = useMemo(() => {
@@ -689,9 +706,9 @@ export function AssetDetailPage() {
         activities.push({
           type: 'trade',
           title: `${o.side.toUpperCase()} ${o.symbol.replace('USDT', '')}`,
-          description: `${parseFloat(o.filledQty).toFixed(6)} @ ${formatNumber(parseFloat(o.avgPrice || '0'))}`,
+          description: `${parseFloat(o.filledQty).toFixed(6)} @ ${formatMoney(parseFloat(o.avgPrice || '0'), o.currency)}`,
           time: o.updatedAt,
-          value: formatNumber(value),
+          value: formatMoney(value, o.currency),
           isPositive: o.side === 'sell',
         });
       });
@@ -713,30 +730,23 @@ export function AssetDetailPage() {
       .slice(0, 6);
   }, [orders, executionLogs]);
 
-  // Market data for BTC and ETH
+  // 市场概览：用自选里的美股指数（SPY/QQQ），不再展示不存在的 BTC/ETH。
   const marketData = useMemo(() => {
-    const btc = symbols?.find(s => s.symbol === 'BTCUSDT');
-    const eth = symbols?.find(s => s.symbol === 'ETHUSDT');
-    
-    return {
-      btc: {
-        price: btc?.price || '0',
-        change: btc?.change24h || 0,
-        sparkline: Array.from({ length: 24 }, () => 
-          parseFloat(btc?.price || '95000') * (1 + (Math.random() - 0.5) * 0.02)),
-      },
-      eth: {
-        price: eth?.price || '0',
-        change: eth?.change24h || 0,
-        sparkline: Array.from({ length: 24 }, () => 
-          parseFloat(eth?.price || '3400') * (1 + (Math.random() - 0.5) * 0.02)),
-      },
+    const card = (symbol: string) => {
+      const row = symbols?.find(s => s.symbol === symbol);
+      const price = parseFloat(row?.price || '0');
+      return {
+        symbol,
+        price: row?.price || '0',
+        change: row?.change24h || 0,
+        sparkline: [] as number[],
+      };
     };
+    return { spy: card('SPY'), qqq: card('QQQ') };
   }, [symbols]);
 
   // Handlers
-  const handleTrade = (asset: string) => {
-    const symbol = `${asset}USDT`;
+  const handleTrade = (symbol: string) => {
     setSelectedSymbol(symbol);
     navigate('/trade');
   };
@@ -784,10 +794,10 @@ export function AssetDetailPage() {
           </div>
           
           <div className={styles.portfolioMeta}>
-            <div className={`${styles.changeIndicator} ${totals.totalChange24h >= 0 ? styles.positive : styles.negative}`}>
-              <Icon name={totals.totalChange24h >= 0 ? 'trending-up' : 'trending-down'} size="xs" />
-              <span>{formatPercent(totals.totalChange24h)}</span>
-              <span className={styles.changeLabel}>24h</span>
+            <div className={`${styles.changeIndicator} ${totals.totalPnl >= 0 ? styles.positive : styles.negative}`}>
+              <Icon name={totals.totalPnl >= 0 ? 'trending-up' : 'trending-down'} size="xs" />
+              <span>{formatPercent(totals.pnlPercent)}</span>
+              <span className={styles.changeLabel}>on cost</span>
             </div>
             <div className={styles.pnlIndicator}>
               <span className={`${styles.pnlValue} ${totals.totalPnl >= 0 ? styles.positive : styles.negative}`}>
@@ -810,7 +820,7 @@ export function AssetDetailPage() {
                 <Icon name="wallet" size="xs" />
               </div>
               <div className={styles.metricContent}>
-                <span className={styles.metricValue}>${totals.availableBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className={styles.metricValue}>{usd(totals.availableBalance)}</span>
                 <span className={styles.metricLabel}>Available Balance</span>
               </div>
             </div>
@@ -820,7 +830,7 @@ export function AssetDetailPage() {
                 <Icon name="layers" size="xs" />
               </div>
               <div className={styles.metricContent}>
-                <span className={styles.metricValue}>${totals.positionValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className={styles.metricValue}>{usd(totals.positionValue)}</span>
                 <span className={styles.metricLabel}>Position Value</span>
               </div>
             </div>
@@ -831,7 +841,7 @@ export function AssetDetailPage() {
               </div>
               <div className={styles.metricContent}>
                 <span className={`${styles.metricValue} ${totals.totalRealizedPnl >= 0 ? styles.positive : styles.negative}`}>
-                  {totals.totalRealizedPnl >= 0 ? '+' : ''}${totals.totalRealizedPnl.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {usdSigned(totals.totalRealizedPnl)}
                 </span>
                 <span className={styles.metricLabel}>Realized P&L</span>
               </div>
@@ -843,7 +853,7 @@ export function AssetDetailPage() {
               </div>
               <div className={styles.metricContent}>
                 <span className={`${styles.metricValue} ${totals.totalUnrealizedPnl >= 0 ? styles.positive : styles.negative}`}>
-                  {totals.totalUnrealizedPnl >= 0 ? '+' : ''}${totals.totalUnrealizedPnl.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {usdSigned(totals.totalUnrealizedPnl)}
                 </span>
                 <span className={styles.metricLabel}>Unrealized P&L</span>
               </div>
@@ -896,25 +906,36 @@ export function AssetDetailPage() {
         <div className={styles.heroChart}>
           <div className={styles.chartHeader}>
             <span className={styles.chartTitle}>Portfolio Growth</span>
-            <div className={styles.timeRangeSelector}>
-              {(['1D', '7D', '30D', 'ALL'] as TimeRange[]).map(range => (
-                <button
-                  key={range}
-                  className={`${styles.timeRangeBtn} ${timeRange === range ? styles.active : ''}`}
-                  onClick={() => setTimeRange(range)}
-                >
-                  {range}
-                </button>
-              ))}
-            </div>
+            {portfolioHistoryData.length >= 2 && (
+              <div className={styles.timeRangeSelector}>
+                {(['1D', '7D', '30D', 'ALL'] as TimeRange[]).map(range => (
+                  <button
+                    key={range}
+                    className={`${styles.timeRangeBtn} ${timeRange === range ? styles.active : ''}`}
+                    onClick={() => setTimeRange(range)}
+                  >
+                    {range}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div className={styles.chartContainer}>
-            <PortfolioChart 
-              data={portfolioHistoryData} 
-              color={totals.totalPnl >= 0 ? 'var(--color-success)' : 'var(--color-error)'}
-              height={120}
-              timeRange={timeRange}
-            />
+            {portfolioHistoryData.length >= 2 ? (
+              <PortfolioChart 
+                data={portfolioHistoryData} 
+                color={totals.totalPnl >= 0 ? 'var(--color-success)' : 'var(--color-error)'}
+                height={120}
+                timeRange={timeRange}
+                fmt={(v) => formatMoney(v, 'USD', { decimals: 0 })}
+              />
+            ) : (
+              // 券商不返回净值曲线；宁可留空也不画一条随机生成的假走势。
+              <div className={styles.chartEmpty}>
+                <Icon name="bar-chart-2" size="lg" />
+                <span>Equity history is not recorded by the venue yet.</span>
+              </div>
+            )}
           </div>
         </div>
         
@@ -945,20 +966,20 @@ export function AssetDetailPage() {
         </div>
         <div className={styles.marketCards}>
           <MarketCard
-            symbol="BTC"
-            name="Bitcoin"
-            price={parseFloat(marketData.btc.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            change={parseFloat(String(marketData.btc.change))}
-            sparklineData={marketData.btc.sparkline}
-            onClick={() => handleTrade('BTC')}
+            symbol="SPY"
+            name="S&P 500 ETF"
+            price={parseFloat(marketData.spy.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            change={parseFloat(String(marketData.spy.change))}
+            sparklineData={marketData.spy.sparkline}
+            onClick={() => handleTrade('SPY')}
           />
           <MarketCard
-            symbol="ETH"
-            name="Ethereum"
-            price={parseFloat(marketData.eth.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            change={parseFloat(String(marketData.eth.change))}
-            sparklineData={marketData.eth.sparkline}
-            onClick={() => handleTrade('ETH')}
+            symbol="QQQ"
+            name="Nasdaq 100 ETF"
+            price={parseFloat(marketData.qqq.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            change={parseFloat(String(marketData.qqq.change))}
+            sparklineData={marketData.qqq.sparkline}
+            onClick={() => handleTrade('QQQ')}
           />
         </div>
       </section>
@@ -1049,7 +1070,6 @@ export function AssetDetailPage() {
                     P&L
                     {sortField === 'pnl' && <Icon name={sortOrder === 'desc' ? 'chevron-down' : 'chevron-up'} size="xs" />}
                   </th>
-                  <th>24h</th>
                   <th></th>
                 </tr>
               </thead>
@@ -1060,7 +1080,7 @@ export function AssetDetailPage() {
                     : 0;
                   
                   return (
-                    <tr key={asset.asset}>
+                    <tr key={asset.symbol}>
                       <td>
                         <div className={styles.assetCell}>
                           <div className={styles.assetIcon}>{asset.asset[0]}</div>
@@ -1071,36 +1091,31 @@ export function AssetDetailPage() {
                         </div>
                       </td>
                       <td className={styles.numericCell}>
-                        <span className={styles.balanceValue}>{parseFloat(asset.total).toFixed(asset.asset === 'USDT' ? 2 : 6)}</span>
+                        <span className={styles.balanceValue}>{parseFloat(asset.total).toFixed(asset.isCash ? 2 : 6)}</span>
                       </td>
                       <td className={styles.numericCell}>
-                        <span className={styles.valueAmount}>${asset.value.toFixed(2)}</span>
+                        <span className={styles.valueAmount}>{usd(asset.value)}</span>
                       </td>
                       <td className={styles.numericCell}>
-                        {asset.asset !== 'USDT' ? (
-                          <span className={styles.priceValue}>${parseFloat(asset.currentPrice).toFixed(2)}</span>
-                        ) : '—'}
+                        {asset.isCash ? '—' : (
+                          <span className={styles.priceValue}>
+                            {formatMoney(parseFloat(asset.currentPrice), asset.currency)}
+                          </span>
+                        )}
                       </td>
                       <td className={styles.numericCell}>
                         {asset.unrealizedPnl !== 0 ? (
                           <div className={`${styles.pnlCell} ${asset.unrealizedPnl >= 0 ? styles.positive : styles.negative}`}>
-                            <span>{asset.unrealizedPnl >= 0 ? '+' : ''}${asset.unrealizedPnl.toFixed(2)}</span>
+                            <span>{usdSigned(asset.unrealizedPnl)}</span>
                             <span className={styles.pnlPercent}>{formatPercent(asset.unrealizedPnlPercent)}</span>
                           </div>
                         ) : '—'}
                       </td>
                       <td>
-                        {asset.asset !== 'USDT' && (
-                          <div className={styles.sparklineCell}>
-                            <Sparkline data={asset.sparklineData} width={60} height={24} lineWidth={1} />
-                          </div>
-                        )}
-                      </td>
-                      <td>
-                        {asset.asset !== 'USDT' && (
+                        {!asset.isCash && (
                           <button 
                             className={styles.tradeBtn}
-                            onClick={() => handleTrade(asset.asset)}
+                            onClick={() => handleTrade(asset.symbol)}
                           >
                             Trade
                           </button>

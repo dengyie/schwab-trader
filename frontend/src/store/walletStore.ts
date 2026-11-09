@@ -52,6 +52,10 @@ export interface BrokerMetrics {
   positionValue: number | null;
   unrealizedPnl: number | null;
   realizedPnl: number | null;
+  /** 券商给的初始资金；总收益百分比以它为分母。 */
+  initialCapital: number | null;
+  /** 券商口径的总收益百分比（已按初始资金计算）。 */
+  totalPnlPct: number | null;
 }
 
 export interface AccountTotals {
@@ -184,6 +188,8 @@ export const useWalletStore = create<WalletState>()(
           unrealized_pnl?: number;
           realized_pnl?: number;
           positions?: Record<string, any>;
+          initial_capital?: number;
+          total_pnl_pct?: number;
         }) => {
           const state = get();
           const cashStr = (data.cash ?? 0).toFixed(2);
@@ -242,6 +248,8 @@ export const useWalletStore = create<WalletState>()(
               positionValue: data.market_value ?? ((data.total_equity ?? data.cash ?? 0) - (data.cash ?? 0)),
               unrealizedPnl: data.unrealized_pnl ?? null,
               realizedPnl: data.realized_pnl ?? null,
+              initialCapital: data.initial_capital ?? null,
+              totalPnlPct: data.total_pnl_pct ?? null,
             },
           });
         },
