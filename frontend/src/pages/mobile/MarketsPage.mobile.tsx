@@ -272,7 +272,7 @@ export function MobileMarketsPage() {
               <div className={styles.assetInfo}>
                 <span className={styles.assetName}>{parseSymbol(market.symbol).base}</span>
                 <div className={styles.assetQuoteRow}>
-                  <span className={styles.assetQuote}>/USDT</span>
+                  <span className={styles.assetQuote}>/{market.ticker?.currency ?? parseSymbol(market.symbol).quote}</span>
                   <span className={styles.volume}>
                     Vol: {market.ticker ? formatVolume(market.ticker.quoteVolume24h) : '—'}
                   </span>

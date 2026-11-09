@@ -116,4 +116,16 @@ describe('resolveAccountTotals - one account total for every panel', () => {
     expect(usd?.total).toBe('0');
     expect(resolveAccountTotals(null, usd)).toEqual({ totalEquity: 0, cash: 0 });
   });
+
+  it('treats a broker-funded account as provisioned without the onboarding click', () => {
+    // A browser that never pressed "Initialize wallet" still owns a funded
+    // broker account: the local account record is only a placeholder.
+    expect(useWalletStore.getState().getOnboardingStage()).toBe('not_created');
+
+    useWalletStore.getState().syncFromBackendPortfolio({ cash: 190000, total_equity: 195846.87 });
+
+    expect(useWalletStore.getState().account).toBeNull();
+    const st = useWalletStore.getState();
+    expect(st.getOnboardingStage()).toBe("funded");
+  });
 });
