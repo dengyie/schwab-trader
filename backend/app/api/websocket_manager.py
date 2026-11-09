@@ -38,6 +38,16 @@ class WebSocketManager:
     def is_authenticated(self, websocket: WebSocket) -> bool:
         return websocket in self._authenticated
 
+    def has_subscribers(self) -> bool:
+        """True while some trusted client is streaming at least one symbol.
+
+        Background work (chart prewarming, broadcast serialisation) is only
+        worth doing for a client that is actually watching something.
+        """
+        return any(
+            self.active_connections.get(ws) for ws in self._authenticated
+        )
+
     async def close(self, websocket: WebSocket, code: int = 1000, reason: str = "") -> None:
         """Close and forget a connection that must be refused (e.g. bad auth)."""
         self.disconnect(websocket)

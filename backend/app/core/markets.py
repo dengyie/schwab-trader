@@ -9,6 +9,8 @@ REST API, the websocket handler and the matching engine.
 """
 from __future__ import annotations
 
+import functools
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Optional, Iterable
@@ -418,10 +420,26 @@ def market_clock(market: MarketDef, now: Optional[datetime] = None) -> dict:
     modelled: a holiday behaves like a quiet session (no quotes, no fills)
     rather than risking a hard-coded calendar that wrongly reports the market
     shut on a real trading day.
+
+    The wall-clock form is memoised per 5s bucket: every symbol in the catalog
+    lives in the same two sessions, and without it each incoming tick rebuilds
+    fourteen days of windows plus their ISO strings. An explicit ``now`` is
+    never cached. Callers get their own copy of the dict.
     """
-    moment = now or datetime.now(timezone.utc)
+    if now is None:
+        return dict(_market_clock_cached(market, int(time.time() // 5)))
+    moment = now
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
+    return _render_clock(market, moment)
+
+
+@functools.lru_cache(maxsize=32)
+def _market_clock_cached(market: MarketDef, _bucket: int) -> dict:
+    return _render_clock(market, datetime.now(timezone.utc))
+
+
+def _render_clock(market: MarketDef, moment: datetime) -> dict:
     tz = ZoneInfo(market.timezone)
     local = moment.astimezone(tz)
     today = local.date()
@@ -464,8 +482,30 @@ def market_clock(market: MarketDef, now: Optional[datetime] = None) -> dict:
     }
 
 
+def _is_open_between(market: MarketDef, local: datetime, day: date) -> bool:
+    """True while ``local`` falls inside one of ``day``'s sessions.
+
+    Same weekday rule as ``_upcoming_sessions`` (the one ``market_clock``
+    uses), so the two can never disagree about whether a day trades.
+    """
+    if day.weekday() not in WEEKDAYS_MON_FRI:
+        return False
+    tz = ZoneInfo(market.timezone)
+    for session in market.sessions:
+        if _session_start(day, session, tz) <= local < _session_end(day, session, tz):
+            return True
+    return False
+
+
 def is_market_open(market: MarketDef, now: Optional[datetime] = None) -> bool:
-    return market_clock(market, now)["is_open"]
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    # Only the local date is needed: build it directly instead of rendering
+    # fourteen days of sessions into ISO strings (``market_clock``) for every
+    # incoming tick.
+    local = moment.astimezone(ZoneInfo(market.timezone))
+    return _is_open_between(market, local, local.date())
 
 
 def local_date(market: MarketDef, now: Optional[datetime] = None) -> str:

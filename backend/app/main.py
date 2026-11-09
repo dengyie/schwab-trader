@@ -147,9 +147,7 @@ ws_manager = WebSocketManager()
 # chart. Hand the feed a presence check instead of letting it re-parse the
 # same multi-thousand-bar payloads for an empty server.
 if hasattr(us_feed, "subscriber_probe"):
-    us_feed.subscriber_probe = lambda: any(
-        bool(symbols) for symbols in ws_manager.active_connections.values()
-    )
+    us_feed.subscriber_probe = ws_manager.has_subscribers
 
 logger = logging.getLogger("app.main")
 
@@ -167,14 +165,22 @@ def _schedule_coro(coro) -> None:
 def on_feed_quote(quote: Quote) -> None:
     # Feed quote into execution broker & mark-to-market
     broker.on_quote(quote)
+    # Nobody subscribed (or only unauthenticated sockets): skip serialising and
+    # scheduling a broadcast that would be dropped anyway.
+    if not ws_manager.has_subscribers():
+        return
     _schedule_coro(ws_manager.broadcast_quote(quote.model_dump(mode="json")))
 
 
 def on_feed_bar(symbol: str, bar: Bar) -> None:
+    if not ws_manager.has_subscribers():
+        return
     _schedule_coro(ws_manager.broadcast_bar(symbol, bar.model_dump(mode="json")))
 
 
 def on_feed_trade(trade: Trade) -> None:
+    if not ws_manager.has_subscribers():
+        return
     _schedule_coro(ws_manager.broadcast_trade(trade.model_dump(mode="json")))
 
 

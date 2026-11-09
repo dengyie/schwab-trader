@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on cached (symbol, timeframe) bar entries; evicts oldest first.
 MAX_CACHE_ENTRIES = 300
+# Maximum fan-out rate for streamed quotes (matches the websocket manager's
+# 40ms conflation). IEX prints far faster than any screen can redraw.
+QUOTE_EMIT_SECONDS = 0.04
 
 
 class AlpacaMarketFeedService:
@@ -103,6 +106,10 @@ class AlpacaMarketFeedService:
         # Optional callable returning True while a client is subscribed to a
         # symbol. ``main`` attaches it; None keeps background prewarming on.
         self.subscriber_probe: Optional[Callable[[], bool]] = None
+        # Fan-out throttle: the UI consumes quotes at ~25 FPS (40ms), so a
+        # per-symbol emit window keeps the tick loop from re-decorating and
+        # re-serialising every IEX print. ``latest_quotes`` is always updated.
+        self._last_quote_emit: Dict[str, float] = {}
 
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
@@ -538,14 +545,25 @@ class AlpacaMarketFeedService:
 
                             # Quote tick
                             elif t_type == "q":
+                                # Conflate at the source. Parsing, decorating,
+                                # storing and scheduling a broadcast per IEX
+                                # print kept a core busy all session while the
+                                # UI can only consume ~25 FPS; anything inside
+                                # the 40ms window is dropped (the next print
+                                # carries the same or newer book).
+                                now_tick = time.monotonic()
+                                if now_tick - self._last_quote_emit.get(sym, 0.0) < QUOTE_EMIT_SECONDS:
+                                    continue
+                                self._last_quote_emit[sym] = now_tick
+
                                 last_p = self.last_trade_prices.get(sym)
                                 quote = AlpacaDataAdapter.parse_stream_quote(item, last_price=last_p)
                                 if quote:
-                                    quote = self._decorate_daily(quote) or quote
-                                    self.latest_quotes[sym] = quote
+                                    decorated = self._decorate_daily(quote) or quote
+                                    self.latest_quotes[sym] = decorated
                                     for listener in self.quote_listeners:
                                         try:
-                                            listener(quote)
+                                            listener(decorated)
                                         except Exception:
                                             pass
 
