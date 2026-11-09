@@ -108,6 +108,10 @@ class Order(BaseModel):
     filled_avg_price: float = 0.0
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    # When the venue (or the virtual matcher) actually executed the fill. Kept
+    # separate from updated_at, which also moves on cancels/status refreshes and
+    # therefore cannot date a trade.
+    filled_at: Optional[datetime] = None
     reject_reason: Optional[str] = None
 
 

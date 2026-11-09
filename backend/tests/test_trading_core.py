@@ -34,6 +34,9 @@ def test_portfolio_ledger_buy_and_sell():
     )
     assert order.status == OrderStatus.FILLED
     assert order.filled_avg_price == 150.2  # Filled at ask
+    # The fill's execution time is recorded separately from updated_at.
+    assert order.filled_at is not None
+    assert order.filled_at >= order.created_at
     assert ledger.portfolio.cash == round(10000.0 - (10 * 150.2), 4)
 
     pos = ledger.get_position("AAPL")

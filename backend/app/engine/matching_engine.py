@@ -398,6 +398,7 @@ class VirtualMatchingEngine(BaseBroker):
                 order.filled_quantity += trade_qty
                 order.filled_avg_price = fill_price
                 order.status = OrderStatus.FILLED
+                order.filled_at = order.filled_at or utc_now()
                 order.updated_at = utc_now()
                 self._mark_dirty()
 

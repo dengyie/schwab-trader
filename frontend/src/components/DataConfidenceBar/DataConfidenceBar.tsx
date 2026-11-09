@@ -19,9 +19,11 @@ export function DataConfidenceBar() {
 
   // While the venue is closed, WS messages are just keepalives/snapshots: the
   // honest "last update" is the quote's own timestamp, which stays frozen at
-  // the closing print instead of dancing with the local clock.
-  const displayTimestamp = isClosed && orderBook?.quoteTime
-    ? orderBook.quoteTime
+  // the closing print instead of dancing with the local clock. Without a venue
+  // timestamp there is nothing honest to show, so render "—" rather than the
+  // receive time of a keepalive.
+  const displayTimestamp = isClosed
+    ? (orderBook?.quoteTime ?? 0)
     : connectionStatus.lastMessageTime;
 
   useEffect(() => {
