@@ -58,14 +58,21 @@ class MultiMarketFeed:
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
 
-    def ensure_daily_stats(self, market: Optional[str] = None) -> None:
-        """Warm the daily context for a whole market, at most one upstream call."""
+    def ensure_daily_stats(
+        self, market: Optional[str] = None, symbols: Optional[List[str]] = None
+    ) -> None:
+        """Warm the daily context for a whole market, at most one upstream call.
+
+        ``symbols`` lets a caller warm exactly the rows it is about to serve
+        (a watchlist can hold names outside the catalog); without it the market
+        catalog is used.
+        """
         feed = self._us if (market or self._us_code).upper() == self._us_code else self._intl
         warmer = getattr(feed, "ensure_daily_stats", None)
         if not callable(warmer):
             return
         try:
-            warmer(self._market_symbols(feed, market))
+            warmer(list(symbols) if symbols else self._market_symbols(feed, market))
         except Exception as exc:
             logger.warning("Daily stats warm-up failed: %s", exc)
 

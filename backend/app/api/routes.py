@@ -162,7 +162,10 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         return {"USD": 1.0}
 
     @router.get("/health")
-    def health_check():
+    async def health_check():
+        # Async on purpose: the deploy health gate must be answered by the
+        # event loop, never queued behind threadpool work, so a busy feed
+        # cannot turn a liveness probe into a timeout.
         return {
             "status": "ok",
             "service": "schwab-trader-hub",
@@ -249,10 +252,13 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         now_ts = int(time.time() * 1000)
 
         # One batched warm-up for the whole market, not one call per row.
+        # It must be the catalog *as this request enumerates it*: the tickers
+        # for a market read their daily context from ``daily_stats``, and a
+        # symbol that is not warmed keeps ``get_daily_stats`` empty.
         warmer = getattr(actual_feed, "ensure_daily_stats", None)
         if callable(warmer):
             try:
-                warmer(code)
+                warmer(code, symbols)
             except Exception:
                 pass
 
