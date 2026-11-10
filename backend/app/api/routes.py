@@ -8,6 +8,8 @@ Every market-data and order endpoint accepts symbols from any supported market
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import inspect
 import time
 from typing import Any, Dict, List, Optional
@@ -40,6 +42,29 @@ HEALTH_BUDGET = 2.0
 # Upstream error text is operationally useful there but is a free-form string;
 # cap it so a future verbose exception cannot leak internal detail verbatim.
 HEALTH_ERROR_CLIP = 120
+
+
+def _tickers_response(
+    response: Response, market: str, rows: List[Dict[str, Any]], if_none_match: Optional[str]
+) -> Any:
+    """ETag over the rendered rows; a 304 only when the body truly matches.
+
+    The hash is over the response itself because the cached path overlays live
+    quotes per request - a timestamp-based validator would promise "unchanged"
+    while prices moved.
+    """
+    body = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    etag = f'W/"tickers-{market}-{hashlib.sha1(body.encode()).hexdigest()[:16]}"'
+    headers = {
+        "ETag": etag,
+        # Revalidate every poll: prices tick while a session is open, so the
+        # browser must ask each time and let the ETag decide.
+        "Cache-Control": "private, no-cache",
+    }
+    if _etag_matches(if_none_match, etag):
+        return Response(status_code=304, headers=headers)
+    response.headers.update(headers)
+    return rows
 
 
 def _clip_error(value: Any) -> Any:
@@ -313,8 +338,18 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         return records
 
     @router.get("/market/tickers", dependencies=[Depends(require_auth)])
-    def get_tickers(market: str = "US") -> List[Dict[str, Any]]:
-        """Catalog quotes for one market, with a short shared cache."""
+    def get_tickers(
+        response: Response,
+        market: str = "US",
+        if_none_match: Optional[str] = Header(None),
+    ) -> Any:
+        """Catalog quotes for one market, with a short shared cache.
+
+        The ETag hashes the rendered rows, not the cache timestamp: the cached
+        path overlays live quotes per request, so only a genuinely identical
+        body earns a 304. ``Cache-Control: no-cache`` keeps every poll
+        revalidating instead of trusting a stale copy.
+        """
         code = _normalize_market(market)
         market_def = MARKETS.require(code)
 
@@ -341,11 +376,11 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 copy_item["lastUpdated"] = (
                     int(q.timestamp.timestamp() * 1000)
                     if q is not None
-                    else int(time.time() * 1000)
+                    else int(item.get("lastUpdated") or 0)
                 )
                 copy_item["isStale"] = bool(q.is_stale) if q is not None else False
                 fresh.append(copy_item)
-            return fresh
+            return _tickers_response(response, code, fresh, if_none_match)
 
         feed_symbols = getattr(actual_feed, "symbols", None) or []
         symbols = list(market_def.catalog)
@@ -421,13 +456,13 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 "lastUpdated": (
                     int(quote.timestamp.timestamp() * 1000)
                     if quote is not None
-                    else now_ts
+                    else (int(bars[-1].time * 1000) if bars else now_ts)
                 ),
                 "isStale": bool(quote.is_stale) if quote is not None else False,
             })
 
         _tickers_cache[code] = (time.time(), tickers)
-        return tickers
+        return _tickers_response(response, code, tickers, if_none_match)
 
     @router.get("/market/quote", dependencies=[Depends(require_auth)])
     def get_quote(symbol: str = "SPY", market: Optional[str] = None) -> Dict[str, Any]:

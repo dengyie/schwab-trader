@@ -262,12 +262,21 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
   useEffect(() => {
     let isSubscribed = true;
 
+    // 条件请求：行情未变时 304 免下载；etag 随组件生命周期保存在 ref 里。
+    const etagRef = { current: undefined as string | undefined };
+
     const fetchPrices = async () => {
       try {
-        const response = await apiFetch(`/market/tickers?market=${encodeURIComponent(activeMarket)}`);
+        const headers: Record<string, string> = {};
+        if (etagRef.current) headers['If-None-Match'] = etagRef.current;
+        const response = await apiFetch(`/market/tickers?market=${encodeURIComponent(activeMarket)}`, { headers });
+        if (response.status === 304) {
+          return; // 行情未变，沿用现有 catalogTickers
+        }
         if (!response.ok || !isSubscribed) {
           return;
         }
+        etagRef.current = response.headers.get('etag') || undefined;
         const data = await response.json();
 
         const rows: Record<string, { price: number; changePct: number; currency?: string; isStale?: boolean }> = {};

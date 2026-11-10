@@ -89,6 +89,14 @@ def test_market_endpoints():
         r = client.get("/api/market/bars?symbol=SPY&timeframe=1M", headers=AUTH)
         assert r.status_code == 200
 
+        # 4b. Tickers carry a body-hash ETag. The SIM feed stamps every quote
+        # with a fresh timestamp, so consecutive renders legitimately differ
+        # (200); the 304 path itself is pinned by the stub-feed test below.
+        r1 = client.get("/api/market/tickers?market=US", headers=AUTH)
+        assert r1.status_code == 200
+        etag = r1.headers.get("etag")
+        assert etag and etag.startswith('W/"tickers-US-')
+
         # 2. Latest quote
         resp_quote = client.get("/api/market/quote?symbol=SPY", headers=AUTH)
         assert resp_quote.status_code == 200
@@ -409,3 +417,64 @@ def test_bars_without_a_fetch_time_are_not_cacheable():
     assert resp.headers["X-Cache"] == "MISS"
     assert resp.headers["Cache-Control"] == "no-store"
     assert "ETag" not in resp.headers
+
+
+def test_market_tickers_conditional_request(monkeypatch):
+    """The tickers ETag hashes the rendered body: identical rows revalidate to
+    304, and a moved price earns a new validator - never a lying 304."""
+    from datetime import datetime, timezone
+
+    from fastapi import FastAPI
+
+    from app.api.routes import create_api_router
+    from app.models.trading import Quote
+
+    class _Broker:
+        def get_fx_rates(self):
+            return {"USD": 1.0}
+
+    quote = Quote(
+        symbol="SPY", bid=99.9, ask=100.1, last=100.0, volume=123,
+        timestamp=datetime(2026, 11, 11, 15, 0, tzinfo=timezone.utc),
+    )
+
+    class _StaticFeed:
+        symbols = ["SPY"]
+        historical_bars: dict = {}
+
+        def get_latest_quote(self, symbol: str):
+            return quote
+
+        def get_daily_stats(self, symbol: str):
+            return {"prev_close": 100.0, "day_high": 101.0, "day_low": 99.0, "volume": 123}
+
+        def ensure_daily_stats(self, *args, **kwargs):
+            return None
+
+    # A fresh router owns an empty tickers cache: r1 is the cold path, r2 the
+    # cached path with the live-quote overlay - exactly the production sequence.
+    app2 = FastAPI()
+    app2.include_router(create_api_router(_Broker(), _StaticFeed()))
+    client = TestClient(app2)
+
+    r1 = client.get("/api/market/tickers?market=US", headers=AUTH)
+    assert r1.status_code == 200
+    assert r1.json()[0]["price"] == 100.0
+    etag = r1.headers.get("etag")
+    assert etag
+
+    r2 = client.get(
+        "/api/market/tickers?market=US", headers={**AUTH, "If-None-Match": etag}
+    )
+    assert r2.status_code == 304
+
+    # A moved price must invalidate: new body, new validator. The move stays
+    # inside the cached day range - the range guard clips out-of-range prints
+    # back to the cached price by design, and that path is covered above.
+    quote.last = 100.5
+    r3 = client.get(
+        "/api/market/tickers?market=US", headers={**AUTH, "If-None-Match": etag}
+    )
+    assert r3.status_code == 200
+    assert r3.json()[0]["price"] == 100.5
+    assert r3.headers.get("etag") != etag

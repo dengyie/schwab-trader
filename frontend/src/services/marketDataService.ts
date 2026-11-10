@@ -54,6 +54,7 @@ export const GET_SYMBOLS_BY_CATEGORY = (cat: string) => CATEGORY_MAP[cat] || POP
 interface TickerCacheEntry {
   fetchedAt: number;
   rows: Map<string, MarketTicker>;
+  etag?: string; // 后端按渲染体哈希的弱校验器，命中即 304
 }
 
 // 每个市场单独缓存：切换市场时不能拿到上一个市场的行情。
@@ -71,13 +72,21 @@ export async function fetchAllTickers(market?: string | null): Promise<MarketTic
 
   try {
     const path = `/market/tickers?market=${encodeURIComponent(key)}`;
-    const response = await apiFetch(path);
+    const condHeaders: Record<string, string> = {};
+    if (cached?.etag) condHeaders['If-None-Match'] = cached.etag;
+    const response = await apiFetch(path, { headers: condHeaders });
+    if (response.status === 304 && cached) {
+      // 行情未变：只续鲜客户端缓存，不重解析整段列表。
+      tickerCaches.set(key, { ...cached, fetchedAt: now });
+      return Array.from(cached.rows.values());
+    }
     if (!response.ok) throw response;
     const data: MarketTicker[] = await response.json();
 
     const rows = new Map<string, MarketTicker>();
     data.forEach((t) => rows.set(t.symbol, t));
-    tickerCaches.set(key, { fetchedAt: now, rows });
+    const etag = response.headers.get('etag') || undefined;
+    tickerCaches.set(key, { fetchedAt: now, rows, etag });
 
     return data.sort((a, b) => b.volume24h - a.volume24h);
   } catch (error) {
