@@ -50,6 +50,28 @@ def test_a_stable_connection_earns_a_clean_slate():
     )
 
 
+def _minimal_feed() -> AlpacaMarketFeedService:
+    """A loop-test feed built via ``__new__``: no preload, no network client.
+
+    The stream-health fields are set explicitly because the listener loop
+    records events into them; ``__new__`` bypasses the ``__init__`` that
+    normally creates them.
+    """
+    feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+    feed._running = True
+    feed.stream_url = "wss://example.invalid/stream"
+    feed.api_key = "key"
+    feed.api_secret = "secret"
+    feed.symbols = {"SPY"}
+    feed.feed = "iex"
+    feed._stream_state = "idle"
+    feed._stream_since = 0.0
+    feed._stream_last_error = None
+    feed._stream_failures = 0
+    feed._stream_quota = False
+    return feed
+
+
 def test_listener_loop_does_not_reset_backoff_on_every_connect(monkeypatch):
     """The regression itself: a stream that connects then drops must back off."""
 
@@ -67,12 +89,7 @@ def test_listener_loop_does_not_reset_backoff_on_every_connect(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
-    feed._running = True
-    feed.stream_url = "wss://example.invalid/stream"
-    feed.api_key = "key"
-    feed.api_secret = "secret"
-    feed.symbols = {"SPY"}
+    feed = _minimal_feed()
 
     monkeypatch.setattr(feed_module.websockets, "connect", lambda *a, **k: ConnectCM())
 
@@ -88,6 +105,8 @@ def test_listener_loop_does_not_reset_backoff_on_every_connect(monkeypatch):
 
     # Old behaviour logged 1.0 every time; now each drop escalates.
     assert delays == [1.0, 1.5, 2.25, 3.375]
+    # Each drop is recorded, and nothing in the loop resets the count.
+    assert feed.stream_health()["consecutive_failures"] == 4
 
 
 def test_listener_loop_survives_an_auth_rejection(monkeypatch):
@@ -113,12 +132,7 @@ def test_listener_loop_survives_an_auth_rejection(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
-    feed._running = True
-    feed.stream_url = "wss://example.invalid/stream"
-    feed.api_key = "key"
-    feed.api_secret = "secret"
-    feed.symbols = {"SPY"}
+    feed = _minimal_feed()
 
     calls = types.SimpleNamespace(count=0)
     monkeypatch.setattr(feed_module.websockets, "connect", lambda *a, **k: ConnectCM())
@@ -136,3 +150,10 @@ def test_listener_loop_survives_an_auth_rejection(monkeypatch):
 
     assert calls.count == 2
     assert delays == [1.0, 1.5]
+    # The rejection is recorded, but a 402 ("auth failed", wrong key) is NOT
+    # a quota rejection: it retries at network cadence, quota stays false.
+    health = feed.stream_health()
+    assert health["consecutive_failures"] == 2
+    assert health["quota_exceeded"] is False
+    assert health["state"] == "degraded"
+    assert "auth failed" in health["last_error"]

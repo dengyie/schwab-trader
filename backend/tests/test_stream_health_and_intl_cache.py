@@ -183,6 +183,40 @@ def test_a_successful_session_clears_the_failure_count(monkeypatch):
     assert health["quota_exceeded"] is False
 
 
+def test_failures_survive_the_connecting_step_of_each_retry(monkeypatch):
+    """The reconnect loop starts every attempt with a ``connecting`` event.
+
+    If that event reset the counter, a two-hour rejection storm would read as
+    one failure: connecting (reset) → degraded (+1) → connecting (reset) …
+    """
+    monkeypatch.setattr(AlpacaMarketFeedService, "_preload_historical_bars_sync", lambda self: None)
+    monkeypatch.setattr(AlpacaMarketFeedService, "refresh_daily_stats", lambda self, *a, **k: None)
+    feed = AlpacaMarketFeedService(initial_symbols=["SPY"], api_key="k", api_secret="s")
+
+    error = "Alpaca stream auth rejected: connection limit exceeded (code=406)"
+    for _ in range(3):  # one full reconnect attempt, as the loop runs it
+        feed._record_stream_event("connecting")
+        feed._record_stream_event("degraded", error)
+
+    health = feed.stream_health()
+    assert health["state"] == "degraded"
+    assert health["consecutive_failures"] == 3
+    assert health["quota_exceeded"] is True
+
+    # A failed attempt that is NOT a quota issue flips the flag back.
+    feed._record_stream_event("connecting")
+    feed._record_stream_event("degraded", "no close frame received or sent")
+    health = feed.stream_health()
+    assert health["consecutive_failures"] == 4
+    assert health["quota_exceeded"] is False
+
+    # Only the real success clears the count; stopping must not either.
+    feed._record_stream_event("stopped")
+    assert feed.stream_health()["consecutive_failures"] == 4
+    feed._record_stream_event("connected")
+    assert feed.stream_health()["consecutive_failures"] == 0
+
+
 def test_quota_backoff_ceiling_is_well_above_the_network_cadence():
     # The point of the separate schedule: a condition we cannot fix must not
     # be retried at the same pace as a dropped socket.
@@ -251,6 +285,29 @@ def test_a_feed_without_a_probe_is_named():
     result = _feed_health(_US(), _Intl())
     assert result["intl"]["state"] == "unavailable"
     assert "health" in result["intl"]["error"]
+
+
+def test_probes_run_concurrently_not_serialised():
+    """Two 0.6s probes must finish together (~0.6s), not one after the other
+    (1.2s): serialised probes would add up against the route's HEALTH_BUDGET
+    and a pair of slow feeds would wipe the payload to a timeout error."""
+    class _SlowUS:
+        def stream_health(self):
+            time.sleep(0.6)
+            return {"connected": True}
+
+    class _SlowIntl:
+        def health(self):
+            time.sleep(0.6)
+            return {"watching": 1}
+
+    started = time.time()
+    result = _feed_health(_SlowUS(), _SlowIntl(), timeout=2.0)
+    elapsed = time.time() - started
+
+    assert result["us"]["connected"] is True
+    assert result["intl"]["watching"] == 1
+    assert elapsed < 1.0, f"probes look serialised: {elapsed:.2f}s for two 0.6s probes"
 
 
 def test_health_payload_includes_feed_state():

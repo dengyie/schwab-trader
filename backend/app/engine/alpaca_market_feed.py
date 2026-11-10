@@ -222,14 +222,20 @@ class AlpacaMarketFeedService:
 
     # -- stream health ----------------------------------------------------
     def _record_stream_event(self, state: str, error: Optional[str] = None) -> None:
-        """Track the socket state so it can be reported without reading logs."""
+        """Track the socket state so it can be reported without reading logs.
+
+        Only a *connected* event clears the failure count. Every reconnect
+        attempt passes through ``connecting`` first; counting that as success
+        would zero ``consecutive_failures`` before each failure could stack,
+        and a two-hour rejection storm would read as a single failure.
+        """
         self._stream_state = state
         self._stream_since = time.time()
         if error is not None:
             self._stream_last_error = error
             self._stream_quota = is_quota_rejection(error)
             self._stream_failures += 1
-        else:
+        elif state == "connected":
             self._stream_failures = 0
             self._stream_quota = False
 

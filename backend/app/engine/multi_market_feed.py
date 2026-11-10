@@ -197,10 +197,15 @@ class MultiMarketFeed:
                         "error": f"{method}() returned {type(result).__name__}"}
             return result
 
-        return {
-            "us": await _probe(self._us, "stream_health"),
-            "intl": await _probe(self._intl, "health"),
-        }
+        # Concurrent on purpose: the probes are independent, and serialised
+        # they would add up to 2s of worst case against the route's own
+        # HEALTH_BUDGET — a pair of slow probes would then wipe the whole
+        # per-feed payload down to a single timeout error.
+        us_state, intl_state = await asyncio.gather(
+            _probe(self._us, "stream_health"),
+            _probe(self._intl, "health"),
+        )
+        return {"us": us_state, "intl": intl_state}
 
     # -- attributes read by the API layer ---------------------------------
     @property
