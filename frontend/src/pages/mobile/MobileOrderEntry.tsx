@@ -4,6 +4,7 @@ import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
 import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
 import { useI18n, formatMessage } from '../../i18n';
+import { formatClockMoment } from '../../utils/timeFormat';
 import { toast } from '../../components/Toast';
 import { Icon } from '../../components/Icon';
 import { useHapticFeedback } from '../../hooks/useHapticFeedback';
@@ -129,7 +130,22 @@ export function MobileOrderEntry({
     }, metrics?.mid);
 
     if (order) {
-      toast.success(t.toast?.orderSubmitted || 'Order submitted');
+      // 收盘时段：市价单已在上面被拦下，能提交的只有挂单型订单，由券商在
+      // 下次开盘后撮合。不写清楚的话，“已提交”会被读成“已成交”。
+      // 时钟取自市场注册表（带 timezone），与桌面端 OrderEntry 同一来源。
+      const marketClock = useMarketsStore.getState().marketOf(symbol)?.clock;
+      const marketClosed = marketClock ? !marketClock.is_open : false;
+      if (marketClosed && type === 'limit') {
+        const nextOpen = formatClockMoment(marketClock?.next_open, marketClock?.timezone);
+        toast.warning(
+          nextOpen
+            ? formatMessage(t.toast?.orderQueuedForOpen || '订单已提交，将在下次开盘后生效：{time}', { time: nextOpen })
+            : (t.toast?.orderQueued || '订单已提交，将在下次开盘后生效'),
+          6000,
+        );
+      } else {
+        toast.success(t.toast?.orderSubmitted || 'Order submitted');
+      }
       trigger('success');
       setQuantity('');
       setQuantityPercent(0);
