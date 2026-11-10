@@ -53,6 +53,33 @@ export function formatTime(timestamp: number, showSeconds: boolean = true): stri
   });
 }
 
+/**
+ * 格式化交易所给出的 ISO 开盘时间 (MM-DD HH:MM, 市场本地时区)
+ *
+ * The market clock reports its session boundary in the venue's own timezone
+ * with an offset, e.g. "2026-11-10T09:30:00-05:00". Echoing that raw string
+ * in a toast tells the user nothing; render it in the venue's timezone so the
+ * time matches the exchange's own schedule.
+ */
+export function formatClockMoment(iso: string | null | undefined, timeZone?: string): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      ...(timeZone ? { timeZone } : {}),
+    }).format(d);
+  } catch {
+    // An unknown IANA zone must not break the toast; fall back to local time.
+    return formatTime(d.getTime(), false);
+  }
+}
+
 
 
 

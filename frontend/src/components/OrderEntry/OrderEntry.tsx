@@ -5,6 +5,7 @@ import { useWalletStore, selectBalances } from '../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
 import { currencySymbol, roundToTick } from '../../utils/money';
+import { formatClockMoment } from '../../utils/timeFormat';
 import { useI18n, formatMessage } from '../../i18n';
 import { toast } from '../Toast';
 import { Icon } from '../Icon';
@@ -409,7 +410,21 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     }
 
     if (order) {
-      toast.success(t.toast.orderSubmitted);
+      // 收盘时段：市价单已被前面拦下，能提交的只有挂单型订单。这类订单由
+      // 券商在下次开盘后撮合，所以提示里必须写明"何时生效"，否则用户会把
+      // "已提交"误读成"已即时成交"。
+      const restingNow = marketClosed && orderCategory === 'spot' && type === 'limit';
+      if (restingNow) {
+        const nextOpen = formatClockMoment(marketClock?.next_open, marketClock?.timezone);
+        toast.warning(
+          nextOpen
+            ? (t.toast.orderQueuedForOpen || '订单已提交，将在下次开盘后生效：{time}').replace('{time}', nextOpen)
+            : (t.toast.orderQueued || '订单已提交，将在下次开盘后生效'),
+          6000,
+        );
+      } else {
+        toast.success(t.toast.orderSubmitted);
+      }
       // Reset form
       setQuantity(''); 
       setQuantityPercent(0); 

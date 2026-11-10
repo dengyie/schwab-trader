@@ -484,6 +484,8 @@ export const enUS: Locale = {
   // Toast
   toast: {
     orderSubmitted: 'Order submitted',
+    orderQueued: 'Order submitted, will take effect after the next open',
+    orderQueuedForOpen: 'Order submitted, will take effect after the next open: {time}',
     orderFilled: 'Order filled',
     orderPartialFilled: 'Order partially filled ({filled}/{total})',
     orderCancelled: 'Order cancelled',

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.auth import token_matches
-from app.core.markets import resolve_symbol
+from app.core.markets import MARKETS, resolve_symbol
 from app.models.trading import (
     Quote, Bar, Trade, Order, OrderSide, OrderType
 )
@@ -431,6 +431,25 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # Mount Production Frontend SPA if dist folder exists
 static_dir = os.getenv("STATIC_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "../../frontend/dist")))
+
+
+@app.get("/health")
+async def health_probe():
+    """Unprefixed liveness probe.
+
+    Declared before the SPA mount on purpose: ``/health`` used to reach the
+    catch-all 404 handler below, which answered with ``index.html`` and a 200.
+    Any external monitor pointed at ``/health`` therefore reported "healthy"
+    even while the process was failing every real request. This mirrors
+    ``/api/health`` (the deploy gate's endpoint) so both probes agree.
+    """
+    return {
+        "status": "ok",
+        "service": "schwab-trader-hub",
+        "market_data_provider": settings.market_data_provider,
+        "broker_provider": settings.broker_provider,
+        "markets": MARKETS.codes(),
+    }
 
 
 @app.exception_handler(404)

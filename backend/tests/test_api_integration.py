@@ -34,6 +34,24 @@ def test_health_endpoint():
         assert data["status"] == "ok"
 
 
+def test_unprefixed_health_probe_is_json_not_spa():
+    """``/health`` must answer JSON.
+
+    Regression guard: the SPA catch-all used to answer ``/health`` with
+    ``index.html`` and a 200, so any external monitor reading that path saw
+    "healthy" even while the API was broken. The unprefixed probe now mirrors
+    ``/api/health``.
+    """
+    with TestClient(app) as client:
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "schwab-trader-hub"
+        assert "markets" in data
+
+
 def test_protected_endpoints_require_token():
     with TestClient(app) as client:
         assert client.get("/api/portfolio").status_code == 401

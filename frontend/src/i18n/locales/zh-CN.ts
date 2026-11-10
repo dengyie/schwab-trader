@@ -483,6 +483,8 @@ export const zhCN = {
   // Toast 消息
   toast: {
     orderSubmitted: '订单已提交',
+    orderQueued: '订单已提交，将在下次开盘后生效',
+    orderQueuedForOpen: '订单已提交，将在下次开盘后生效：{time}',
     orderFilled: '订单已完全成交',
     orderPartialFilled: '订单部分成交 ({filled}/{total})',
     orderCancelled: '订单已撤销',
