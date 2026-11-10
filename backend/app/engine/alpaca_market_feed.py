@@ -42,6 +42,16 @@ INITIAL_RECONNECT_BACKOFF = 1.0
 MAX_RECONNECT_BACKOFF = 30.0
 STABLE_CONNECTION_SECONDS = 30.0
 
+# A quota rejection is not a network problem: another client holds this key's
+# single IEX session, so nothing we do locally makes the next attempt succeed.
+# Retrying it at network cadence only spams the log and the endpoint (observed:
+# 135 identical lines in an hour), so it backs off harder and logs sparsely.
+QUOTA_INITIAL_BACKOFF = 5.0
+QUOTA_MAX_BACKOFF = 60.0
+QUOTA_LOG_EVERY = 10
+# Alpaca's wording for "you already have as many sessions as your plan allows".
+QUOTA_ERROR_MARKERS = ("connection limit exceeded", "code=406")
+
 
 def next_reconnect_backoff(
     backoff: float,
@@ -64,6 +74,18 @@ def next_reconnect_backoff(
     if connected_seconds >= stable_after:
         return INITIAL_RECONNECT_BACKOFF
     return min(backoff * factor, cap)
+
+
+def is_quota_rejection(message: str) -> bool:
+    """True when the auth failure is "this key already has its session".
+
+    Distinguishing it matters: a wrong key or a flaky network is fixed on our
+    side, while "connection limit exceeded" can only be fixed by whoever else
+    is holding the session. Treating both the same produces a log that reads
+    like a network fault and hides the real owner.
+    """
+    text = (message or "").lower()
+    return any(marker in text for marker in QUOTA_ERROR_MARKERS)
 
 
 class AlpacaMarketFeedService:
@@ -91,6 +113,10 @@ class AlpacaMarketFeedService:
     # idle between user interactions.
     SNAPSHOT_TTL = 180.0
     SNAPSHOT_TTL_CLOSED = 3600.0
+    # With no client connected the snapshot sweep still runs, just rarely: a
+    # quote payload nobody is watching is not worth one Yahoo request per
+    # symbol every three minutes.
+    IDLE_SWEEP_SECONDS = 300.0
     # Chart prewarming exists only to make the first chart load instant. With
     # no client connected there is nothing to prewarm for, so the loop sleeps
     # instead of re-fetching multi-thousand-bar candle payloads forever.
@@ -160,6 +186,16 @@ class AlpacaMarketFeedService:
         # re-serialising every IEX print. ``latest_quotes`` is always updated.
         self._last_quote_emit: Dict[str, float] = {}
 
+        # Stream health, readable without a journalctl session. A rejected
+        # auth (another client holds the key's single session) looks exactly
+        # like "the chart is quiet" from the outside, so the state has to be
+        # something the health probe and the UI can see.
+        self._stream_state: str = "idle"
+        self._stream_since: float = 0.0
+        self._stream_last_error: Optional[str] = None
+        self._stream_failures: int = 0
+        self._stream_quota: bool = False
+
         self.headers = {
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.api_secret,
@@ -183,6 +219,40 @@ class AlpacaMarketFeedService:
     @property
     def _bars_cache_ts(self) -> Dict[str, Dict[str, float]]:
         return self._bar_cache.fetched_at
+
+    # -- stream health ----------------------------------------------------
+    def _record_stream_event(self, state: str, error: Optional[str] = None) -> None:
+        """Track the socket state so it can be reported without reading logs."""
+        self._stream_state = state
+        self._stream_since = time.time()
+        if error is not None:
+            self._stream_last_error = error
+            self._stream_quota = is_quota_rejection(error)
+            self._stream_failures += 1
+        else:
+            self._stream_failures = 0
+            self._stream_quota = False
+
+    def stream_health(self) -> Dict[str, Any]:
+        """Socket state: live, or degraded and why.
+
+        A rejected session and a quiet market look identical from the outside
+        (no ticks either way), so this is the only honest way for the health
+        probe and the UI to tell them apart.
+        """
+        uptime = 0.0
+        if self._stream_state == "connected" and self._stream_since:
+            uptime = max(0.0, time.time() - self._stream_since)
+        return {
+            "provider": "alpaca",
+            "feed": self.feed,
+            "state": self._stream_state,
+            "connected": self._stream_state == "connected",
+            "uptime_s": round(uptime, 1),
+            "consecutive_failures": self._stream_failures,
+            "quota_exceeded": self._stream_quota,
+            "last_error": self._stream_last_error,
+        }
 
     def _preload_historical_bars_sync(self) -> None:
         """Fetch latest historical 1-minute bars and quotes via REST on initialization.
@@ -627,6 +697,7 @@ class AlpacaMarketFeedService:
 
     async def stop(self) -> None:
         self._running = False
+        self._record_stream_event("stopped")
         for task in (self._ws_task, self._sync_task, self._prewarm_task):
             if task:
                 task.cancel()
@@ -643,10 +714,20 @@ class AlpacaMarketFeedService:
         YahooFinanceAdapter.close_client()
 
     async def _websocket_listener_loop(self) -> None:
-        """Connects and reconnects to Alpaca IEX stream with exponential backoff."""
+        """Connects and reconnects to Alpaca IEX stream with exponential backoff.
+
+        Two failures need different pacing. A dropped socket is worth retrying
+        within seconds. A rejected auth because another client holds this key's
+        single session is not: the owner has to leave, which we neither see nor
+        control, so hammering the endpoint at network cadence only fills the
+        log. Quota rejections back off on their own schedule and log sparsely.
+        """
         backoff = INITIAL_RECONNECT_BACKOFF
+        quota_backoff = QUOTA_INITIAL_BACKOFF
+        quota_hits = 0
         while self._running:
             connected_at = time.monotonic()
+            self._record_stream_event("connecting")
             try:
                 async with websockets.connect(self.stream_url, ping_interval=20, ping_timeout=20) as ws:
                     logger.info("Connected to Alpaca IEX Streamer: %s", self.stream_url)
@@ -682,6 +763,14 @@ class AlpacaMarketFeedService:
                     }
                     await ws.send(json.dumps(sub_msg))
                     sub_resp = await ws.recv()
+
+                    self._record_stream_event("connected")
+                    logger.info(
+                        "Alpaca IEX stream authenticated and subscribed: %s",
+                        ", ".join(sorted(self.symbols)),
+                    )
+                    quota_backoff = QUOTA_INITIAL_BACKOFF
+                    quota_hits = 0
 
                     # 4. Message processing loop
                     while self._running:
@@ -771,15 +860,32 @@ class AlpacaMarketFeedService:
                 close_code = getattr(close_frame, "code", None)
                 close_reason = getattr(close_frame, "reason", None)
                 uptime = time.monotonic() - connected_at
-                delay = backoff
-                backoff = next_reconnect_backoff(backoff, uptime)
-                logger.warning(
-                    "Alpaca Streamer disconnected (%s%s) after %.0fs, reconnecting in %.1fs...",
-                    e,
-                    f", code={close_code}, reason={close_reason!r}" if close_code is not None else "",
-                    uptime,
-                    delay,
-                )
+                self._record_stream_event("degraded", str(e))
+
+                if self._stream_quota:
+                    # Nothing local fixes this. Pace the retries and say it
+                    # once per burst instead of once per attempt; each line is
+                    # 30s apart, so the repetition is what buried the cause.
+                    quota_hits += 1
+                    delay = quota_backoff
+                    quota_backoff = min(quota_backoff * 1.5, QUOTA_MAX_BACKOFF)
+                    if quota_hits == 1 or quota_hits % QUOTA_LOG_EVERY == 0:
+                        logger.warning(
+                            "Alpaca stream session unavailable (%s): another client "
+                            "holds this key's IEX session. Retrying quietly at %.0fs; "
+                            "quotes still refresh over REST. attempt=%d",
+                            e, delay, quota_hits,
+                        )
+                else:
+                    delay = backoff
+                    backoff = next_reconnect_backoff(backoff, uptime)
+                    logger.warning(
+                        "Alpaca Streamer disconnected (%s%s) after %.0fs, reconnecting in %.1fs...",
+                        e,
+                        f", code={close_code}, reason={close_reason!r}" if close_code is not None else "",
+                        uptime,
+                        delay,
+                    )
                 await asyncio.sleep(delay)
 
     async def _periodic_quote_sync_loop(self) -> None:
@@ -787,6 +893,7 @@ class AlpacaMarketFeedService:
         Polls latest quote every 15 seconds during off-hours or quiet periods
         to keep frontend alive and heartbeating.
         """
+        last_idle_sweep = 0.0
         while self._running:
             try:
                 await asyncio.sleep(15)
@@ -794,10 +901,16 @@ class AlpacaMarketFeedService:
                     break
 
                 # Keep previous closes and day ranges warm for the watchlist.
-                try:
-                    await asyncio.to_thread(self.refresh_daily_stats)
-                except Exception:
-                    pass
+                # The sweep is one Yahoo request per symbol, so it skips itself
+                # while nobody is connected — but not indefinitely: on an
+                # always-on server that would leave the day range frozen.
+                now = time.time()
+                if self._has_chart_subscribers() or now - last_idle_sweep > IDLE_SWEEP_SECONDS:
+                    last_idle_sweep = now
+                    try:
+                        await asyncio.to_thread(self.refresh_daily_stats)
+                    except Exception:
+                        pass
 
                 for sym in self.symbols:
                     q = self._decorate_daily(self.latest_quotes.get(sym))

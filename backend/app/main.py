@@ -110,8 +110,14 @@ else:
     us_feed = MarketFeedService(initial_symbols=settings.default_symbols)
 
 # Non-US venues (HK / JP / CN) are served by Yahoo; the US stream is untouched.
+# Both feeds share the market cache directory: a chart's candles are the same
+# historical data whichever venue answered, and both should survive a deploy.
 fx = FxService(enabled=settings.fx_enabled)
-intl_feed = YahooQuoteFeed(symbols=[], enabled=settings.intl_market_data_enabled)
+intl_feed = YahooQuoteFeed(
+    symbols=[],
+    enabled=settings.intl_market_data_enabled,
+    cache_dir=market_cache_dir,
+)
 feed = MultiMarketFeed(us_feed, intl_feed)
 
 # 2. Broker / Execution Provider Factory

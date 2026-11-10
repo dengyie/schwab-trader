@@ -48,6 +48,11 @@ class AlpacaPaperBroker(BaseBroker):
         self._portfolio_ttl: float = 5.0
         self._orders_cached_at: float = 0.0
         self._orders_ttl: float = 5.0
+        # The clock is polled by every open terminal and changes only at
+        # session boundaries, so it gets a longer window than the account.
+        self._clock_cached: Optional[dict] = None
+        self._clock_cached_at: float = 0.0
+        self._clock_ttl: float = 15.0
 
         # Fill detection state: last observed filled quantity per order
         self._last_order_status: Dict[str, OrderStatus] = {}
@@ -240,15 +245,22 @@ class AlpacaPaperBroker(BaseBroker):
 
     def get_market_clock(self, market: Optional[str] = None) -> Optional[dict]:
         """Alpaca trading clock: tells the UI 'market closed' vs 'feed degraded'."""
+        now = time.time()
+        if self._clock_cached is not None and now - self._clock_cached_at < self._clock_ttl:
+            return dict(self._clock_cached)
         try:
             resp = self.client.get(f"{self.base_url}/clock")
             if resp.status_code != 200:
                 return None
             data = resp.json()
-            return {
+            clock = {
                 "is_open": bool(data.get("is_open")),
                 "next_open": data.get("next_open"),
                 "next_close": data.get("next_close"),
             }
+            self._clock_cached = clock
+            self._clock_cached_at = now
+            return dict(clock)
         except Exception:
-            return None
+            # A broker hiccup must not erase the last known session state.
+            return dict(self._clock_cached) if self._clock_cached else None

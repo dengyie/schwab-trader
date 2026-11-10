@@ -279,6 +279,62 @@ def test_market_clock_unavailable_returns_none(monkeypatch):
     assert broker.get_market_clock() is None
 
 
+def test_market_clock_is_cached_across_calls(monkeypatch):
+    """Every open terminal polls the clock; one poll must not be one API call."""
+    payload = {"is_open": True, "next_open": "o", "next_close": "c"}
+    calls = []
+
+    def counting_get(*a, **kw):
+        calls.append(a)
+        return _FakeClockResponse(200, payload)
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    monkeypatch.setattr(broker.client, "get", counting_get)
+    assert broker.get_market_clock()["is_open"] is True
+    assert broker.get_market_clock()["is_open"] is True
+    assert len(calls) == 1
+
+
+def test_market_clock_cache_expires(monkeypatch):
+    payload = {"is_open": True, "next_open": "o", "next_close": "c"}
+    calls = []
+
+    def counting_get(*a, **kw):
+        calls.append(a)
+        return _FakeClockResponse(200, payload)
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    monkeypatch.setattr(broker.client, "get", counting_get)
+    assert broker.get_market_clock()["is_open"] is True
+    broker._clock_cached_at -= broker._clock_ttl + 1.0
+    assert broker.get_market_clock()["is_open"] is True
+    assert len(calls) == 2
+
+
+def test_market_clock_serves_last_known_on_failure(monkeypatch):
+    """A refused call must not make a closed session look unknown."""
+    payload = {"is_open": False, "next_open": "o", "next_close": "c"}
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, payload))
+    assert broker.get_market_clock()["is_open"] is False
+
+    def boom(*a, **kw):
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(broker.client, "get", boom)
+    broker._clock_cached_at -= broker._clock_ttl + 1.0
+    stale = broker.get_market_clock()
+    assert stale is not None
+    assert stale["is_open"] is False
+
+
+def test_market_clock_returns_a_copy(monkeypatch):
+    """Callers format the payload; they must not be able to poison the cache."""
+    payload = {"is_open": True, "next_open": "o", "next_close": "c"}
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, payload))
+    broker.get_market_clock()["is_open"] = "mutated"
+    assert broker.get_market_clock()["is_open"] is True
+
+
 @pytest.mark.skipif(
     os.getenv("ALPACA_LIVE_TESTS") != "1",
     reason="Live Alpaca test; opt in with ALPACA_LIVE_TESTS=1",

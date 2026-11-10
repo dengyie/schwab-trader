@@ -12,8 +12,9 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
@@ -24,6 +25,7 @@ from app.core.markets import (
     resolve_symbol,
 )
 from app.core.timeframes import TIMEFRAME_TTLS
+from app.engine.bar_cache import BarCache
 from app.models.trading import Bar, Quote, utc_now
 
 logger = logging.getLogger(__name__)
@@ -35,11 +37,20 @@ class YahooQuoteFeed:
     POLL_SECONDS = 6.0
     IDLE_POLL_SECONDS = 30.0
     CACHE_SECONDS = 4.0
+    # Fallback TTL for a timeframe the shared table does not know. The US feed
+    # and this one read the same ``TIMEFRAME_TTLS``; a second, different number
+    # here is how the two venues drifted apart before.
     BAR_CACHE_SECONDS = 20.0
+    MAX_BAR_ENTRIES = 120
     # A REST read keeps a symbol warm for this long, then the poller drops it.
     ON_DEMAND_TTL = 180.0
 
-    def __init__(self, symbols: Optional[List[str]] = None, enabled: bool = True):
+    def __init__(
+        self,
+        symbols: Optional[List[str]] = None,
+        enabled: bool = True,
+        cache_dir: Optional[str] = None,
+    ):
         self._catalog = {s.upper() for s in (symbols or [])}
         # Sticky watch set (websocket subscriptions) vs. short-lived reads.
         self._active: Dict[str, float] = {}
@@ -53,7 +64,16 @@ class YahooQuoteFeed:
         self.latest_quotes: Dict[str, Quote] = {}
         self.last_trade_prices: Dict[str, float] = {}
         self.historical_bars: Dict[str, List[Bar]] = {}
-        self._bars_cache: Dict[str, tuple[float, List[Bar]]] = {}
+        # Bars use the same cache as the US path: persisted, stale-served,
+        # single-flight. A HK chart then survives a deploy and reports a real
+        # ``fetched_at`` so the API can emit ETag/Cache-Control for it too.
+        self._bar_cache = BarCache(
+            cache_dir,
+            max_entries=self.MAX_BAR_ENTRIES,
+            ttl_for=lambda tf: TIMEFRAME_TTLS.get(tf, self.BAR_CACHE_SECONDS),
+        )
+        self._refresh_pool: Optional[ThreadPoolExecutor] = None
+        self._refresh_pool_lock = threading.Lock()
 
         self.quote_listeners: List[Callable[[Quote], None]] = []
 
@@ -164,28 +184,81 @@ class YahooQuoteFeed:
         return quote or cached
 
     # -- bars -------------------------------------------------------------
-    def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
+    def _refresh_pool_executor(self) -> ThreadPoolExecutor:
+        with self._refresh_pool_lock:
+            if self._refresh_pool is None:
+                self._refresh_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="yahoo-bars"
+                )
+            return self._refresh_pool
+
+    def _fetch_bars(self, symbol: str, timeframe: str) -> Optional[List[Bar]]:
+        """Fetch one key and store it. The caller owns the refresh slot."""
+        try:
+            ref = resolve_symbol(symbol)
+            if ref is None:
+                return None
+            tz = ZoneInfo(ref.market.timezone)
+            bars = YahooFinanceAdapter.fetch_bars(ref.symbol, timeframe=timeframe, tz=tz)
+            if bars:
+                self._bar_cache.put(ref.symbol, timeframe, bars)
+                return bars
+            return None
+        except Exception as exc:
+            logger.warning("Yahoo bars failed for %s (%s): %s", symbol, timeframe, exc)
+            self._bar_cache.cool_down(symbol, timeframe)
+            return None
+        finally:
+            self._bar_cache.end_refresh(symbol, timeframe)
+
+    def _fetch_cold_bars(self, symbol: str, timeframe: str) -> Optional[List[Bar]]:
+        """Lead a cold fetch, or wait for whoever is already leading it."""
+        if not self._bar_cache.begin_refresh(symbol, timeframe):
+            self._bar_cache.wait_for_refresh(symbol, timeframe)
+            entry = self._bar_cache.get(symbol, timeframe)
+            return entry.bars if entry else None
+        return self._fetch_bars(symbol, timeframe)
+
+    def _schedule_refresh(self, symbol: str, timeframe: str) -> None:
+        # A disabled feed still serves what it has on disk, but it must never
+        # reach upstream: "disabled" is an operator switch, not a hint.
+        if not self._enabled:
+            return
+        if self._bar_cache.is_cooling(symbol, timeframe):
+            return
+        if not self._bar_cache.begin_refresh(symbol, timeframe):
+            return
+        try:
+            self._refresh_pool_executor().submit(self._fetch_bars, symbol, timeframe)
+        except RuntimeError:
+            self._bar_cache.end_refresh(symbol, timeframe)
+
+    def get_bars_with_meta(
+        self, symbol: str, timeframe: str = "15m"
+    ) -> Tuple[List[Bar], float]:
+        """Bars plus their fetch time, mirroring the US feed's contract."""
         ref = resolve_symbol(symbol)
         if ref is None:
-            return []
+            return [], 0.0
         self._touch(ref.symbol)
-        key = f"{ref.symbol}:{timeframe.lower()}"
-        now = time.time()
-        with self._lock:
-            cached = self._bars_cache.get(key)
-        ttl = max(self.BAR_CACHE_SECONDS, TIMEFRAME_TTLS.get(timeframe.lower(), 30.0))
-        if cached and now - cached[0] < ttl:
-            return cached[1]
-        if not self._enabled:
-            return cached[1] if cached else []
+        tf = timeframe.lower()
+        entry = self._bar_cache.get(ref.symbol, tf)
 
-        tz = ZoneInfo(ref.market.timezone)
-        bars = YahooFinanceAdapter.fetch_bars(ref.symbol, timeframe=timeframe, tz=tz)
-        if bars:
-            with self._lock:
-                self._bars_cache[key] = (now, bars)
-            return bars
-        return cached[1] if cached else []
+        if entry:
+            if not self._bar_cache.is_fresh(entry, tf):
+                self._schedule_refresh(ref.symbol, tf)
+            return entry.bars, entry.fetched_at
+
+        if self._enabled and not self._bar_cache.is_cooling(ref.symbol, tf):
+            bars = self._fetch_cold_bars(ref.symbol, tf)
+            if bars:
+                return bars, self._bar_cache.fetched_at_of(ref.symbol, tf)
+
+        return [], 0.0
+
+    def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
+        bars, _ = self.get_bars_with_meta(symbol, timeframe)
+        return bars
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
@@ -213,6 +286,26 @@ class YahooQuoteFeed:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        with self._refresh_pool_lock:
+            pool, self._refresh_pool = self._refresh_pool, None
+        if pool is not None:
+            # An in-flight Yahoo call must not hold up a shutdown.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def health(self) -> Dict[str, object]:
+        """Polling state, for the health probe and for ops questions.
+
+        There is no socket to report: this feed is a poller, so the useful
+        facts are whether it is running and how many symbols it is watching.
+        """
+        with self._lock:
+            watching = len(set(self._active) | set(self._on_demand))
+        return {
+            "provider": "yahoo",
+            "enabled": bool(self._enabled),
+            "running": bool(self._running),
+            "watching": watching,
+        }
 
     async def _poll_loop(self) -> None:
         while self._running:

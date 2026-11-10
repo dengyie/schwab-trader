@@ -7,6 +7,8 @@ Every market-data and order endpoint accepts symbols from any supported market
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import time
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,11 @@ from app.core.markets import (
     within_day_range,
 )
 from app.core.timeframes import TIMEFRAME_SECONDS, TIMEFRAME_TTLS
+
+# Outer bound on the feed probes behind /api/health. Each feed already caps
+# itself (MultiMarketFeed.HEALTH_PROBE_TIMEOUT); this covers a feed that
+# ignores its own budget, and stays under the deploy gate's curl timeout.
+HEALTH_BUDGET = 2.0
 
 
 class OrderRequest(BaseModel):
@@ -188,13 +195,34 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         # Async on purpose: the deploy health gate must be answered by the
         # event loop, never queued behind threadpool work, so a busy feed
         # cannot turn a liveness probe into a timeout.
-        return {
+        payload: Dict[str, Any] = {
             "status": "ok",
             "service": "schwab-trader-hub",
             "market_data_provider": settings.market_data_provider,
             "broker_provider": settings.broker_provider,
             "markets": MARKETS.codes(),
         }
+        # Liveness stays "ok": the process serves REST and the deploy gate must
+        # not flap on it. A rejected upstream stream is reported next to it,
+        # because that failure is otherwise invisible (no ticks looks the same
+        # as a quiet market).
+        feeds = getattr(actual_feed, "health", None)
+        if callable(feeds):
+            try:
+                feed_health = feeds()
+                if inspect.isawaitable(feed_health):
+                    # The feed probes upstream state; a hung probe must not
+                    # hang liveness longer than its own budget.
+                    feed_health = await asyncio.wait_for(feed_health, timeout=HEALTH_BUDGET)
+            except Exception as exc:
+                feed_health = {"error": str(exc)}
+            payload["feeds"] = feed_health
+            if isinstance(feed_health, dict) and any(
+                isinstance(entry, dict) and entry.get("quota_exceeded")
+                for entry in feed_health.values()
+            ):
+                payload["degraded"] = ["market_stream_quota_exceeded"]
+        return payload
 
     @router.get("/auth/verify", dependencies=[Depends(require_auth)])
     def verify_token():

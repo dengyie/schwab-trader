@@ -8,8 +8,9 @@ provider answered.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.core.markets import resolve_symbol
 from app.models.trading import Bar, Quote, Trade
@@ -18,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class MultiMarketFeed:
+    # A feed probe that hangs must not hang the health endpoint: the deploy
+    # gate gives up long before this, and a timed-out feed is itself the
+    # signal we want to report.
+    HEALTH_PROBE_TIMEOUT = 1.0
+
     def __init__(self, us_feed, intl_feed, us_market_code: str = "US"):
         self._us = us_feed
         self._intl = intl_feed
@@ -154,6 +160,47 @@ class MultiMarketFeed:
                 await feed.stop()
             except Exception:
                 pass
+
+    # -- health -----------------------------------------------------------
+    async def health(self) -> Dict[str, Any]:
+        """Per-venue feed state, so a probe can name the degraded feed.
+
+        A whole-app "ok" hides the two cases that matter operationally: the US
+        stream being rejected while REST keeps prices moving, and the US feed
+        itself failing to answer at all. The former already shows up as
+        ``quota_exceeded`` / ``consecutive_failures``; here a feed that takes
+        more than ``HEALTH_PROBE_TIMEOUT`` to reply, or that raises, is reported
+        as degraded rather than silently dropped.
+        """
+        async def _probe(feed: object, method: str) -> Dict[str, Any]:
+            getter = getattr(feed, method, None)
+            if not callable(getter):
+                return {"state": "unavailable",
+                        "error": f"feed has no callable {method}()"}
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(asyncio.to_thread(getter))
+            try:
+                done, _ = await asyncio.wait({task}, timeout=self.HEALTH_PROBE_TIMEOUT)
+            finally:
+                if not task.done():
+                    task.cancel()
+            if not done:
+                return {"state": "unreachable", "connected": False,
+                        "error": f"{method}() timed out after "
+                                 f"{self.HEALTH_PROBE_TIMEOUT:.1f}s"}
+            try:
+                result = task.result()
+            except Exception as exc:
+                return {"state": "unreachable", "connected": False, "error": str(exc)}
+            if not isinstance(result, dict):
+                return {"state": "unreachable", "connected": False,
+                        "error": f"{method}() returned {type(result).__name__}"}
+            return result
+
+        return {
+            "us": await _probe(self._us, "stream_health"),
+            "intl": await _probe(self._intl, "health"),
+        }
 
     # -- attributes read by the API layer ---------------------------------
     @property
