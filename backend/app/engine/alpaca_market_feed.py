@@ -218,6 +218,12 @@ class AlpacaMarketFeedService:
             logger.warning("AlpacaMarketFeedService: Failed to preload historical bars: %s", e)
 
     def _preload_bars_from_rest(self, client: httpx.Client, sym: str) -> None:
+        # Deliberately kept out of the bar cache. These are the IEX venue's own
+        # bars (~2% of consolidated volume); the cache's 1m entries are the
+        # consolidated series the chart draws. Persisting them would let a
+        # restart serve a candle from the wrong venue and look like a hit, and
+        # the real one could not replace it until the TTL expired. They live
+        # for this process only, as a last-resort fallback for ``get_bars``.
         try:
             bars_resp = client.get(
                 f"{self.data_base_url}/stocks/{sym}/bars",
@@ -824,8 +830,17 @@ class AlpacaMarketFeedService:
     async def _prewarm_cache_loop(self) -> None:
         """
         Background task:
-        Smoothly pre-warms key candles (15m, 1h, 1d) for core symbols (SPY, QQQ, AAPL, NVDA, TSLA) in RAM.
-        Runs gently with rate-limit protection so user requests are served in < 1ms.
+        Smoothly pre-warms key candles (1m, 5m, 15m, 1h, 1d) for core symbols
+        (SPY, QQQ, AAPL, NVDA, TSLA).
+        Runs gently with rate-limit protection so user requests are served
+        without waiting on Yahoo.
+
+        1m is in the list because it is the timeframe the chart opens on, and
+        it is the one a fresh deploy cannot already have: the boot preload
+        fills it from the IEX venue, which is not the consolidated series
+        ``get_bars`` serves. Leaving it out meant the first minute chart after
+        every deploy paid a full upstream round-trip, then stayed cold on disk
+        until someone happened to request it again.
 
         Skipped entirely while no client is connected: candle payloads are
         megabytes of JSON parsed on the event loop, and prewarming for an
@@ -833,7 +848,7 @@ class AlpacaMarketFeedService:
         """
         await asyncio.sleep(2.0)
         core_symbols = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA"]
-        core_timeframes = ["5m", "15m", "1h", "4h", "1d"]
+        core_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
         while self._running:
             try:
