@@ -121,6 +121,28 @@ def test_unknown_timeframe_returns_empty():
     assert YahooFinanceAdapter.fetch_bars("SPY", timeframe="bogus") == []
 
 
+def test_long_horizon_timeframes_are_mapped_and_registered():
+    """Weekly / monthly candles are what let a chart reach back years.
+
+    The adapter map and the API whitelist must never drift: a timeframe the
+    chart offers but the registry lacks would 400 at the route, and one the
+    registry has but the adapter lacks would silently fetch nothing.
+    """
+    from app.core.timeframes import TIMEFRAME_SECONDS, YAHOO_TIMEFRAME_MAP
+
+    assert set(YAHOO_TIMEFRAME_MAP) == set(TIMEFRAME_SECONDS)
+
+    # Weekly reaches a decade, monthly reaches the whole listing history.
+    assert YAHOO_TIMEFRAME_MAP["1wk"] == ("1wk", "10y")
+    assert YAHOO_TIMEFRAME_MAP["1mo"] == ("1mo", "max")
+    # Daily spans the asked-for five years.
+    assert YAHOO_TIMEFRAME_MAP["1d"] == ("1d", "5y")
+
+    # The case trap: the API lowercases input, so a client sending "1M" lands
+    # on the 1-minute key. Monthly is spelled "1mo" and never collides.
+    assert {"1m", "1wk", "1mo"} <= set(TIMEFRAME_SECONDS)
+
+
 def test_bar_cache_is_bounded(monkeypatch):
     feed = _make_feed(monkeypatch)
     for i in range(MAX_CACHE_ENTRIES + 20):

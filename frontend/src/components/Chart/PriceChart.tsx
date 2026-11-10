@@ -13,7 +13,7 @@ import { Icon } from '../Icon';
 import styles from './PriceChart.module.css';
 
 export type ChartType = 'line' | 'candlestick';
-export type TimeRange = '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
+export type TimeRange = '1m' | '5m' | '15m' | '1h' | '4h' | '1d' | '1wk' | '1mo';
 export type Indicator = 'MA' | 'EMA' | 'BOLL' | 'VOL';
 
 // 图表颜色配置
@@ -67,6 +67,10 @@ const INTERVAL_MAP: Record<TimeRange, string> = {
   '1h': '1h',
   '4h': '4h',
   '1d': '1d',
+  // Backend keys are deliberately "1wk"/"1mo" (the API lowercases input, so a
+  // bare "1M" would collide with the 1-minute key).
+  '1wk': '1wk',
+  '1mo': '1mo',
 };
 
 const TIMEFRAME_SECONDS: Record<TimeRange, number> = {
@@ -76,6 +80,31 @@ const TIMEFRAME_SECONDS: Record<TimeRange, number> = {
   '1h': 3600,
   '4h': 14400,
   '1d': 86400,
+  '1wk': 604800,
+  '1mo': 2592000,
+};
+
+// 按钮文案与跨度提示：让"能看到多久"一眼可见，而不是靠猜缩写。
+const RANGE_LABELS: Record<TimeRange, string> = {
+  '1m': '1m',
+  '5m': '5m',
+  '15m': '15m',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+  '1wk': '1周',
+  '1mo': '1月',
+};
+
+const RANGE_HINTS: Record<TimeRange, string> = {
+  '1m': '分钟K · 近7天',
+  '5m': '近1个月',
+  '15m': '近1个月',
+  '1h': '近6个月',
+  '4h': '近1年',
+  '1d': '日K · 近5年',
+  '1wk': '周K · 近10年',
+  '1mo': '月K · 全部历史',
 };
 
 // 计算移动平均线
@@ -920,13 +949,14 @@ export function PriceChart() {
 
           {/* 时间周期 */}
           <div className={styles.timeRangeGroup}>
-            {(['1m', '5m', '15m', '1h', '4h', '1d'] as TimeRange[]).map((range) => (
+            {(['1m', '5m', '15m', '1h', '4h', '1d', '1wk', '1mo'] as TimeRange[]).map((range) => (
               <button
                 key={range}
                 className={`${styles.timeRangeBtn} ${timeRange === range ? styles.active : ''}`}
                 onClick={() => setTimeRange(range)}
+                title={RANGE_HINTS[range]}
               >
-                {range}
+                {RANGE_LABELS[range]}
               </button>
             ))}
           </div>

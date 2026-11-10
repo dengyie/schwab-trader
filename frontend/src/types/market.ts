@@ -29,7 +29,7 @@ export interface OrderBook {
 
 export interface Candle {
   symbol: string;
-  interval: '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
+  interval: '1m' | '5m' | '15m' | '1h' | '4h' | '1d' | '1wk' | '1mo';
   openTime: number;
   open: string;
   high: string;

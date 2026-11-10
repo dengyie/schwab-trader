@@ -78,6 +78,17 @@ def test_market_endpoints():
         # Unsupported timeframe must be rejected, never silently substituted.
         assert client.get("/api/market/bars?symbol=SPY&timeframe=bogus", headers=AUTH).status_code == 400
 
+        # Long-horizon timeframes are first-class: weekly/monthly candles are
+        # how the chart reaches one year, five years and all history.
+        for tf in ("1wk", "1mo"):
+            r = client.get(f"/api/market/bars?symbol=SPY&timeframe={tf}", headers=AUTH)
+            assert r.status_code == 200, (tf, r.status_code)
+            assert isinstance(r.json(), list)
+
+        # The lowercase trap: "1M" must resolve to the 1-minute key, not fail.
+        r = client.get("/api/market/bars?symbol=SPY&timeframe=1M", headers=AUTH)
+        assert r.status_code == 200
+
         # 2. Latest quote
         resp_quote = client.get("/api/market/quote?symbol=SPY", headers=AUTH)
         assert resp_quote.status_code == 200
