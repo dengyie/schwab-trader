@@ -34,6 +34,35 @@ MAX_CACHE_ENTRIES = 300
 # 40ms conflation). IEX prints far faster than any screen can redraw.
 QUOTE_EMIT_SECONDS = 0.04
 
+# Reconnect policy. A connection only earns a fresh backoff once it has
+# actually stayed up; see ``next_reconnect_backoff`` for why.
+INITIAL_RECONNECT_BACKOFF = 1.0
+MAX_RECONNECT_BACKOFF = 30.0
+STABLE_CONNECTION_SECONDS = 30.0
+
+
+def next_reconnect_backoff(
+    backoff: float,
+    connected_seconds: float,
+    *,
+    stable_after: float = STABLE_CONNECTION_SECONDS,
+    factor: float = 1.5,
+    cap: float = MAX_RECONNECT_BACKOFF,
+) -> float:
+    """Backoff for the next reconnect attempt.
+
+    Resetting to one second on every successful ``connect`` is not safe: the
+    stream can accept the socket and then drop it seconds later (Alpaca evicts
+    duplicate sessions for one key, and a second backend sharing production
+    credentials produces exactly that endless ping-pong). Under that pattern a
+    connect-based reset reconnects every second forever, hammering the endpoint
+    and masking the cause. Only a connection that stayed up long enough earns a
+    clean slate; short-lived ones keep escalating.
+    """
+    if connected_seconds >= stable_after:
+        return INITIAL_RECONNECT_BACKOFF
+    return min(backoff * factor, cap)
+
 
 class AlpacaMarketFeedService:
     """
@@ -486,12 +515,12 @@ class AlpacaMarketFeedService:
 
     async def _websocket_listener_loop(self) -> None:
         """Connects and reconnects to Alpaca IEX stream with exponential backoff."""
-        backoff = 1.0
+        backoff = INITIAL_RECONNECT_BACKOFF
         while self._running:
+            connected_at = time.monotonic()
             try:
                 async with websockets.connect(self.stream_url, ping_interval=20, ping_timeout=20) as ws:
                     logger.info("Connected to Alpaca IEX Streamer: %s", self.stream_url)
-                    backoff = 1.0
 
                     # 1. Wait for connection confirmation
                     init_msg = await ws.recv()
@@ -506,6 +535,14 @@ class AlpacaMarketFeedService:
                     await ws.send(json.dumps(auth_msg))
                     auth_resp = await ws.recv()
                     auth_data = json.loads(auth_resp)
+                    for item in auth_data if isinstance(auth_data, list) else [auth_data]:
+                        if isinstance(item, dict) and item.get("T") == "error":
+                            # Wrong key, or another backend already holds the
+                            # session for this key. Fail loudly instead of
+                            # looping on a subscription that will never tick.
+                            raise RuntimeError(
+                                f"Alpaca stream auth rejected: {item.get('msg')} (code={item.get('code')})"
+                            )
 
                     # 3. Subscribe to quotes and bars
                     sub_msg = {
@@ -526,6 +563,13 @@ class AlpacaMarketFeedService:
 
                         for item in items:
                             t_type = item.get("T")
+                            if t_type == "error":
+                                logger.error(
+                                    "Alpaca stream error: %s (code=%s)",
+                                    item.get("msg"),
+                                    item.get("code"),
+                                )
+                                continue
                             sym = item.get("S", "").upper()
                             if not sym:
                                 continue
@@ -589,9 +633,25 @@ class AlpacaMarketFeedService:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning("Alpaca Streamer disconnected (%s), reconnecting in %.1fs...", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, 30.0)
+                # A close frame carries the *reason* the stream hung us up on
+                # (Alpaca evicts duplicate sessions for one key), so surface
+                # code/reason instead of the opaque exception text alone.
+                # Read them off the frame: ``ConnectionClosed.code``/``.reason``
+                # are deprecated since websockets 13.1.
+                close_frame = getattr(e, "rcvd", None) or getattr(e, "sent", None)
+                close_code = getattr(close_frame, "code", None)
+                close_reason = getattr(close_frame, "reason", None)
+                uptime = time.monotonic() - connected_at
+                delay = backoff
+                backoff = next_reconnect_backoff(backoff, uptime)
+                logger.warning(
+                    "Alpaca Streamer disconnected (%s%s) after %.0fs, reconnecting in %.1fs...",
+                    e,
+                    f", code={close_code}, reason={close_reason!r}" if close_code is not None else "",
+                    uptime,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     async def _periodic_quote_sync_loop(self) -> None:
         """

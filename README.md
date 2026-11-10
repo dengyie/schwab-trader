@@ -103,8 +103,15 @@ The repository includes an all-in-one startup script that checks environments an
 git clone https://github.com/dengyie/schwab-trader.git
 cd schwab-trader
 
-# Run the automated launch script
+# Run the automated launch script — sim mode by default (synthetic quotes,
+# in-process virtual broker, no Alpaca session, login token: local-dev-token)
 ./start.sh
+
+# Real Alpaca IEX stream + paper-trading account
+# (credentials from ALPACA_API_KEY/ALPACA_API_SECRET/ADMIN_TOKEN, or
+#  ~/.config/schwab-trader/prod.env). Stop the production service first:
+# two processes sharing one key evict each other's stream every few seconds.
+./start.sh --real
 ```
 
 ### 2. Manual Launch
@@ -118,6 +125,10 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Sim mode needs no credentials; without these the app refuses to boot in
+# alpaca mode (it would have nothing to authenticate with).
+export MARKET_DATA_PROVIDER=simulation BROKER_PROVIDER=virtual ADMIN_TOKEN=local-dev-token
 
 # Start FastAPI server on 127.0.0.1:8000
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
