@@ -531,6 +531,15 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             "base_currency": "USD",
         }
 
+    @router.get("/portfolio/history", dependencies=[Depends(require_auth)])
+    def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> Dict[str, Any]:
+        # None means "no history at the venue" (fresh account, or Alpaca down
+        # and nothing cached): the client shows its empty state, never zeros.
+        history = broker.get_equity_history(period=period, timeframe=timeframe)
+        if not history:
+            raise HTTPException(status_code=404, detail="equity history unavailable")
+        return {"base_currency": "USD", **history}
+
     @router.get("/orders", dependencies=[Depends(require_auth)])
     def list_orders() -> List[Dict[str, Any]]:
         orders = broker.get_orders()

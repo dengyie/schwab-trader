@@ -75,3 +75,12 @@ class BaseBroker(ABC):
         this so a quiet market is not reported as a broken live feed.
         """
         return None
+
+    def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
+        """
+        Account equity curve: {"points": [{time, equity}, ...], "base_value": float}.
+
+        Returns None when the venue records no history; the UI shows an empty
+        state instead of a fabricated curve.
+        """
+        return None

@@ -53,6 +53,8 @@ class AlpacaPaperBroker(BaseBroker):
         self._clock_cached: Optional[dict] = None
         self._clock_cached_at: float = 0.0
         self._clock_ttl: float = 15.0
+        # Equity curve per (period, timeframe); venue writes it once per close.
+        self._equity_history_cache: Dict[str, tuple] = {}
 
         # Fill detection state: last observed filled quantity per order
         self._last_order_status: Dict[str, OrderStatus] = {}
@@ -264,3 +266,51 @@ class AlpacaPaperBroker(BaseBroker):
         except Exception:
             # A broker hiccup must not erase the last known session state.
             return dict(self._clock_cached) if self._clock_cached else None
+
+    # Equity history is only written once per session close, so every open
+    # terminal can share one upstream answer for minutes at a time.
+    EQUITY_HISTORY_TTL: float = 300.0
+    EQUITY_HISTORY_PERIODS: Dict[str, str] = {
+        "1D": "1D", "1W": "1W", "1M": "1M", "3M": "3M", "1A": "1A", "ALL": "ALL",
+    }
+
+    def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
+        """Account equity curve from Alpaca's portfolio history endpoint.
+
+        Returns ``{"points": [{time, equity, ...}], "base_value": float}`` or
+        ``None`` when the venue has no history (fresh account) or the call
+        fails; the UI renders an explicit empty state, never a fake curve.
+        Dropped/na day entries (null equity) are skipped, not zero-filled.
+        """
+        period = self.EQUITY_HISTORY_PERIODS.get(period.upper(), "1M")
+        now = time.time()
+        cache_key = f"{period}:{timeframe}"
+        cached = self._equity_history_cache.get(cache_key)
+        if cached is not None and now - cached[1] < self.EQUITY_HISTORY_TTL:
+            return {**cached[0], "points": [dict(p) for p in cached[0]["points"]]}
+
+        try:
+            resp = self.client.get(
+                f"{self.base_url}/account/portfolio/history",
+                params={"period": period, "timeframe": timeframe},
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            timestamps = data.get("timestamp") or []
+            equities = data.get("equity") or []
+            points = [
+                {"time": ts, "equity": eq}
+                for ts, eq in zip(timestamps, equities)
+                if eq is not None
+            ]
+            if len(points) < 2:
+                return None
+            result = {"points": points, "base_value": data.get("base_value")}
+            self._equity_history_cache[cache_key] = (result, now)
+            return {**result, "points": [dict(p) for p in points]}
+        except Exception:
+            # Serve the last good curve rather than blanking the chart on a
+            # transient broker hiccup; None only when nothing was ever fetched.
+            stale = self._equity_history_cache.get(cache_key)
+            return {**stale[0], "points": [dict(p) for p in stale[0]["points"]]} if stale else None

@@ -478,3 +478,42 @@ def test_market_tickers_conditional_request(monkeypatch):
     assert r3.status_code == 200
     assert r3.json()[0]["price"] == 100.5
     assert r3.headers.get("etag") != etag
+
+
+def test_portfolio_history_endpoint(monkeypatch):
+    """/api/portfolio/history forwards to the venue curve; a fresh account
+    (no history) is a 404 the client maps to its empty state, never zeros."""
+    from fastapi import FastAPI
+
+    from app.api.routes import create_api_router
+
+    class _Broker:
+        def __init__(self, history):
+            self._history = history
+            self.calls = []
+
+        def get_equity_history(self, period="1M", timeframe="1D"):
+            self.calls.append((period, timeframe))
+            return self._history
+
+    curve = {
+        "points": [{"time": 1791849600, "equity": 100000.0},
+                   {"time": 1791936000, "equity": 100500.0}],
+        "base_value": 100000.0,
+    }
+    broker = _Broker(curve)
+    app = FastAPI(); app.include_router(create_api_router(broker, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+    resp = client.get("/api/portfolio/history?period=1M", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["base_currency"] == "USD"
+    assert body["points"] == curve["points"]
+    assert broker.calls == [("1M", "1D")]
+
+    # Fresh account: the venue has no curve yet.
+    empty = _Broker(None)
+    app2 = FastAPI(); app2.include_router(create_api_router(empty, _StubBarsFeed([], 0.0)))
+    client2 = TestClient(app2)
+    assert client2.get("/api/portfolio/history", headers=AUTH).status_code == 404
+    assert client2.get("/api/portfolio/history").status_code == 401

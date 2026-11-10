@@ -435,3 +435,65 @@ def test_cancelling_an_order_invalidates_the_order_cache(monkeypatch):
     assert returned is not None
     assert returned.status == OrderStatus.CANCELLED
     assert broker._orders_cached_at == 0.0
+
+
+# -- Equity history ---------------------------------------------------------
+def _history_payload():
+    return {
+        "timestamp": [1791849600, 1791936000, 1792022400, 1792108800],
+        "equity": [100000.0, 100500.0, None, 101200.0],
+        "base_value": 100000.0,
+    }
+
+
+def test_equity_history_parses_and_skips_null_days(monkeypatch):
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, _history_payload()))
+    history = broker.get_equity_history(period="1M")
+    assert history is not None
+    # The venue reports a null equity for non-trading days; zero-filling those
+    # would draw a fake crash to $0 in the middle of the curve.
+    assert [p["equity"] for p in history["points"]] == [100000.0, 100500.0, 101200.0]
+    assert history["base_value"] == 100000.0
+
+
+def test_equity_history_is_cached_and_returns_a_copy(monkeypatch):
+    import time as _time
+
+    calls = []
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+
+    class _CountingResp(_FakeClockResponse):
+        def json(self):
+            calls.append(1)
+            return super().json()
+
+    monkeypatch.setattr(broker.client, "get", lambda *a, **kw: _CountingResp(200, _history_payload()))
+
+    first = broker.get_equity_history()
+    first["points"][0]["equity"] = 999.0  # a caller mutating its copy...
+    second = broker.get_equity_history()
+    assert calls == [1], "the 5-minute TTL must collapse repeated polls"
+    assert second["points"][0]["equity"] == 100000.0, "...must not poison the cache"
+
+
+def test_equity_history_fresh_account_maps_to_none(monkeypatch):
+    # A brand-new account gets an all-null or empty series from Alpaca;
+    # two real points are the minimum a chart can draw.
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, {"timestamp": [1, 2], "equity": [None, None]}))
+    assert broker.get_equity_history() is None
+
+
+def test_equity_history_upstream_failure_maps_to_none(monkeypatch):
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(500, {}))
+    assert broker.get_equity_history() is None
+
+
+def test_equity_history_serves_stale_curve_on_transient_failure(monkeypatch):
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    monkeypatch.setattr(broker.client, "get", lambda *a, **kw: _FakeClockResponse(200, _history_payload()))
+    assert broker.get_equity_history() is not None
+
+    monkeypatch.setattr(broker.client, "get", lambda *a, **kw: _FakeClockResponse(503, {}))
+    still = broker.get_equity_history()
+    assert still is not None
+    assert still["points"][-1]["equity"] == 101200.0

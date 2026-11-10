@@ -623,6 +623,12 @@ export const zhCN = {
   },
 
   // 钱包页
+  assets: {
+    portfolioGrowth: '组合增长',
+    equityLoading: '净值历史加载中…',
+    equityUnavailable: '券商尚未记录净值历史。',
+  },
+
   wallet: {
     title: '钱包',
     comingSoon: '钱包页面即将推出...',

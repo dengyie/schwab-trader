@@ -206,3 +206,7 @@ class MarketRouterBroker(BaseBroker):
             if live:
                 return {**market_clock(market_def), **live}
         return market_clock(market_def)
+
+    def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
+        """Equity curve comes from the venue that holds the account (US)."""
+        return self._us.get_equity_history(period=period, timeframe=timeframe)

@@ -624,6 +624,12 @@ export const enUS: Locale = {
   },
 
   // Wallet
+  assets: {
+    portfolioGrowth: 'Portfolio Growth',
+    equityLoading: 'Loading equity history…',
+    equityUnavailable: 'Equity history is not recorded by the venue yet.',
+  },
+
   wallet: {
     title: 'Wallet',
     comingSoon: 'Wallet page coming soon...',

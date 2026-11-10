@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from 'react';
+import { useMemo, useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   useWalletStore, selectAccount,
@@ -11,6 +11,7 @@ import { useI18n } from '../i18n';
 import { Icon, IconName } from '../components/Icon';
 import { Sparkline } from '../components/Chart/Sparkline';
 import { formatMoney } from '../utils/money';
+import { apiFetch } from '../services/apiClient';
 import type { Position } from '../types/trading';
 import styles from './AssetDetailPage.module.css';
 import Decimal from 'decimal.js';
@@ -18,6 +19,12 @@ import Decimal from 'decimal.js';
 type TimeRange = '1D' | '7D' | '30D' | 'ALL';
 type SortField = 'value' | 'balance' | 'pnl' | 'pnlPercent';
 type SortOrder = 'asc' | 'desc';
+
+/** Venue equity curve, one point per session close (Alpaca portfolio history). */
+type EquityHistory = { points: { time: number; equity: number }[]; baseValue: number | null };
+
+// The venue only maps day-granular periods; a week of trading days is "1W".
+const HISTORY_PERIODS: Record<TimeRange, string> = { '1D': '1D', '7D': '1W', '30D': '1M', 'ALL': 'ALL' };
 
 // 格式化数字
 function formatNumber(value: number, decimals = 2): string {
@@ -453,11 +460,13 @@ function ActivityItem({
 }
 
 export function AssetDetailPage() {
-  const { t: _t } = useI18n();
+  const { t } = useI18n();
   const navigate = useNavigate();
   
   // State
   const [timeRange, setTimeRange] = useState<TimeRange>('30D');
+  const [equityHistory, setEquityHistory] = useState<EquityHistory | null>(null);
+  const [equityLoading, setEquityLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [sortField, setSortField] = useState<SortField>('value');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
@@ -473,6 +482,32 @@ export function AssetDetailPage() {
   const symbols = useWatchlistStore((state) => state.symbols);
   const setSelectedSymbol = useWatchlistStore((state) => state.setSelectedSymbol);
   const fxRates = useMarketsStore((state) => state.fxRates);
+
+  // 券商端的逐日净值曲线（Alpaca portfolio history）。404 表示账户太新、
+  // 场内还没有历史——保留 null 让空态文案出现，绝不拿 0 值伪造走势。
+  useEffect(() => {
+    let cancelled = false;
+    setEquityLoading(true);
+    apiFetch(`/portfolio/history?period=${HISTORY_PERIODS[timeRange]}&timeframe=1D`)
+      .then(async (res) => {
+        if (cancelled) return;
+        if (!res.ok) {
+          if (res.status !== 401) setEquityHistory(null);
+          return;
+        }
+        const data = await res.json();
+        setEquityHistory({
+          points: (data.points || []).map((p: { time: number; equity: number }) => ({
+            time: p.time,
+            equity: p.equity,
+          })),
+          baseValue: data.base_value ?? null,
+        });
+      })
+      .catch(() => { if (!cancelled) setEquityHistory(null); })
+      .finally(() => { if (!cancelled) setEquityLoading(false); });
+    return () => { cancelled = true; };
+  }, [timeRange]);
 
   const usdPerUnit = useCallback(
     (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1,
@@ -627,8 +662,11 @@ export function AssetDetailPage() {
     };
   }, [assetList, brokerMetrics]);
 
-  // 券商不提供逐日净值曲线；没有真实历史就不要用随机数伪造走势。
-  const portfolioHistoryData = useMemo<number[]>(() => [], []);
+  // 券商净值曲线 → 图表点序列；没有真实历史就保持空数组走空态。
+  const portfolioHistoryData = useMemo<number[]>(
+    () => (equityHistory ? equityHistory.points.map((p) => p.equity) : []),
+    [equityHistory],
+  );
 
   // Trading stats. 成交额按标的币种换算成 USD，否则港币/日元成交会被
   // 当成美元累加；价格同样优先用券商快照，本地行情只是回退。
@@ -898,7 +936,7 @@ export function AssetDetailPage() {
         
         <div className={styles.heroChart}>
           <div className={styles.chartHeader}>
-            <span className={styles.chartTitle}>Portfolio Growth</span>
+            <span className={styles.chartTitle}>{t.assets?.portfolioGrowth ?? 'Portfolio Growth'}</span>
             {portfolioHistoryData.length >= 2 && (
               <div className={styles.timeRangeSelector}>
                 {(['1D', '7D', '30D', 'ALL'] as TimeRange[]).map(range => (
@@ -915,18 +953,23 @@ export function AssetDetailPage() {
           </div>
           <div className={styles.chartContainer}>
             {portfolioHistoryData.length >= 2 ? (
-              <PortfolioChart 
-                data={portfolioHistoryData} 
+              <PortfolioChart
+                data={portfolioHistoryData}
                 color={totals.totalPnl >= 0 ? 'var(--color-success)' : 'var(--color-error)'}
                 height={120}
                 timeRange={timeRange}
                 fmt={(v) => formatMoney(v, 'USD', { decimals: 0 })}
               />
-            ) : (
-              // 券商不返回净值曲线；宁可留空也不画一条随机生成的假走势。
+            ) : equityLoading ? (
               <div className={styles.chartEmpty}>
                 <Icon name="bar-chart-2" size="lg" />
-                <span>Equity history is not recorded by the venue yet.</span>
+                <span>{t.assets?.equityLoading ?? 'Loading equity history…'}</span>
+              </div>
+            ) : (
+              // 券商不返回净值曲线（账户太新或上游不可用）；宁可留空也不画一条随机生成的假走势。
+              <div className={styles.chartEmpty}>
+                <Icon name="bar-chart-2" size="lg" />
+                <span>{t.assets?.equityUnavailable ?? 'Equity history is not recorded by the venue yet.'}</span>
               </div>
             )}
           </div>
