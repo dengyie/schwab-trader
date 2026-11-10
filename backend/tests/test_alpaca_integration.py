@@ -313,3 +313,69 @@ def test_alpaca_live_account_and_market_data():
         assert "quote" in quote_data
         assert float(quote_data["quote"].get("bp", 0)) > 0
 
+
+
+# -- account cache invalidation --------------------------------------------
+def _order_json(order_id="ord-1"):
+    return {
+        "id": order_id,
+        "client_order_id": f"cli-{order_id}",
+        "symbol": "SPY",
+        "side": "buy",
+        "type": "limit",
+        "qty": "1",
+        "filled_qty": "0",
+        "status": "new",
+        "limit_price": "600.00",
+        "created_at": "2026-11-10T15:00:00Z",
+        "updated_at": "2026-11-10T15:00:00Z",
+    }
+
+
+def test_submitting_an_order_invalidates_the_account_caches(monkeypatch):
+    """A fresh order must show up on the next portfolio/orders read.
+
+    The 5s TTL is what makes the panel cheap to poll; without this
+    invalidation the user would submit a trade and watch an unchanged book
+    for up to five seconds.
+    """
+    import time as _time
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    broker._portfolio_cached_at = _time.time()
+    broker._orders_cached_at = _time.time()
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return _order_json()
+
+    monkeypatch.setattr(broker.client, "post", lambda *a, **kw: _Resp())
+
+    order = broker.submit_order("SPY", OrderSide.BUY, OrderType.LIMIT, 1, price=600.0)
+    assert order.order_id == "ord-1"
+    assert broker._portfolio_cached_at == 0.0
+    assert broker._orders_cached_at == 0.0
+
+
+def test_cancelling_an_order_invalidates_the_order_cache(monkeypatch):
+    import time as _time
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    order = AlpacaDataAdapter.parse_order_to_domain(_order_json())
+    broker.cached_orders[order.order_id] = order
+    broker._orders_cached_at = _time.time()
+
+    class _Resp:
+        status_code = 204
+
+    monkeypatch.setattr(broker.client, "delete", lambda *a, **kw: _Resp())
+
+    returned = broker.cancel_order(order.order_id)
+    assert returned is not None
+    assert returned.status == OrderStatus.CANCELLED
+    assert broker._orders_cached_at == 0.0

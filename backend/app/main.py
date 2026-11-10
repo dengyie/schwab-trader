@@ -84,6 +84,13 @@ def _configure_logging() -> None:
 
 _configure_logging()
 
+# Where process state lives across restarts. Resolved first because the market
+# feed persists its bar cache here too (a deploy should not start cold).
+state_dir = (
+    resolve_state_dir(settings.state_dir) if settings.state_persist_enabled else None
+)
+market_cache_dir = os.path.join(state_dir, "market_cache") if state_dir else None
+
 # 1. Market Data Provider Factory
 if settings.market_data_provider == "alpaca":
     if not settings.alpaca_api_key or not settings.alpaca_api_secret:
@@ -96,7 +103,8 @@ if settings.market_data_provider == "alpaca":
         api_secret=settings.alpaca_api_secret,
         stream_url=settings.alpaca_data_stream_url,
         data_base_url=settings.alpaca_data_base_url,
-        feed=settings.alpaca_feed
+        feed=settings.alpaca_feed,
+        cache_dir=market_cache_dir,
     )
 else:
     us_feed = MarketFeedService(initial_symbols=settings.default_symbols)
@@ -110,9 +118,6 @@ feed = MultiMarketFeed(us_feed, intl_feed)
 ledger = PortfolioLedger(initial_capital=settings.initial_capital, fx=fx)
 # The virtual book must outlive a deploy: US positions live at Alpaca, but
 # HK / JP / CN are matched in-process and would otherwise be wiped on restart.
-state_dir = (
-    resolve_state_dir(settings.state_dir) if settings.state_persist_enabled else None
-)
 state_store = JsonStateStore(state_dir) if state_dir else None
 if state_dir:
     logging.getLogger("app.main").info("Virtual book state directory: %s", state_dir)

@@ -2,6 +2,7 @@
 Integration tests for FastAPI REST endpoints and WebSocket communication flow.
 """
 import os
+import time
 import pytest
 
 # Enforce virtual matching engine and local simulated feed during integration unit testing
@@ -300,3 +301,100 @@ def test_multi_market_catalog_and_rules():
         assert portfolio["base_currency"] == "USD"
         assert "fx_rates" in portfolio
         assert "USD" in portfolio["fx_rates"]
+
+
+# -- /api/market/bars HTTP caching -----------------------------------------
+class _StubBarsFeed:
+    """Feed double that reports exactly the freshness the API should encode."""
+
+    def __init__(self, bars, fetched_at):
+        self._bars = bars
+        self._fetched_at = fetched_at
+
+    def get_bars_with_meta(self, symbol, timeframe="15m"):
+        return self._bars, self._fetched_at
+
+
+def _bars_client(fetched_at):
+    """A bare app whose only route of interest is ``/api/market/bars``."""
+    from fastapi import FastAPI
+    from app.api.routes import create_api_router
+    from app.models.trading import Bar
+
+    bars = [
+        Bar(time=1000 + i * 60, open=100.0 + i, high=101.0 + i, low=99.0 + i,
+            close=100.5 + i, volume=10.0)
+        for i in range(3)
+    ]
+    stub = FastAPI()
+    stub.include_router(create_api_router(ledger, _StubBarsFeed(bars, fetched_at)))
+    return TestClient(stub)
+
+
+def test_bars_response_carries_cache_validators():
+    client = _bars_client(time.time())
+    resp = client.get("/api/market/bars?symbol=SPY&timeframe=15m", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert len(resp.json()) == 3
+    assert resp.headers["X-Cache"] == "HIT"
+    assert resp.headers["Age"] == "0"
+    etag = resp.headers["ETag"]
+    assert etag.startswith('W/"SPY-15m-')
+    # 15m TTL is 120s, so a just-fetched response is reusable for a while.
+    assert resp.headers["Cache-Control"].startswith("private, max-age=")
+    assert int(resp.headers["Cache-Control"].split("=")[1]) > 0
+
+
+def test_bars_conditional_request_returns_304():
+    client = _bars_client(time.time())
+    first = client.get("/api/market/bars?symbol=SPY&timeframe=15m", headers=AUTH)
+    etag = first.headers["ETag"]
+
+    second = client.get(
+        "/api/market/bars?symbol=SPY&timeframe=15m",
+        headers={**AUTH, "If-None-Match": etag},
+    )
+    assert second.status_code == 304
+    assert second.content == b""
+    assert second.headers["ETag"] == etag
+
+
+def test_bars_conditional_request_accepts_weak_and_listed_validators():
+    client = _bars_client(time.time())
+    etag = client.get("/api/market/bars?symbol=SPY&timeframe=15m", headers=AUTH).headers["ETag"]
+    opaque = etag[2:].strip('"')  # same tag without the W/ marker and quotes
+
+    listed = client.get(
+        "/api/market/bars?symbol=SPY&timeframe=15m",
+        headers={**AUTH, "If-None-Match": f'"other", {opaque}'},
+    )
+    assert listed.status_code == 304
+
+    wildcard = client.get(
+        "/api/market/bars?symbol=SPY&timeframe=15m",
+        headers={**AUTH, "If-None-Match": "*"},
+    )
+    assert wildcard.status_code == 304
+
+
+def test_stale_bars_are_served_but_marked_stale():
+    client = _bars_client(time.time() - 3600)
+    resp = client.get("/api/market/bars?symbol=SPY&timeframe=1m", headers=AUTH)
+
+    # Old data is still far more useful than an empty chart.
+    assert resp.status_code == 200
+    assert len(resp.json()) == 3
+    assert resp.headers["X-Cache"] == "STALE"
+    assert resp.headers["Cache-Control"] == "private, max-age=0"
+    assert int(resp.headers["Age"]) >= 3600
+
+
+def test_bars_without_a_fetch_time_are_not_cacheable():
+    client = _bars_client(0.0)
+    resp = client.get("/api/market/bars?symbol=SPY&timeframe=15m", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert resp.headers["X-Cache"] == "MISS"
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert "ETag" not in resp.headers

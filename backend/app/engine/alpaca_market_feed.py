@@ -8,8 +8,8 @@ import json
 import threading
 import time
 import logging
-from collections import OrderedDict
-from typing import Any, Dict, List, Callable, Optional, Set
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Callable, Optional, Set, Tuple
 from datetime import datetime, timezone
 import httpx
 import websockets
@@ -25,6 +25,8 @@ from app.core.markets import (
     within_day_range,
 )
 from app.core.timeframes import TIMEFRAME_TTLS as CORE_TIMEFRAME_TTLS
+from app.engine.bar_cache import BarCache
+from app.engine.state_store import JsonStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,9 @@ class AlpacaMarketFeedService:
     """
 
     TIMEFRAME_TTLS: Dict[str, float] = dict(CORE_TIMEFRAME_TTLS)
+    # Default for services built with ``__new__`` (tests that exercise one
+    # method): no snapshot on disk unless ``__init__`` wired one up.
+    _stats_store: Optional[JsonStateStore] = None
     # Daily context (previous close, day range, volume) is refreshed at most
     # this often. During a session the range moves; after the close it is
     # static, so a far longer TTL keeps the same consolidated close for the
@@ -98,7 +103,8 @@ class AlpacaMarketFeedService:
         api_secret: Optional[str] = None,
         stream_url: Optional[str] = None,
         data_base_url: Optional[str] = None,
-        feed: Optional[str] = None
+        feed: Optional[str] = None,
+        cache_dir: Optional[str] = None,
     ):
         self.symbols: Set[str] = set(
             sym.upper() for sym in (initial_symbols or settings.default_symbols)
@@ -122,11 +128,25 @@ class AlpacaMarketFeedService:
         self._snapshot_ts: float = 0.0
         self._snapshot_lock = threading.Lock()
 
-        # Multi-timeframe RAM cache: {symbol: {timeframe: [Bar, ...]}}
-        # OrderedDict enables oldest-first eviction when the cache grows unbounded.
-        self.multi_tf_bars: Dict[str, Dict[str, List[Bar]]] = {}
-        self._bars_cache_ts: Dict[str, Dict[str, float]] = {}
-        self._cache_order: "OrderedDict[str, None]" = OrderedDict()
+        # Multi-timeframe bars, kept on disk so a deploy does not start cold.
+        # ``cache_dir`` is None in the test suite (STATE_DIR=off), which makes
+        # this a pure RAM cache.
+        self._bar_cache = BarCache(
+            cache_dir,
+            max_entries=MAX_CACHE_ENTRIES,
+            ttl_for=lambda tf: self.TIMEFRAME_TTLS.get(tf, 60.0),
+        )
+        # Background refreshes run here so an expired entry never blocks a
+        # request on Yahoo. Two workers bound the upstream fan-out.
+        self._refresh_pool: Optional[ThreadPoolExecutor] = None
+        self._refresh_pool_lock = threading.Lock()
+        # Daily context (prev close / day range / volume) also survives a
+        # restart: re-sweeping 14 symbols at boot is pure waste.
+        self._stats_store = (
+            JsonStateStore(cache_dir, filename="market_daily_stats.json")
+            if cache_dir
+            else None
+        )
 
         self._running = False
         self._ws_task: Optional[asyncio.Task] = None
@@ -145,41 +165,44 @@ class AlpacaMarketFeedService:
             "APCA-API-SECRET-KEY": self.api_secret,
         }
 
-        # Initialize snapshot data
+        # Restore what the previous process already fetched, then fill the gaps.
+        self._load_daily_stats_snapshot()
         self._preload_historical_bars_sync()
         # Warm the consolidated daily context before the first read: the
         # preloaded REST quotes carry no trade, and a row must not briefly
-        # display a one-venue previous close as the market's.
-        self.refresh_daily_stats(force=True)
+        # display a one-venue previous close as the market's. Not forced: a
+        # snapshot restored from disk within its TTL is good enough.
+        self.refresh_daily_stats()
+
+    # The cache owns these; the names are kept because tests and the tickers
+    # route read/write them directly.
+    @property
+    def multi_tf_bars(self) -> Dict[str, Dict[str, List[Bar]]]:
+        return self._bar_cache.bars
+
+    @property
+    def _bars_cache_ts(self) -> Dict[str, Dict[str, float]]:
+        return self._bar_cache.fetched_at
 
     def _preload_historical_bars_sync(self) -> None:
-        """Fetch latest historical 1-minute bars and quotes via REST on initialization."""
+        """Fetch latest historical 1-minute bars and quotes via REST on initialization.
+
+        A restart is not a reason to refetch candles the previous process
+        already stored: a 1m cache entry younger than a day still describes
+        the same session, so it seeds ``historical_bars`` and that symbol
+        skips its REST bars call. Quotes are always refetched — a quote goes
+        stale in seconds, a past candle does not.
+        """
         try:
             with httpx.Client(headers=self.headers, timeout=15.0) as client:
                 for sym in self.symbols:
-                    # 1. Fetch individual symbol bars
-                    try:
-                        bars_resp = client.get(
-                            f"{self.data_base_url}/stocks/{sym}/bars",
-                            params={
-                                "timeframe": "1Min",
-                                "limit": 120,
-                                "feed": self.feed
-                            }
-                        )
-                        if bars_resp.status_code == 200:
-                            parsed = AlpacaDataAdapter.parse_rest_bars_response(bars_resp.json(), symbol=sym)
-                            if parsed:
-                                self.historical_bars[sym.upper()] = parsed
-                            # NOTE: do not seed last_trade_prices from a bar
-                            # close — that window can reach back into an older
-                            # session and masquerade as a live trade. The first
-                            # real trade, or the snapshot's latestTrade via
-                            # _decorate_daily, is the authoritative price.
-                    except Exception as err:
-                        logger.warning("Alpaca feed bar error for %s: %s", sym, err)
+                    cached = self._bar_cache.get(sym, "1m")
+                    if cached and self._bar_cache.age(cached) < 24 * 3600:
+                        self.historical_bars[sym.upper()] = cached.bars[-120:]
+                    else:
+                        self._preload_bars_from_rest(client, sym)
 
-                    # 2. Fetch latest quote
+                    # Fetch latest quote
                     try:
                         q_resp = client.get(
                             f"{self.data_base_url}/stocks/{sym}/quotes/latest",
@@ -194,61 +217,120 @@ class AlpacaMarketFeedService:
         except Exception as e:
             logger.warning("AlpacaMarketFeedService: Failed to preload historical bars: %s", e)
 
-    def _cache_put(self, sym: str, tf: str, bars: List[Bar], ts: Optional[float] = None) -> None:
-        """Store bars in the bounded multi-timeframe cache (oldest entry evicted)."""
-        key = f"{sym}:{tf}"
-        self.multi_tf_bars.setdefault(sym, {})[tf] = bars
-        self._bars_cache_ts.setdefault(sym, {})[tf] = time.time() if ts is None else ts
-        self._cache_order[key] = None
-        self._cache_order.move_to_end(key)
-        while len(self._cache_order) > MAX_CACHE_ENTRIES:
-            old_key, _ = self._cache_order.popitem(last=False)
-            old_sym, old_tf = old_key.split(":", 1)
-            self.multi_tf_bars.get(old_sym, {}).pop(old_tf, None)
-            self._bars_cache_ts.get(old_sym, {}).pop(old_tf, None)
-            if not self.multi_tf_bars.get(old_sym):
-                self.multi_tf_bars.pop(old_sym, None)
-                self._bars_cache_ts.pop(old_sym, None)
+    def _preload_bars_from_rest(self, client: httpx.Client, sym: str) -> None:
+        try:
+            bars_resp = client.get(
+                f"{self.data_base_url}/stocks/{sym}/bars",
+                params={
+                    "timeframe": "1Min",
+                    "limit": 120,
+                    "feed": self.feed
+                }
+            )
+            if bars_resp.status_code == 200:
+                parsed = AlpacaDataAdapter.parse_rest_bars_response(bars_resp.json(), symbol=sym)
+                if parsed:
+                    self.historical_bars[sym.upper()] = parsed
+                # NOTE: do not seed last_trade_prices from a bar
+                # close — that window can reach back into an older
+                # session and masquerade as a live trade. The first
+                # real trade, or the snapshot's latestTrade via
+                # _decorate_daily, is the authoritative price.
+        except Exception as err:
+            logger.warning("Alpaca feed bar error for %s: %s", sym, err)
 
-    def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
-        """
-        Retrieves historical K-line bars for a given symbol and timeframe.
-        Leverages RAM TTL cache to achieve sub-millisecond response time.
-        Falls back to Yahoo Finance Rapid Adapter for deep multi-timeframe candles,
-        and to Alpaca historical bars.
-        """
-        sym = symbol.upper()
-        tf = timeframe.lower()
-        now = time.time()
+    def _cache_put(
+        self, sym: str, tf: str, bars: List[Bar], ts: Optional[float] = None
+    ) -> None:
+        """Store bars in the cache (RAM + disk, oldest entry evicted)."""
+        self._bar_cache.put(sym, tf, bars, fetched_at=ts)
 
-        # Check RAM cache first
-        cached = self.multi_tf_bars.get(sym, {}).get(tf)
-        cache_ts = self._bars_cache_ts.get(sym, {}).get(tf, 0.0)
-        ttl = self.TIMEFRAME_TTLS.get(tf, 60.0)
+    # -- fetching --------------------------------------------------------
+    def _refresh_pool_executor(self) -> ThreadPoolExecutor:
+        with self._refresh_pool_lock:
+            if self._refresh_pool is None:
+                self._refresh_pool = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="bar-refresh"
+                )
+            return self._refresh_pool
 
-        if cached and (now - cache_ts < ttl):
-            return cached
-
-        # Fetch fresh bars from Yahoo Rapid Adapter
+    def _fetch_upstream(self, sym: str, tf: str) -> Optional[List[Bar]]:
+        """Fetch one key and store it. The caller must own the refresh slot."""
         try:
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf)
             if bars:
-                self._cache_put(sym, tf, bars, now)
-                # NOTE: never write last_trade_prices here — a historical close must
-                # not overwrite a fresher live trade price.
+                # NOTE: never write last_trade_prices here — a historical close
+                # must not overwrite a fresher live trade price.
+                self._cache_put(sym, tf, bars)
                 return bars
+            return None
         except Exception as err:
             logger.warning("Yahoo Finance fetch failed for %s (%s): %s", sym, tf, err)
+            self._bar_cache.cool_down(sym, tf)
+            return None
+        finally:
+            self._bar_cache.end_refresh(sym, tf)
 
-        # 1. Fallback to cached bars of requested timeframe even if stale
-        if cached:
-            return cached
+    def _fetch_and_cache(self, sym: str, tf: str) -> Optional[List[Bar]]:
+        """Single-flight fetch: lead it, or wait for whoever is leading.
 
-        # 2. If 1m requested, fallback to local 1m bars if available
-        if tf == "1m" and sym in self.historical_bars and self.historical_bars[sym]:
-            return self.historical_bars[sym]
+        Returns the bars on success, None on failure (after arming the
+        cooldown). Never raises: this also runs on background threads.
+        """
+        if not self._bar_cache.begin_refresh(sym, tf):
+            # Somebody else is already fetching this key; wait for their result.
+            self._bar_cache.wait_for_refresh(sym, tf)
+            entry = self._bar_cache.get(sym, tf)
+            return entry.bars if entry else None
+        return self._fetch_upstream(sym, tf)
 
-        return []
+    def _schedule_refresh(self, sym: str, tf: str) -> None:
+        """Refresh a stale key in the background, at most one task per key."""
+        if self._bar_cache.is_cooling(sym, tf):
+            return
+        if not self._bar_cache.begin_refresh(sym, tf):
+            return  # another caller already scheduled this fetch
+        try:
+            self._refresh_pool_executor().submit(self._fetch_upstream, sym, tf)
+        except RuntimeError:
+            # Interpreter shutting down or pool already closed.
+            self._bar_cache.end_refresh(sym, tf)
+
+    def get_bars_with_meta(
+        self, symbol: str, timeframe: str = "15m"
+    ) -> Tuple[List[Bar], float]:
+        """Bars plus the wall-clock time they were fetched (0.0 when unserved).
+
+        Stale data is served immediately and refreshed in the background: a
+        chart two minutes behind is useful, a chart that blocks for a second
+        is not. Only a key with nothing cached at all pays the upstream
+        round-trip, and concurrent callers share that one fetch.
+        """
+        sym = symbol.upper()
+        tf = timeframe.lower()
+        entry = self._bar_cache.get(sym, tf)
+
+        if entry:
+            if not self._bar_cache.is_fresh(entry, tf):
+                self._schedule_refresh(sym, tf)
+            return entry.bars, entry.fetched_at
+
+        # Nothing cached: this caller has to wait, but only one of them fetches.
+        if not self._bar_cache.is_cooling(sym, tf):
+            bars = self._fetch_and_cache(sym, tf)
+            if bars:
+                return bars, self._bar_cache.fetched_at_of(sym, tf)
+
+        # 1. If 1m requested, fallback to local 1m bars if available
+        if tf == "1m" and self.historical_bars.get(sym):
+            return self.historical_bars[sym], 0.0
+
+        return [], 0.0
+
+    def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
+        """Bars for a symbol/timeframe, from cache whenever one exists."""
+        bars, _ = self.get_bars_with_meta(symbol, timeframe)
+        return bars
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
@@ -396,6 +478,41 @@ class AlpacaMarketFeedService:
         missing = self._refresh_consolidated_daily(syms)
         if missing:
             self._refresh_alpaca_snapshots(missing)
+        self._save_daily_stats_snapshot()
+
+    def _load_daily_stats_snapshot(self) -> None:
+        """Restore the previous process's daily context, if there is one.
+
+        Sweeping 14 symbols at boot is pure waste when the file on disk is
+        still inside its TTL — the TTL check in ``refresh_daily_stats``
+        decides whether the restored copy is good enough.
+        """
+        if self._stats_store is None:
+            return
+        snapshot = self._stats_store.load()
+        if not isinstance(snapshot, dict):
+            return
+        stats = snapshot.get("stats")
+        fetched_at = snapshot.get("fetched_at")
+        if not isinstance(stats, dict) or not isinstance(fetched_at, (int, float)):
+            return
+        try:
+            self.daily_stats.update(
+                {
+                    str(sym).upper(): dict(entry)
+                    for sym, entry in stats.items()
+                    if isinstance(entry, dict)
+                }
+            )
+        except (TypeError, ValueError) as err:
+            logger.warning("Ignoring market daily stats snapshot: %s", err)
+            return
+        self._snapshot_ts = float(fetched_at)
+
+    def _save_daily_stats_snapshot(self) -> None:
+        if self._stats_store is None:
+            return
+        self._stats_store.save({"fetched_at": time.time(), "stats": self.daily_stats})
 
     def _daily_ttl(self) -> float:
         """Longer TTL when every venue is shut: a close does not move."""
@@ -511,6 +628,12 @@ class AlpacaMarketFeedService:
                     await task
                 except asyncio.CancelledError:
                     pass
+        with self._refresh_pool_lock:
+            pool, self._refresh_pool = self._refresh_pool, None
+        if pool is not None:
+            # Do not wait: an in-flight upstream fetch may be seconds from
+            # returning, and a shutting-down process must not stall on it.
+            pool.shutdown(wait=False, cancel_futures=True)
         YahooFinanceAdapter.close_client()
 
     async def _websocket_listener_loop(self) -> None:
@@ -727,11 +850,12 @@ class AlpacaMarketFeedService:
                         cached_ts = self._bars_cache_ts.get(sym, {}).get(tf, 0.0)
                         ttl = self.TIMEFRAME_TTLS.get(tf, 60.0)
 
-                        if now - cached_ts > (ttl * 0.7):
+                        if now - cached_ts > (ttl * 0.7) and not self._bar_cache.is_cooling(sym, tf):
                             try:
-                                bars = await asyncio.to_thread(YahooFinanceAdapter.fetch_bars, sym, tf)
-                                if bars:
-                                    self._cache_put(sym, tf, bars)
+                                # Single-flight: if a request is already fetching
+                                # this key, wait for its result instead of adding
+                                # a second upstream call.
+                                await asyncio.to_thread(self._fetch_and_cache, sym, tf)
                             except Exception as e:
                                 logger.debug("Prewarm failed for %s (%s): %s", sym, tf, e)
                             await asyncio.sleep(0.5)

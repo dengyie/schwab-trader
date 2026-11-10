@@ -9,7 +9,7 @@ provider answered.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from app.core.markets import resolve_symbol
 from app.models.trading import Bar, Quote, Trade
@@ -54,6 +54,25 @@ class MultiMarketFeed:
         except Exception as exc:
             logger.warning("Bar lookup failed for %s (%s): %s", canonical, timeframe, exc)
             return []
+
+    def get_bars_with_meta(self, symbol: str, timeframe: str = "15m") -> Tuple[List[Bar], float]:
+        """Bars plus when they were fetched, for HTTP cache validators.
+
+        Feeds that do not track a fetch time report 0.0, which the API turns
+        into "always revalidate" instead of a bogus freshness claim.
+        """
+        canonical, feed = self._route(symbol)
+        if feed is None:
+            return [], 0.0
+        try:
+            if hasattr(feed, "get_bars_with_meta"):
+                return feed.get_bars_with_meta(canonical, timeframe=timeframe)
+            if hasattr(feed, "get_bars"):
+                return feed.get_bars(canonical, timeframe=timeframe), 0.0
+            return feed.get_historical_bars(canonical), 0.0
+        except Exception as exc:
+            logger.warning("Bar lookup failed for %s (%s): %s", canonical, timeframe, exc)
+            return [], 0.0
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")

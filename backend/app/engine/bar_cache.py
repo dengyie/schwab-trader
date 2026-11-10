@@ -1,0 +1,267 @@
+"""
+Chart-bar cache with disk persistence, stale-while-revalidate and single-flight.
+
+The in-memory TTL cache that used to live inside the feed had three costs that
+showed up as user-visible latency (measured on the VPS, 2026-11-10):
+
+* every deploy/restart started cold — a 1m chart paid 1.0-1.2s for ~2,400
+  bars that had already been fetched minutes earlier;
+* the moment a TTL expired the *next* request blocked on Yahoo, so a warm
+  chart still took ~1.1s;
+* N concurrent tabs for the same symbol each fetched it independently.
+
+This cache keeps the bars on disk (they are historical data, they do not stop
+being true), serves whatever it has immediately and refreshes in the
+background, and lets only one caller fetch a given (symbol, timeframe) at a
+time. Fetched data is never discarded while the process lives: a stale chart
+is still far more useful than an empty one.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+from app.models.trading import Bar
+
+logger = logging.getLogger(__name__)
+
+# Disk entries older than this are pruned: a week-old candle series is not a
+# cache hit worth keeping. Runtime staleness is unbounded by design.
+MAX_DISK_AGE_SECONDS = 30 * 24 * 3600
+# Files kept on disk; the RAM cache is bounded separately.
+MAX_DISK_FILES = 400
+# After a failed fetch, do not retry that key for this long. Without it an
+# upstream outage turns every request (and every tab) into another attempt.
+FAILURE_COOLDOWN_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    bars: List[Bar]
+    fetched_at: float
+
+
+class BarCache:
+    """RAM + disk cache for ``(symbol, timeframe) -> bars``.
+
+    ``bars`` and ``fetched_at`` are exposed with the names the feed has always
+    used (``multi_tf_bars`` / ``_bars_cache_ts``) so callers and tests that
+    touch them directly keep working.
+    """
+
+    def __init__(
+        self,
+        directory: Optional[str] = None,
+        max_entries: int = 300,
+        ttl_for: Optional[Callable[[str], float]] = None,
+    ):
+        self.bars: Dict[str, Dict[str, List[Bar]]] = {}
+        self.fetched_at: Dict[str, Dict[str, float]] = {}
+        self.max_entries = max_entries
+        self._ttl_for = ttl_for or (lambda _tf: 60.0)
+        self._order: "OrderedDict[str, None]" = OrderedDict()
+        self._lock = threading.RLock()
+        self._events: Dict[str, threading.Event] = {}
+        self._cooldown_until: Dict[str, float] = {}
+
+        self._directory: Optional[Path] = Path(directory) / "bars" if directory else None
+        if self._directory is not None:
+            try:
+                self._directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("Bar cache dir %s unusable: %s", self._directory, exc)
+                self._directory = None
+        if self._directory is not None:
+            self._prune_disk()
+
+    # -- keys ------------------------------------------------------------
+    @staticmethod
+    def _key(symbol: str, timeframe: str) -> str:
+        return f"{symbol.upper()}:{timeframe.lower()}"
+
+    def _path(self, symbol: str, timeframe: str) -> Optional[Path]:
+        if self._directory is None:
+            return None
+        safe_sym = "".join(c for c in symbol.upper() if c.isalnum() or c in ".-_")
+        safe_tf = "".join(c for c in timeframe.lower() if c.isalnum())
+        return self._directory / f"{safe_sym}_{safe_tf}.json"
+
+    # -- reads -----------------------------------------------------------
+    def get(self, symbol: str, timeframe: str) -> Optional[CacheEntry]:
+        """Cached bars for a key, falling back to the on-disk copy."""
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            bars = self.bars.get(symbol.upper(), {}).get(timeframe.lower())
+            ts = self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
+            if bars:
+                return CacheEntry(bars=bars, fetched_at=ts)
+        return self._load_from_disk(symbol, timeframe)
+
+    def is_fresh(self, entry: Optional[CacheEntry], timeframe: str) -> bool:
+        if not entry or not entry.fetched_at:
+            return False
+        return (time.time() - entry.fetched_at) < self._ttl_for(timeframe)
+
+    def age(self, entry: Optional[CacheEntry]) -> float:
+        if not entry or not entry.fetched_at:
+            return 0.0
+        return max(0.0, time.time() - entry.fetched_at)
+
+    def fetched_at_of(self, symbol: str, timeframe: str) -> float:
+        with self._lock:
+            return self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
+
+    # -- writes ----------------------------------------------------------
+    def put(
+        self,
+        symbol: str,
+        timeframe: str,
+        bars: List[Bar],
+        fetched_at: Optional[float] = None,
+    ) -> None:
+        sym = symbol.upper()
+        tf = timeframe.lower()
+        ts = time.time() if fetched_at is None else fetched_at
+        with self._lock:
+            self.bars.setdefault(sym, {})[tf] = bars
+            self.fetched_at.setdefault(sym, {})[tf] = ts
+            key = self._key(sym, tf)
+            self._order[key] = None
+            self._order.move_to_end(key)
+            self._evict_locked()
+        self._write_to_disk(sym, tf, bars, ts)
+
+    def _evict_locked(self) -> None:
+        while len(self._order) > self.max_entries:
+            old_key, _ = self._order.popitem(last=False)
+            old_sym, old_tf = old_key.split(":", 1)
+            self.bars.get(old_sym, {}).pop(old_tf, None)
+            self.fetched_at.get(old_sym, {}).pop(old_tf, None)
+            if not self.bars.get(old_sym):
+                self.bars.pop(old_sym, None)
+                self.fetched_at.pop(old_sym, None)
+
+    # -- single-flight ---------------------------------------------------
+    def begin_refresh(self, symbol: str, timeframe: str) -> bool:
+        """True when the caller becomes the one allowed to fetch this key."""
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            if key in self._events:
+                return False
+            self._events[key] = threading.Event()
+            return True
+
+    def end_refresh(self, symbol: str, timeframe: str) -> None:
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            event = self._events.pop(key, None)
+        if event is not None:
+            event.set()
+
+    def wait_for_refresh(self, symbol: str, timeframe: str, timeout: float = 6.0) -> None:
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            event = self._events.get(key)
+        if event is not None:
+            event.wait(timeout)
+
+    def is_refreshing(self, symbol: str, timeframe: str) -> bool:
+        with self._lock:
+            return self._key(symbol, timeframe) in self._events
+
+    # -- failure cooldown ------------------------------------------------
+    def cool_down(self, symbol: str, timeframe: str, seconds: float = FAILURE_COOLDOWN_SECONDS) -> None:
+        with self._lock:
+            self._cooldown_until[self._key(symbol, timeframe)] = time.time() + seconds
+
+    def is_cooling(self, symbol: str, timeframe: str) -> bool:
+        with self._lock:
+            until = self._cooldown_until.get(self._key(symbol, timeframe), 0.0)
+            return time.time() < until
+
+    # -- disk ------------------------------------------------------------
+    def _write_to_disk(self, symbol: str, timeframe: str, bars: List[Bar], ts: float) -> None:
+        path = self._path(symbol, timeframe)
+        if path is None:
+            return
+        payload = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "fetched_at": ts,
+            # Arrays instead of objects: same data, roughly half the parse cost
+            # on the boot path that reads these files.
+            "bars": [[b.time, b.open, b.high, b.low, b.close, b.volume] for b in bars],
+        }
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("Bar cache write failed at %s: %s", path, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_from_disk(self, symbol: str, timeframe: str) -> Optional[CacheEntry]:
+        path = self._path(symbol, timeframe)
+        if path is None or not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            ts = float(payload["fetched_at"])
+            bars = [
+                Bar(time=int(row[0]), open=float(row[1]), high=float(row[2]),
+                    low=float(row[3]), close=float(row[4]), volume=float(row[5]))
+                for row in payload["bars"]
+            ]
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            # A half-written or hand-edited file must never break a chart; move
+            # it aside so the same bad bytes are not re-read on every request.
+            logger.warning("Bar cache file %s ignored: %s", path, exc)
+            try:
+                path.replace(path.with_suffix(".corrupt"))
+            except OSError:
+                pass
+            return None
+        if not bars:
+            return None
+        if time.time() - ts > MAX_DISK_AGE_SECONDS:
+            return None
+        with self._lock:
+            self.bars.setdefault(symbol.upper(), {})[timeframe.lower()] = bars
+            self.fetched_at.setdefault(symbol.upper(), {})[timeframe.lower()] = ts
+            key = self._key(symbol, timeframe)
+            self._order[key] = None
+            self._order.move_to_end(key)
+            self._evict_locked()
+        return CacheEntry(bars=bars, fetched_at=ts)
+
+    def _prune_disk(self) -> None:
+        if self._directory is None:
+            return
+        cutoff = time.time() - MAX_DISK_AGE_SECONDS
+        try:
+            files: List[Tuple[float, Path]] = []
+            for path in self._directory.glob("*.json"):
+                try:
+                    files.append((path.stat().st_mtime, path))
+                except OSError:
+                    continue
+            files.sort(reverse=True)
+            for index, (mtime, path) in enumerate(files):
+                if mtime < cutoff or index >= MAX_DISK_FILES:
+                    path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Bar cache prune failed: %s", exc)

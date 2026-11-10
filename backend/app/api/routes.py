@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, field_validator
 
 from app.models.trading import (
@@ -28,7 +28,7 @@ from app.core.markets import (
     resolve_symbol,
     within_day_range,
 )
-from app.core.timeframes import TIMEFRAME_SECONDS
+from app.core.timeframes import TIMEFRAME_SECONDS, TIMEFRAME_TTLS
 
 
 class OrderRequest(BaseModel):
@@ -87,6 +87,28 @@ def _normalize_market(code: Optional[str]) -> str:
     if market is None:
         raise HTTPException(status_code=400, detail=f"Unknown market: {code!r}")
     return market.code
+
+
+def _etag_matches(if_none_match: Optional[str], etag: str) -> bool:
+    """Whether a conditional request can be answered with 304.
+
+    ``If-None-Match`` is a comma-separated list that may use weak validators
+    (``W/"..."``); RFC 9110 says to compare the opaque tag, ignoring the
+    weakness marker, so ``W/"x"`` and ``"x"`` match.
+    """
+    if not if_none_match:
+        return False
+    def opaque(value: str) -> str:
+        value = value.strip()
+        if value.startswith("W/"):
+            value = value[2:]
+        return value.strip('"')
+
+    candidate = opaque(etag)
+    return any(
+        part.strip() == "*" or opaque(part) == candidate
+        for part in if_none_match.split(",")
+    )
 
 
 # Day-range guard lives in app.core.markets so the REST rows and the position
@@ -195,17 +217,53 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
     # Market Data Endpoints ----------------------------------------------
     @router.get("/market/bars", dependencies=[Depends(require_auth)])
     def get_bars(
-        symbol: str = "SPY", timeframe: str = "15m", market: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        # Fetch multi-timeframe candles with in-memory TTL caching.
+        response: Response,
+        symbol: str = "SPY",
+        timeframe: str = "15m",
+        market: Optional[str] = None,
+        if_none_match: Optional[str] = Header(None),
+    ) -> Any:
+        # The feed serves whatever it has and refreshes in the background, so
+        # this is fast even when the data is older than its TTL; the headers
+        # tell the client how fresh it actually is.
         # Never fabricate candles: an empty list tells the client data is unavailable.
         sym = _normalize_symbol(symbol, market)
         tf = _normalize_timeframe(timeframe)
-        if hasattr(actual_feed, "get_bars"):
-            bars = actual_feed.get_bars(sym, timeframe=tf)
+
+        if hasattr(actual_feed, "get_bars_with_meta"):
+            bars, fetched_at = actual_feed.get_bars_with_meta(sym, timeframe=tf)
+        elif hasattr(actual_feed, "get_bars"):
+            bars, fetched_at = actual_feed.get_bars(sym, timeframe=tf), 0.0
         else:
-            bars = actual_feed.get_historical_bars(sym)
-        return ModelFeatureExporter.to_records(bars or [])
+            bars, fetched_at = actual_feed.get_historical_bars(sym), 0.0
+        records = ModelFeatureExporter.to_records(bars or [])
+
+        if not fetched_at:
+            # Nothing cached behind this response (or a feed that does not
+            # track fetch times): the client must ask again next time.
+            response.headers["X-Cache"] = "MISS"
+            response.headers["Cache-Control"] = "no-store"
+            return records
+
+        ttl = TIMEFRAME_TTLS.get(tf, 60.0)
+        age = max(0.0, time.time() - fetched_at)
+        remaining = max(0, int(ttl - age))
+        # Weak validator: two renders of the same fetch are equivalent, and the
+        # client only needs to know whether the data changed.
+        etag = f'W/"{sym}-{tf}-{int(fetched_at)}"'
+        headers = {
+            "ETag": etag,
+            "Age": str(int(age)),
+            "X-Cache": "HIT" if age < ttl else "STALE",
+            # Browsers and Caddy may reuse it for the rest of its TTL; after
+            # that they revalidate, and the ETag turns an unchanged fetch into
+            # a 304 instead of a 200 carrying 200KB of identical candles.
+            "Cache-Control": f"private, max-age={remaining}",
+        }
+        if _etag_matches(if_none_match, etag):
+            return Response(status_code=304, headers=headers)
+        response.headers.update(headers)
+        return records
 
     @router.get("/market/tickers", dependencies=[Depends(require_auth)])
     def get_tickers(market: str = "US") -> List[Dict[str, Any]]:
