@@ -189,6 +189,42 @@ def test_disk_round_trip_survives_a_restart(tmp_path):
     assert entry.fetched_at == fetched_at
 
 
+def test_disk_load_cannot_regress_a_newer_ram_entry(tmp_path):
+    """The disk read happens outside the lock, so a put() can land while it is
+    in flight. Promoting the just-read file then would drag fetched_at (and
+    the ETag) backwards; a RAM entry that is at least as new must win."""
+    cache = BarCache(str(tmp_path))
+    fresh, stale = _bars(close=200.0), _bars(close=100.0)
+    now = time.time()
+
+    cache.put("SPY", "1d", fresh, fetched_at=now)
+    # Simulate the interleaving: the disk still holds the older series.
+    cache._write_to_disk("SPY", "1d", stale, now - 3600)
+
+    entry = cache._load_from_disk("SPY", "1d")
+    assert entry is not None
+    assert entry.fetched_at == now
+    assert entry.bars == fresh
+    assert cache.fetched_at_of("SPY", "1d") == now
+
+
+def test_disk_load_still_promotes_when_ram_is_empty(tmp_path):
+    """The guard must not block the legitimate path: after an eviction (RAM
+    empty, disk newer than nothing) the disk entry is promoted as before."""
+    cache = BarCache(str(tmp_path))
+    bars = _bars(close=55.0)
+    fetched_at = time.time() - 120
+    cache.put("SPY", "1d", bars, fetched_at=fetched_at)
+    cache.bars["SPY"].pop("1d")  # evicted from RAM only; disk remains
+    cache.fetched_at["SPY"].pop("1d")
+
+    entry = cache._load_from_disk("SPY", "1d")
+    assert entry is not None
+    assert entry.bars == bars
+    assert entry.fetched_at == fetched_at
+    assert cache.fetched_at_of("SPY", "1d") == fetched_at
+
+
 def test_corrupt_cache_file_is_ignored_and_set_aside(tmp_path):
     cache = BarCache(str(tmp_path))
     path = tmp_path / "bars" / "SPY_1m.json"

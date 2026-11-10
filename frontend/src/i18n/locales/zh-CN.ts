@@ -1156,6 +1156,18 @@ export const zhCN = {
     dataStale: '数据已过期',
     dataDelayed: '数据延迟',
     resyncing: '重建中...',
+    rangeLabel1wk: '1周',
+    rangeLabel1mo: '1月',
+    rangeHints: {
+      '1m': '分钟K · 近7天',
+      '5m': '近1个月',
+      '15m': '近1个月',
+      '1h': '近6个月',
+      '4h': '近1年',
+      '1d': '日K · 近5年',
+      '1wk': '周K · 近10年',
+      '1mo': '月K · 全部历史',
+    },
   },
 
   // 账户总览面板

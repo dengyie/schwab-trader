@@ -172,10 +172,6 @@ class BarCache:
         if event is not None:
             event.wait(timeout)
 
-    def is_refreshing(self, symbol: str, timeframe: str) -> bool:
-        with self._lock:
-            return self._key(symbol, timeframe) in self._events
-
     # -- failure cooldown ------------------------------------------------
     def cool_down(self, symbol: str, timeframe: str, seconds: float = FAILURE_COOLDOWN_SECONDS) -> None:
         with self._lock:
@@ -240,6 +236,15 @@ class BarCache:
         if time.time() - ts > MAX_DISK_AGE_SECONDS:
             return None
         with self._lock:
+            # The disk read happened outside the lock, so a concurrent put()
+            # may have stored a newer entry in RAM while we parsed. Promoting
+            # unconditionally would regress fetched_at (and with it the ETag);
+            # a RAM entry that is at least as new always wins.
+            current_ts = self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
+            if current_ts >= ts and self.bars.get(symbol.upper(), {}).get(timeframe.lower()):
+                return CacheEntry(
+                    bars=self.bars[symbol.upper()][timeframe.lower()], fetched_at=current_ts
+                )
             self.bars.setdefault(symbol.upper(), {})[timeframe.lower()] = bars
             self.fetched_at.setdefault(symbol.upper(), {})[timeframe.lower()] = ts
             key = self._key(symbol, timeframe)

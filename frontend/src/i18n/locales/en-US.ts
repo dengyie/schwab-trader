@@ -1167,6 +1167,18 @@ export const enUS: Locale = {
     dataStale: 'Data Stale',
     dataDelayed: 'Data Delayed',
     resyncing: 'Resyncing...',
+    rangeLabel1wk: '1W',
+    rangeLabel1mo: '1M',
+    rangeHints: {
+      '1m': 'Minute bars · last 7 days',
+      '5m': 'Last 1 month',
+      '15m': 'Last 1 month',
+      '1h': 'Last 6 months',
+      '4h': 'Last 1 year',
+      '1d': 'Daily bars · last 5 years',
+      '1wk': 'Weekly bars · last 10 years',
+      '1mo': 'Monthly bars · all history',
+    },
   },
 
   // Account Overview Panel

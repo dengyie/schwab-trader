@@ -36,6 +36,16 @@ from app.core.timeframes import TIMEFRAME_SECONDS, TIMEFRAME_TTLS
 # itself (MultiMarketFeed.HEALTH_PROBE_TIMEOUT); this covers a feed that
 # ignores its own budget, and stays under the deploy gate's curl timeout.
 HEALTH_BUDGET = 2.0
+# /api/health is unauthenticated (the deploy gate probes it without a token).
+# Upstream error text is operationally useful there but is a free-form string;
+# cap it so a future verbose exception cannot leak internal detail verbatim.
+HEALTH_ERROR_CLIP = 120
+
+
+def _clip_error(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > HEALTH_ERROR_CLIP:
+        return value[: HEALTH_ERROR_CLIP - 3] + "..."
+    return value
 
 
 class OrderRequest(BaseModel):
@@ -216,6 +226,15 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                     feed_health = await asyncio.wait_for(feed_health, timeout=HEALTH_BUDGET)
             except Exception as exc:
                 feed_health = {"error": str(exc)}
+            if isinstance(feed_health, dict):
+                if "error" in feed_health:
+                    feed_health["error"] = _clip_error(feed_health["error"])
+                for entry in feed_health.values():
+                    if isinstance(entry, dict):
+                        if "last_error" in entry:
+                            entry["last_error"] = _clip_error(entry["last_error"])
+                        if "error" in entry:
+                            entry["error"] = _clip_error(entry["error"])
             payload["feeds"] = feed_health
             if isinstance(feed_health, dict) and any(
                 isinstance(entry, dict) and entry.get("quota_exceeded")

@@ -416,6 +416,11 @@
     padding: 2px 6px;
     font-size: 10px;
   }
+
+  /* 周期按钮提到滚动区首位：手机上不用左滑也能看到 1周/1月 */
+  .timeRangeGroup {
+    order: -1;
+  }
   
   .chartTypeBtn {
     width: 24px;

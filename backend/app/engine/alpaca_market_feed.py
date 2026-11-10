@@ -24,7 +24,7 @@ from app.core.markets import (
     market_of,
     within_day_range,
 )
-from app.core.timeframes import TIMEFRAME_TTLS as CORE_TIMEFRAME_TTLS
+from app.core.timeframes import TIMEFRAME_TTLS
 from app.engine.bar_cache import BarCache
 from app.engine.state_store import JsonStateStore
 
@@ -96,7 +96,6 @@ class AlpacaMarketFeedService:
     - Multi-timeframe in-memory TTL caching with background preheating.
     """
 
-    TIMEFRAME_TTLS: Dict[str, float] = dict(CORE_TIMEFRAME_TTLS)
     # Default for services built with ``__new__`` (tests that exercise one
     # method): no snapshot on disk unless ``__init__`` wired one up.
     _stats_store: Optional[JsonStateStore] = None
@@ -160,7 +159,7 @@ class AlpacaMarketFeedService:
         self._bar_cache = BarCache(
             cache_dir,
             max_entries=MAX_CACHE_ENTRIES,
-            ttl_for=lambda tf: self.TIMEFRAME_TTLS.get(tf, 60.0),
+            ttl_for=lambda tf: TIMEFRAME_TTLS.get(tf, 60.0),
         )
         # Background refreshes run here so an expired entry never blocks a
         # request on Yahoo. Two workers bound the upstream fan-out.
@@ -982,7 +981,7 @@ class AlpacaMarketFeedService:
                             break
                         now = time.time()
                         cached_ts = self._bars_cache_ts.get(sym, {}).get(tf, 0.0)
-                        ttl = self.TIMEFRAME_TTLS.get(tf, 60.0)
+                        ttl = TIMEFRAME_TTLS.get(tf, 60.0)
 
                         if now - cached_ts > (ttl * 0.7) and not self._bar_cache.is_cooling(sym, tf):
                             try:

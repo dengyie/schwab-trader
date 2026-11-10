@@ -41,7 +41,10 @@ class YahooQuoteFeed:
     # and this one read the same ``TIMEFRAME_TTLS``; a second, different number
     # here is how the two venues drifted apart before.
     BAR_CACHE_SECONDS = 20.0
-    MAX_BAR_ENTRIES = 120
+    # RAM ceiling in (symbol, timeframe) keys. Sized for ~20 watched symbols
+    # across all eight timeframes; older keys fall back to their disk copy, so
+    # an eviction costs one JSON parse, never an upstream call.
+    MAX_BAR_ENTRIES = 160
     # A REST read keeps a symbol warm for this long, then the poller drops it.
     ON_DEMAND_TTL = 180.0
 
@@ -63,8 +66,7 @@ class YahooQuoteFeed:
 
         self.latest_quotes: Dict[str, Quote] = {}
         self.last_trade_prices: Dict[str, float] = {}
-        self.historical_bars: Dict[str, List[Bar]] = {}
-        # Bars use the same cache as the US path: persisted, stale-served,
+            # Bars use the same cache as the US path: persisted, stale-served,
         # single-flight. A HK chart then survives a deploy and reports a real
         # ``fetched_at`` so the API can emit ETag/Cache-Control for it too.
         self._bar_cache = BarCache(

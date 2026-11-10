@@ -84,29 +84,6 @@ const TIMEFRAME_SECONDS: Record<TimeRange, number> = {
   '1mo': 2592000,
 };
 
-// 按钮文案与跨度提示：让"能看到多久"一眼可见，而不是靠猜缩写。
-const RANGE_LABELS: Record<TimeRange, string> = {
-  '1m': '1m',
-  '5m': '5m',
-  '15m': '15m',
-  '1h': '1h',
-  '4h': '4h',
-  '1d': '1d',
-  '1wk': '1周',
-  '1mo': '1月',
-};
-
-const RANGE_HINTS: Record<TimeRange, string> = {
-  '1m': '分钟K · 近7天',
-  '5m': '近1个月',
-  '15m': '近1个月',
-  '1h': '近6个月',
-  '4h': '近1年',
-  '1d': '日K · 近5年',
-  '1wk': '周K · 近10年',
-  '1mo': '月K · 全部历史',
-};
-
 // 计算移动平均线
 function calculateMA(data: KlineData[], period: number) {
   const result = [];
@@ -213,7 +190,7 @@ export function PriceChart() {
 
   // K线数据缓存与引用
   const klinesRef = useRef<KlineData[]>([]);
-  const klinesCacheRef = useRef<Map<string, { data: KlineData[]; timestamp: number }>>(new Map());
+  const klinesCacheRef = useRef<Map<string, { data: KlineData[]; timestamp: number; etag?: string }>>(new Map()); // etag: 后端弱校验器，命中则 304 免下载整段K线
   const CACHE_FRESH_TTL = 15000; // 15秒内视为极速新鲜缓存，直接返回
   const MAX_CACHE_ENTRIES = 50; // 最大缓存条目数，防止无界增长
 
@@ -241,8 +218,19 @@ export function PriceChart() {
     
     try {
       const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}`;
-      const response = await apiFetch(url);
-      
+      // 后端为每段K线发弱 ETag；带上一次的值，未变化时整段下载变 304。
+      const condHeaders: Record<string, string> = {};
+      if (cached?.etag) condHeaders['If-None-Match'] = cached.etag;
+      const response = await apiFetch(url, { headers: condHeaders });
+
+      if (response.status === 304) {
+        // 数据未变：续鲜 SWR 缓存即可，画面保持当前内容。
+        if (cached) {
+          klinesCacheRef.current.set(cacheKey, { ...cached, timestamp: now });
+        }
+        return;
+      }
+
       if (!response.ok) throw response;
       
       const data = await response.json();
@@ -263,7 +251,8 @@ export function PriceChart() {
         const oldestKey = klinesCacheRef.current.keys().next().value;
         if (oldestKey) klinesCacheRef.current.delete(oldestKey);
       }
-      klinesCacheRef.current.set(cacheKey, { data: formattedData, timestamp: now });
+      const etag = response.headers.get('etag') || undefined;
+      klinesCacheRef.current.set(cacheKey, { data: formattedData, timestamp: now, etag });
       
       klinesRef.current = formattedData;
       setKlines(formattedData);
@@ -815,8 +804,10 @@ export function PriceChart() {
           });
         }
       } 
-      // 情况 2: 时间跨入新的蜡烛周期，顺延对齐追加新蜡烛
-      else if (lastKline && tradeSec >= lastKline.time + intervalSec) {
+      // 情况 2: 时间跨入新的蜡烛周期，顺延对齐追加新蜡烛。
+      // 仅限分钟/小时桶：日/周/月的日历边界不等长（31 天月 ≠ 30 天），
+      // 固定秒数顺延会画出错位蜡烛；这些视图由 60s 轮询整段刷新兜底。
+      else if (lastKline && intervalSec < 86400 && tradeSec >= lastKline.time + intervalSec) {
         const offsetBuckets = Math.floor((tradeSec - lastKline.time) / intervalSec);
         const newBarTime = (lastKline.time + offsetBuckets * intervalSec) as UTCTimestamp;
         const newKline: KlineData = {
@@ -954,9 +945,11 @@ export function PriceChart() {
                 key={range}
                 className={`${styles.timeRangeBtn} ${timeRange === range ? styles.active : ''}`}
                 onClick={() => setTimeRange(range)}
-                title={RANGE_HINTS[range]}
+                title={t.chart?.rangeHints?.[range]}
               >
-                {RANGE_LABELS[range]}
+                {range === '1wk' ? (t.chart?.rangeLabel1wk ?? '1wk')
+                  : range === '1mo' ? (t.chart?.rangeLabel1mo ?? '1mo')
+                  : range}
               </button>
             ))}
           </div>

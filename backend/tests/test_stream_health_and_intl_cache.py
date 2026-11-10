@@ -364,6 +364,36 @@ def test_health_payload_omits_feeds_for_a_plain_feed():
     assert "feeds" not in body
 
 
+def test_health_clips_error_strings_on_the_public_route():
+    """/api/health is unauthenticated; a verbose upstream exception must not
+    be echoed to anonymous visitors verbatim."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.routes import HEALTH_ERROR_CLIP, create_api_router
+
+    long_error = "x" * (HEALTH_ERROR_CLIP + 200)
+
+    class _Feed:
+        def health(self):
+            return {
+                "us": {"state": "degraded", "last_error": long_error, "quota_exceeded": True},
+                "intl": {"error": long_error},
+            }
+
+    class _Broker:
+        def get_fx_rates(self):
+            return {"USD": 1.0}
+
+    app = FastAPI()
+    app.include_router(create_api_router(_Broker(), _Feed()))
+    body = TestClient(app).get("/api/health").json()
+    assert len(body["feeds"]["us"]["last_error"]) <= HEALTH_ERROR_CLIP
+    assert len(body["feeds"]["intl"]["error"]) <= HEALTH_ERROR_CLIP
+    # The degraded flag must survive the clipping.
+    assert body["degraded"] == ["market_stream_quota_exceeded"]
+
+
 def test_health_probe_separates_healthy_from_empty():
     """A healthy probe ({}) is real information; it must survive the router.
 
