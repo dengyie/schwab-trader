@@ -460,12 +460,13 @@ def test_equity_history_is_cached_and_returns_a_copy(monkeypatch):
     calls = []
     broker = AlpacaPaperBroker(api_key="K", api_secret="S")
 
-    class _CountingResp(_FakeClockResponse):
-        def json(self):
-            calls.append(1)
-            return super().json()
+    def _counting(url, **kwargs):
+        if "portfolio/history" not in url:
+            return _FakeClockResponse(200, {})
+        calls.append(1)
+        return _FakeClockResponse(200, _history_payload())
 
-    monkeypatch.setattr(broker.client, "get", lambda *a, **kw: _CountingResp(200, _history_payload()))
+    monkeypatch.setattr(broker.client, "get", _counting)
 
     first = broker.get_equity_history()
     first["points"][0]["equity"] = 999.0  # a caller mutating its copy...
@@ -512,13 +513,51 @@ def test_equity_history_skips_alpacas_zero_padding(monkeypatch):
     assert broker.get_equity_history() is None  # one real point < 2
 
 
+def test_equity_history_truncates_padding_by_account_creation(monkeypatch):
+    # Live probing also caught intraday series padding pre-account entries
+    # with base_value instead of 0.0, so a value filter alone cannot tell
+    # padding from a real (flat) session close. The creation timestamp is
+    # the authoritative boundary.
+    created = "2026-11-10T22:39:58.895409Z"
+    created_ts = 1794422398  # before the timestamps below
+    before, after = created_ts - 86400, created_ts + 86400
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+
+    def _route(url, **kwargs):
+        if url.endswith("/account"):
+            return _FakeClockResponse(200, {"created_at": created})
+        return _FakeClockResponse(200, {
+            "timestamp": [before, after, after + 86400],
+            "equity": [100000.0, 100000.0, 100500.0],  # padding is NOT 0 here
+            "base_value": 100000.0,
+        })
+
+    monkeypatch.setattr(broker.client, "get", _route)
+    history = broker.get_equity_history()
+    assert history is not None
+    assert [p["time"] for p in history["points"]] == [after, after + 86400]
+
+    # The creation timestamp is cached for an hour, not refetched per call.
+    account_calls = []
+    real_route = _route
+
+    def _counting_route(url, **kwargs):
+        if url.endswith("/account"):
+            account_calls.append(1)
+        return real_route(url, **kwargs)
+
+    monkeypatch.setattr(broker.client, "get", _counting_route)
+    broker.get_equity_history(period="1W")
+    assert account_calls == [], "created_at must be TTL-cached"
+
+
 def test_equity_history_unknown_timeframe_collapses_to_default(monkeypatch):
     # Arbitrary strings must neither reach the venue nor grow the cache:
     # each unknown key collapses onto the default instead of becoming a
     # permanent cache entry.
     sent = []
     broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, _history_payload()))
-    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()))
+    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()) if "portfolio/history" in url else _FakeClockResponse(200, {}))
     broker.get_equity_history(timeframe="; DROP TABLE users")
     assert sent[-1] == {"period": "1M", "timeframe": "1D"}
 
@@ -528,7 +567,7 @@ def test_equity_history_intraday_timeframe_maps_to_venue_spelling(monkeypatch):
     # is rejected with 40010001. Case-insensitive input maps onto that.
     sent = []
     broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, _history_payload()))
-    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()))
+    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()) if "portfolio/history" in url else _FakeClockResponse(200, {}))
     broker.get_equity_history(timeframe="5min")
     assert sent[-1] == {"period": "1M", "timeframe": "5Min"}
     broker.get_equity_history(timeframe="15Min")
@@ -542,6 +581,8 @@ def test_equity_history_empty_result_is_cached_briefly(monkeypatch):
     broker = AlpacaPaperBroker(api_key="K", api_secret="S")
 
     def _counting(url, **kwargs):
+        if "portfolio/history" not in url:
+            return _FakeClockResponse(200, {})
         calls.append(1)
         return _FakeClockResponse(200, {"timestamp": [1, 2], "equity": [None, None]})
 

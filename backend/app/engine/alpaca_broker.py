@@ -2,6 +2,7 @@
 Alpaca Paper Trading Broker implementation.
 Routes orders to Alpaca Paper Trading REST API and syncs cloud portfolio state.
 """
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable
 import time
 import httpx
@@ -55,6 +56,9 @@ class AlpacaPaperBroker(BaseBroker):
         self._clock_ttl: float = 15.0
         # Equity curve per (period, timeframe); venue writes it once per close.
         self._equity_history_cache: Dict[str, tuple] = {}
+        # Account creation instant for padding detection (1h TTL).
+        self._account_created_cache: Optional[datetime] = None
+        self._account_created_at_cache_ts: float = 0.0
 
         # Fill detection state: last observed filled quantity per order
         self._last_order_status: Dict[str, OrderStatus] = {}
@@ -283,14 +287,36 @@ class AlpacaPaperBroker(BaseBroker):
         "1MIN": "1Min", "5MIN": "5Min", "15MIN": "15Min", "1D": "1D",
     }
 
+    def _account_created_at(self) -> Optional[datetime]:
+        """Account creation instant (UTC), TTL-cached; None when unavailable.
+
+        Live probing showed the venue pads pre-account entries inconsistently:
+        daily series use 0.0, intraday ones have used base_value instead. The
+        creation timestamp is the only reliable padding boundary.
+        """
+        now = time.time()
+        if self._account_created_at_cache_ts and now - self._account_created_at_cache_ts < 3600:
+            return self._account_created_cache
+        try:
+            resp = self.client.get(f"{self.base_url}/account")
+            if resp.status_code != 200:
+                return self._account_created_cache
+            raw = resp.json().get("created_at")
+            created = datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
+        except Exception:
+            return self._account_created_cache
+        self._account_created_cache = created
+        self._account_created_at_cache_ts = now
+        return created
+
     def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
         """Account equity curve from Alpaca's portfolio history endpoint.
 
         Returns ``{"points": [{time, equity}], "base_value": float}`` or
         ``None`` when the venue has no history (fresh account) or the call
         fails; the UI renders an explicit empty state, never a fake curve.
-        Day entries without a real close (null equity, or Alpaca's 0.0
-        padding from before the account existed) are skipped, not filled.
+        Entries before the account existed (padded with 0.0 or base_value
+        depending on granularity) and null closes are skipped, not filled.
         """
         period = self.EQUITY_HISTORY_PERIODS.get(period.upper(), "1M")
         timeframe = self.EQUITY_HISTORY_TIMEFRAMES.get(timeframe.upper(), "1D")
@@ -315,10 +341,14 @@ class AlpacaPaperBroker(BaseBroker):
                 data = resp.json()
                 timestamps = data.get("timestamp") or []
                 equities = data.get("equity") or []
+                created = self._account_created_at()
+                created_ts = created.timestamp() if created else None
                 points = [
                     {"time": ts, "equity": eq}
                     for ts, eq in zip(timestamps, equities)
-                    if eq is not None and eq > 0
+                    if eq is not None
+                    and eq > 0
+                    and (created_ts is None or ts >= created_ts)
                 ]
                 result = None
                 if len(points) >= 2:
