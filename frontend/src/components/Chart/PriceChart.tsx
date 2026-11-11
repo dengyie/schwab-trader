@@ -402,7 +402,7 @@ export function PriceChart() {
     for (let page = 0; page < PREFILL_PAGE_BUDGET && hasMoreRef.current; page++) {
       await loadOlderRef.current?.();
       const oldest = klinesRef.current[0]?.time ?? 0;
-      if (oldest === lastOldest) return; // 无进展：到边（或重复页），不再翻
+      if (oldest === lastOldest) break; // 到边（或重复页）：停止翻页，但已补的段仍要重适配
       lastOldest = oldest;
       grew = true;
     }
