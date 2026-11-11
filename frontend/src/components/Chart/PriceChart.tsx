@@ -313,7 +313,13 @@ export function PriceChart() {
     setLivePrice(null);
     // 换标的/换周期 = 新的序列：重置补载状态（段缓存仍保留，切回不重拉）
     hasMoreRef.current = HISTORY_CAPABLE[tfForHistory(timeRange)] ?? false;
-    if (selectedSymbol) fetchKlines(selectedSymbol, INTERVAL_MAP[timeRange]);
+    if (selectedSymbol) void (async () => {
+      await fetchKlines(selectedSymbol, INTERVAL_MAP[timeRange]);
+      // 初始窗只是 Yahoo range 给的种子（15m ≈ 一个月）：序列就绪后把
+      // 该周期可用的历史一次性补齐（预取走分段接口，段已在 CF 边缘缓存，
+      // 后续访问者 ~300ms 命中），而不是等用户拖到最左才逐页补。
+      await prefillRef.current?.();
+    })();
   }, [selectedSymbol, timeRange, fetchKlines]);
 
   // 左边界历史补载：请求 time < 最旧一根 的不可变段，prepend 后整段重画。
@@ -369,6 +375,22 @@ export function PriceChart() {
   }, [timeRange]);
   // 图表初始化订阅持此 ref：回调永远调用最新的 loadOlder，不受 render 时序影响。
   loadOlderRef.current = loadOlder;
+
+  // 序列预取：loadOlder 连续翻页直到该周期的可用历史补齐（或预算耗尽）。
+  // 每页 loadOlder 自带竞态守卫；这里再守两道——最旧一根没前移说明整页
+  // 重复（段缓存合并零新增），停；页数预算兜底防御上游契约意外。
+  const prefillRef = useRef<(() => Promise<void>) | null>(null);
+  const PREFILL_PAGE_BUDGET = 6;
+  prefillRef.current = async () => {
+    if (!hasMoreRef.current) return;
+    let lastOldest = klinesRef.current[0]?.time ?? 0;
+    for (let page = 0; page < PREFILL_PAGE_BUDGET && hasMoreRef.current; page++) {
+      await loadOlderRef.current?.();
+      const oldest = klinesRef.current[0]?.time ?? 0;
+      if (oldest === lastOldest) return; // 无进展：到边（或重复页），不再翻
+      lastOldest = oldest;
+    }
+  };
 
   // 合并更早的段到当前序列：按 time 去重、只增不减（纯函数在 klineMerge.ts，测试钉住）。
   const mergeOlderSegment = useCallback((older: KlineData[], hasMore: boolean) => {
