@@ -7,6 +7,7 @@ import { useTradingStore } from '../store/tradingStore';
 import { useWatchlistStore } from '../store/watchlistStore';
 import { useAutomationStore } from '../store/automationStore';
 import { useMarketsStore } from '../store/marketsStore';
+import { useMarketStore, selectMarketClock } from '../store/marketStore';
 import { useI18n } from '../i18n';
 import { Icon, IconName } from '../components/Icon';
 import { Sparkline } from '../components/Chart/Sparkline';
@@ -520,6 +521,7 @@ export function AssetDetailPage() {
   const symbols = useWatchlistStore((state) => state.symbols);
   const setSelectedSymbol = useWatchlistStore((state) => state.setSelectedSymbol);
   const fxRates = useMarketsStore((state) => state.fxRates);
+  const marketClock = useMarketStore(selectMarketClock);
 
   // 券商端的净值曲线（Alpaca portfolio history；1D 走日内 5 分钟粒度）。
   // 404 表示账户太新、场内还没有历史——保留 null 让空态文案出现，绝不拿
@@ -546,6 +548,21 @@ export function AssetDetailPage() {
       .finally(() => { if (!cancelled) setEquityLoading(false); });
     return () => { cancelled = true; };
   }, [timeRange]);
+
+  // 年轻账户的日线档（7D/30D/ALL）在第二次收盘前必然 404：加载结束后若
+  // 当前档无数据而日内档有，默认切到 1D，让页面首屏就能看到真实曲线。
+  useEffect(() => {
+    if (equityLoading || equityHistory || timeRange === '1D') return;
+    let cancelled = false;
+    apiFetch(`/portfolio/history?${HISTORY_PARAMS['1D']}`)
+      .then(async (res) => {
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
+        if (!cancelled && (data.points || []).length >= 2) setTimeRange('1D');
+      })
+      .catch(() => { /* keep the daily empty state */ });
+    return () => { cancelled = true; };
+  }, [equityLoading, equityHistory, timeRange]);
 
   const usdPerUnit = useCallback(
     (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1,
@@ -1009,10 +1026,15 @@ export function AssetDetailPage() {
                 <span>{t.assets?.equityLoading ?? 'Loading equity history…'}</span>
               </div>
             ) : (
-              // 券商不返回净值曲线（账户太新或上游不可用）；宁可留空也不画一条随机生成的假走势。
+              // 券商不返回净值曲线（账户太新或上游不可用）；宁可留空也不画一条
+              // 随机生成的假走势。日线档在年轻账户上会等到下一次收盘，说明等待点。
               <div className={styles.chartEmpty}>
                 <Icon name="bar-chart-2" size="lg" />
-                <span>{t.assets?.equityUnavailable ?? 'Equity history is not recorded by the venue yet.'}</span>
+                <span>
+                  {timeRange !== '1D' && marketClock?.next_close
+                    ? (t.assets?.equityFirstClose ?? 'Daily curve starts after the next session close')
+                    : (t.assets?.equityUnavailable ?? 'Equity history is not recorded by the venue yet.')}
+                </span>
               </div>
             )}
           </div>

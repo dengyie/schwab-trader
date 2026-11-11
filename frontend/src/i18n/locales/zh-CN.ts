@@ -626,6 +626,7 @@ export const zhCN = {
   assets: {
     portfolioGrowth: '组合增长',
     equityLoading: '净值历史加载中…',
+    equityFirstClose: '账户太新，日线曲线将在下次收盘后出现；日内走势仍可查看。',
     equityUnavailable: '券商尚未记录净值历史。',
   },
 

@@ -627,6 +627,7 @@ export const enUS: Locale = {
   assets: {
     portfolioGrowth: 'Portfolio Growth',
     equityLoading: 'Loading equity history…',
+    equityFirstClose: 'Account is too new — the daily curve appears after the next session close; intraday is still live.',
     equityUnavailable: 'Equity history is not recorded by the venue yet.',
   },
 
