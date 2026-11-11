@@ -478,52 +478,58 @@ def test_hist_segment_survives_a_restart(tmp_path):
     assert entry.bars == seg
 
 
-def test_hist_segment_daily_falls_back_to_defeatbeta(make_feed, monkeypatch):
-    """Yahoo answering an empty daily window must not be cached as a terminal
-    edge: it may be the rate limit, not the listing's birth. DefeatBeta's 30y
-    US dailies fill the segment instead — the whole point of the fallback."""
+def test_daily_window_falls_back_to_defeatbeta(make_feed, monkeypatch):
+    """Yahoo answering the whole-window daily request with nothing must not
+    leave the daily chart blank: it may be the rate limit, not the listing's
+    birth. DefeatBeta's 30y US dailies fill the window instead."""
     feed = make_feed()
-    cursor = 1_800_000_000
-    deep = _hist_bars(cursor - 400 * 86400, 12, step=86400)  # 12 daily bars deep past
+    deep = _hist_bars(1_700_000_000, 12, step=86400)  # 12 daily bars
 
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
     monkeypatch.setattr(
         "app.adapters.defeatbeta_adapter.fetch_daily_history",
-        lambda sym, before, page_size: (deep, time.time()),
+        lambda sym: (deep, time.time()),
     )
 
-    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "1d", before=cursor)
+    bars, fetched_at = feed.get_bars_with_meta("SPY", "1d")
     assert [b.time for b in bars] == [b.time for b in deep]
     assert fetched_at > 0
+    # The fallback result is cached under the normal key, so the next read
+    # (before Yahoo recovers) does not re-scan anything.
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_daily_history",
+        lambda sym: (_ for _ in ()).throw(AssertionError("must be cached")),
+    )
+    assert feed.get_bars("SPY", "1d") == deep
 
 
-def test_hist_segment_defeatbeta_failure_keeps_terminal_edge(make_feed, monkeypatch):
-    """When the fallback is also unreachable, the empty window must still be
-    cached as the edge (previous behavior) — a paging UI that hammers a dead
-    upstream on every click is worse than an honest data start."""
+def test_daily_window_defeatbeta_failure_stays_empty_and_cools(make_feed, monkeypatch):
+    """When the fallback is also unreachable, the daily key stays unserved —
+    but defeatbeta's own failure cooldown keeps the next click from paying
+    another dataset scan."""
     feed = make_feed()
-    cursor = 1_800_000_000
-    calls = []
+    scans = []
 
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
-    def dead_fallback(sym, before, page_size):
-        calls.append(sym)
-        return None
-    monkeypatch.setattr("app.adapters.defeatbeta_adapter.fetch_daily_history", dead_fallback)
+    def dead_scan(sym):
+        scans.append(sym)
+        raise ConnectionError("dataset unreachable")
+    # Patch the scan, not fetch_daily_history: the cooldown under test lives
+    # inside fetch_daily_history itself.
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter._load_daily_bars", dead_scan)
 
-    feed.get_historical_segment("SPY", "1d", before=cursor)
-    feed.get_historical_segment("SPY", "1d", before=cursor)
-    assert calls == ["SPY"], "the terminal edge is still cached after both sources fail"
+    assert feed.get_bars("SPY", "1d") == []
+    assert feed.get_bars("SPY", "1d") == []
+    assert scans == ["SPY"], "the failure cooldown absorbs the retry"
 
 
-def test_hist_segment_fallback_only_for_us_daily(make_feed, monkeypatch):
-    """The gate: intraday windows and non-US symbols must never touch
-    defeatbeta — it is US daily-only by construction (data/US/*.parquet)."""
+def test_daily_window_fallback_only_for_us_daily(make_feed, monkeypatch):
+    """The gate: intraday windows must never touch defeatbeta — it is US
+    daily-only by construction (data/US/*.parquet)."""
     feed = make_feed()
-    cursor = 1_800_000_000
     calls = []
 
-    def spy_fallback(sym, before, page_size):
+    def spy_fallback(sym):
         calls.append(sym)
         return None
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
@@ -531,5 +537,5 @@ def test_hist_segment_fallback_only_for_us_daily(make_feed, monkeypatch):
 
     # Intraday empty window on a US symbol: true edge (or Yahoo throttle —
     # but defeatbeta cannot answer intraday, so it must not be consulted).
-    feed.get_historical_segment("SPY", "15m", before=cursor)
+    feed.get_bars("SPY", "15m")
     assert calls == []

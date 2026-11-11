@@ -346,6 +346,15 @@ class AlpacaMarketFeedService:
         """Fetch one key and store it. The caller must own the refresh slot."""
         try:
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf)
+            if not bars and tf == "1d" and market_of(sym).code == "US":
+                # Yahoo answered the whole-window daily request with nothing:
+                # the 429 Edge disguise, or a listing Yahoo's coverage misses.
+                # DefeatBeta's 30y US dailies fill the window instead of
+                # leaving the daily chart blank; a later successful Yahoo
+                # refresh overwrites the fallback through the normal cycle.
+                fallback = defeatbeta_adapter.fetch_daily_history(sym)
+                if fallback:
+                    bars = fallback[0]
             if bars:
                 # NOTE: never write last_trade_prices here — a historical close
                 # must not overwrite a fresher live trade price.
@@ -473,14 +482,6 @@ class AlpacaMarketFeedService:
                 period1 = oldest_allowed
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
             bars = [b for b in bars if b.time < before]
-            if not bars and tf == "1d" and market_of(sym).code == "US":
-                # An empty daily window is either the true edge or Yahoo being
-                # throttled/partial — indistinguishable from here, and storing
-                # the emptiness would freeze a false "data begins here" edge.
-                # DefeatBeta's 30y US dailies fill the segment instead.
-                fallback = defeatbeta_adapter.fetch_daily_history(sym, before, page_size)
-                if fallback:
-                    bars = fallback[0]
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:

@@ -15,9 +15,12 @@ measured directly (2026-11-11):
   every paging click that session, and cools down 10 minutes after a failure
   so a network partition does not turn each click into another 2s stall.
 
-The role here is narrow: when Yahoo answers a daily paging request with
-nothing (rate-limited, or the symbol simply predates Yahoo's coverage), this
-fills the segment instead of storing a false "data begins here" edge.
+The role here is narrow: when Yahoo answers the whole-window daily request
+with nothing (rate-limited via the Edge disguise, or the symbol predates
+Yahoo's coverage), this fills the daily window instead of leaving the chart
+blank. Daily keys are served whole by design — there is no daily paging —
+so the whole-window fetch IS the daily request; a later successful Yahoo
+refresh overwrites the fallback bars through the normal cache cycle.
 
 DuckDB is queried directly instead of via the defeatbeta-api package: the
 package's 0.0.63 requires Python >=3.11 (prod runs 3.10) while its older
@@ -94,12 +97,13 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
     return bars
 
 
-def fetch_daily_history(symbol: str, before: int, page_size: int) -> Optional[Tuple[List[Bar], float]]:
-    """Bars for one daily-history page strictly older than ``before``.
+def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
+    """Full split-adjusted US daily history for ``symbol``, oldest first.
 
-    Returns ``(bars, fetched_at)`` or ``None`` when upstream failed (caller
-    keeps its existing cooldown behavior). Bars are trimmed to ``page_size``
-    newest-oldest, honoring the segment contract.
+    Returns ``(bars, fetched_at)`` or ``None`` when upstream failed (the
+    caller keeps its own cooldown). The per-symbol frame is cached for a
+    day, so one dataset scan serves every request that session — including
+    the empty result of a symbol the dataset does not list.
     """
     global _last_error
     key = symbol.upper()
@@ -107,26 +111,21 @@ def fetch_daily_history(symbol: str, before: int, page_size: int) -> Optional[Tu
     with _cache_lock:
         hit = _frame_cache.get(key)
         if hit and now - hit[0] < _DEFEATBETA_TTL_SECONDS:
-            all_bars = hit[1]
-        else:
-            if now - _cooldown.get(key, 0.0) < _DEFEATBETA_COOLDOWN_SECONDS:
-                return None
-            try:
-                all_bars = _load_daily_bars(key)
-            except Exception as exc:
-                _cooldown[key] = now
-                _last_error = str(exc)
-                logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
-                return None
-            _frame_cache[key] = (now, all_bars)
-            if len(_frame_cache) > _MAX_CACHED_SYMBOLS:
-                oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
-                _frame_cache.pop(oldest, None)
-
-    older = [b for b in all_bars if b.time < before]
-    if len(older) > page_size:
-        older = older[-page_size:]
-    return older, time.time()
+            return hit[1], time.time()
+        if now - _cooldown.get(key, 0.0) < _DEFEATBETA_COOLDOWN_SECONDS:
+            return None
+        try:
+            all_bars = _load_daily_bars(key)
+        except Exception as exc:
+            _cooldown[key] = now
+            _last_error = str(exc)
+            logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
+            return None
+        _frame_cache[key] = (now, all_bars)
+        if len(_frame_cache) > _MAX_CACHED_SYMBOLS:
+            oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
+            _frame_cache.pop(oldest, None)
+    return all_bars, time.time()
 
 
 def cooldown_remaining(symbol: str) -> float:
