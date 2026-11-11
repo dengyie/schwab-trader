@@ -122,6 +122,15 @@ jobs:
 
           test -d "$stage/backend" && test -d "$stage/dist"
           mkdir -p "$backup"
+
+          # Self-heal bytecode-cache ownership: one manual root-uid run of the
+          # app leaves __pycache__ dirs owned by root, and the --delete sweep
+          # below then dies with "Permission denied" (exit 23, 2026-11-11).
+          # Bytecode is disposable, so any root-owned one is simply removed.
+          for pyc in $(find "$live_backend" -name '__pycache__' -not -user "$(id -u)" 2>/dev/null); do
+            sudo -n rm -rf "$pyc" || true
+          done
+
           rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
             --exclude 'data' "$live_backend/" "$backup/backend/"
           [ -d "$live_dist" ] && rsync -a "$live_dist/" "$backup/dist/" || true

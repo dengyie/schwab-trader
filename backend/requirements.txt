@@ -5,7 +5,9 @@ websockets>=13.0
 httpx>=0.27.0
 pytest>=8.0.0
 python-socks[asyncio]>=3.2.0
-# defeatbeta-api: US daily-history fallback (HuggingFace Parquet + DuckDB).
-# Heavy deps (duckdb/pandas/ipython) arrive transitively; imported lazily so
-# boot cost stays zero — see app/adapters/defeatbeta_adapter.py.
-defeatbeta-api>=0.0.63
+# duckdb: direct Parquet scans of the defeatbeta HuggingFace dataset for the
+# US daily-history fallback — see app/adapters/defeatbeta_adapter.py. (The
+# defeatbeta-api wrapper itself is not used: 0.0.63 requires Python >=3.11,
+# prod runs 3.10, and its older versions target the dataset's pre-partitioned
+# layout and 404. duckdb alone is py3.10-compatible.)
+duckdb>=1.0.0

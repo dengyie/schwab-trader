@@ -1,22 +1,29 @@
 """
 DefeatBeta (HuggingFace Parquet) adapter — deep US daily history as a fallback.
 
-The dataset is one Parquet file of US daily bars served by HuggingFace, scanned
-with DuckDB. Facts measured on 0.0.63 (2026-11-11):
+The dataset is one 450MB Parquet file of US daily bars served by HuggingFace
+(``defeatbeta/yahoo-finance-data``), scanned with DuckDB over httpfs. Facts
+measured directly (2026-11-11):
 
-* US-only by construction — the library hardcodes ``data/US/{table}.parquet``;
-  a HK/JP/CN symbol returns an empty frame, which is why this adapter gates on
-  the symbol's market before touching upstream.
-* Daily bars to the early 1990s (AAPL: 8k rows), ``report_date`` date strings,
+* US-only by construction — the dataset is partitioned ``data/US/*.parquet``;
+  a HK/JP/CN symbol simply has no rows, which is why this adapter gates on the
+  symbol's market before touching the network.
+* Daily bars to the early 1990s (AAPL: 8k rows), ``report_date`` VARCHAR dates,
   prices already split-adjusted; no intraday data at all.
-* A full per-symbol scan costs ~1.5-2s; the library caches the fetched frame
-  in-process, so repeat calls are free. One bar request per user paging click
-  is therefore acceptable, and a module-level TTL cache below keeps even that
-  off the hot path.
+* A whole-symbol scan costs ~2s server-side (server-side projection prunes the
+  file); this module caches the per-symbol frame for a day so one scan serves
+  every paging click that session, and cools down 10 minutes after a failure
+  so a network partition does not turn each click into another 2s stall.
 
 The role here is narrow: when Yahoo answers a daily paging request with
 nothing (rate-limited, or the symbol simply predates Yahoo's coverage), this
 fills the segment instead of storing a false "data begins here" edge.
+
+DuckDB is queried directly instead of via the defeatbeta-api package: the
+package's 0.0.63 requires Python >=3.11 (prod runs 3.10) while its older
+versions still point at the pre-partitioned dataset layout and 404. The
+interesting logic here is one SQL WHERE clause; a second dependency chain
+(duckdb + pandas + ipython + openai transitively) bought nothing.
 """
 from __future__ import annotations
 
@@ -30,13 +37,16 @@ from app.models.trading import Bar
 
 logger = logging.getLogger(__name__)
 
-# The full history is one Parquet row group away, so "paging" defeatbeta means
-# serving the whole series once and letting BarCache keep the segment. The
-# fetch is heavy (~2s) but in-process cached by the library; this module adds
-# a failure cooldown so a dead dataset or a network partition does not turn
-# every paging click into another 2s stall.
+_DATASET_URL = (
+    "https://huggingface.co/datasets/defeatbeta/yahoo-finance-data"
+    "/resolve/main/data/US/stock_prices.parquet"
+)
+# One symbol's full daily history (~8k rows) cached for a day — the dataset
+# itself updates daily, so a longer TTL would serve stale bars after an
+# overnight session, a shorter one would re-scan per paging click.
 _DEFEATBETA_TTL_SECONDS = 24 * 3600.0
 _DEFEATBETA_COOLDOWN_SECONDS = 600.0
+_MAX_CACHED_SYMBOLS = 64
 
 _cache_lock = threading.Lock()
 _frame_cache: Dict[str, Tuple[float, List[Bar]]] = {}
@@ -50,36 +60,37 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
     Raises on upstream failure so the caller can distinguish "no such symbol"
     (empty list) from "cannot reach the dataset" (exception + cooldown).
     """
-    # Imported lazily: defeatbeta-api pulls DuckDB, pandas and friends —
-    # several seconds of import — and the backend must not pay that at boot
-    # for a fallback most sessions never use.
-    from defeatbeta_api.data.ticker import Ticker
+    # Imported lazily: duckdb is a heavy binary wheel and the fallback must
+    # not tax boot or the test loop for work most sessions never do.
+    import duckdb
 
-    df = Ticker(symbol.upper().replace(".", "-"), log_level=None).price()
+    sym = symbol.upper()
+    rows = duckdb.sql(
+        f"""
+        SELECT report_date, open, high, low, close, volume
+        FROM '{_DATASET_URL}'
+        WHERE symbol = '{sym}'
+        ORDER BY report_date
+        """
+    ).fetchall()
+
     bars: List[Bar] = []
-    if df is None or df.empty:
-        return bars
-    for row in df.itertuples(index=False):
-        # report_date is a date string (or datetime) at the session bucket;
-        # defeatbeta has no intraday, so the bucket is midnight ET of that
-        # session — the same convention the chart's daily key already uses.
-        raw = row.report_date
-        if isinstance(raw, str):
-            day = datetime.strptime(raw[:10], "%Y-%m-%d")
-        else:
-            day = datetime(raw.year, raw.month, raw.day)
+    for report_date, o, h, low, c, v in rows:
+        # report_date is a VARCHAR session date; the daily bucket is midnight
+        # UTC of that session — the same convention the chart's daily key
+        # already uses (Yahoo dailies are stamped the same way).
+        day = datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
         ts = int(day.replace(tzinfo=timezone.utc).timestamp())
-        if row.open is None or row.close is None:
+        if o is None or c is None:
             continue
         bars.append(Bar(
             time=ts,
-            open=round(float(row.open), 4),
-            high=round(float(row.high), 4),
-            low=round(float(row.low), 4),
-            close=round(float(row.close), 4),
-            volume=float(row.volume or 0),
+            open=round(float(o), 4),
+            high=round(float(h), 4),
+            low=round(float(low), 4),
+            close=round(float(c), 4),
+            volume=float(v or 0),
         ))
-    bars.sort(key=lambda b: b.time)
     return bars
 
 
@@ -108,8 +119,7 @@ def fetch_daily_history(symbol: str, before: int, page_size: int) -> Optional[Tu
                 logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
                 return None
             _frame_cache[key] = (now, all_bars)
-            # Bound the module cache: one symbol's 30y of dailies is ~8k Bars.
-            if len(_frame_cache) > 64:
+            if len(_frame_cache) > _MAX_CACHED_SYMBOLS:
                 oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
                 _frame_cache.pop(oldest, None)
 
