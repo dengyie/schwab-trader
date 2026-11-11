@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import Dict, List, Callable, Optional, Set
+from typing import Dict, List, Callable, Optional, Set, Tuple
 from datetime import datetime, timezone
 from app.models.trading import Quote, Bar, Trade, OrderSide, utc_now
 from app.core.timeframes import TIMEFRAME_SECONDS
@@ -71,7 +71,9 @@ class MarketFeedService:
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.historical_bars.get(symbol.upper(), [])
 
-    def get_historical_segment(self, symbol: str, timeframe: str, before: int):
+    def get_historical_segment(
+        self, symbol: str, timeframe: str, before: int
+    ) -> Tuple[List[Bar], float, bool]:
         """Synthetic history for the simulation feed: a deterministic random
         walk strictly older than the cursor. Lets local --sim development
         exercise the chart's paging UI without any upstream session. A short
@@ -95,7 +97,7 @@ class MarketFeedService:
                 high=round(max(price, close_p) * 1.0008, 2),
                 low=round(min(price, close_p) * 0.9992, 2),
                 close=close_p,
-                volume=random.Random(f"{sym}:{bar_time}").randint(1000, 25000),
+                volume=rng.randint(1000, 25000),
             ))
             price = close_p
         # Keep the synthetic past bounded: the third page back is the edge.

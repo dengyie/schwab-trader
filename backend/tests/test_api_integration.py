@@ -334,6 +334,19 @@ class _StubBarsFeed:
         return self._bars, self._fetched_at
 
 
+class _StubSegmentFeed(_StubBarsFeed):
+    """Adds the historical-segment surface so the route's paging contract
+    (headers, validators, cursor validation) is pinned at the HTTP layer."""
+
+    def __init__(self, bars, fetched_at, seg_bars, has_more=True):
+        super().__init__(bars, fetched_at)
+        self._seg_bars = seg_bars
+        self._has_more = has_more
+
+    def get_historical_segment(self, symbol, timeframe="15m", before=0):
+        return self._seg_bars, self._fetched_at, self._has_more
+
+
 def _bars_client(fetched_at):
     """A bare app whose only route of interest is ``/api/market/bars``."""
     from fastapi import FastAPI
@@ -347,6 +360,23 @@ def _bars_client(fetched_at):
     ]
     stub = FastAPI()
     stub.include_router(create_api_router(ledger, _StubBarsFeed(bars, fetched_at)))
+    return TestClient(stub)
+
+
+def _segment_client(seg_bars, has_more=True, fetched_at=None):
+    """A bare app wired to a segment-capable feed, for paging-contract tests."""
+    from fastapi import FastAPI
+    from app.api.routes import create_api_router
+    from app.models.trading import Bar
+
+    bars = [
+        Bar(time=1000 + i * 60, open=100.0 + i, high=101.0 + i, low=99.0 + i,
+            close=100.5 + i, volume=10.0)
+        for i in range(3)
+    ]
+    stub = FastAPI()
+    stub.include_router(create_api_router(
+        ledger, _StubSegmentFeed(bars, fetched_at or time.time(), seg_bars, has_more)))
     return TestClient(stub)
 
 
@@ -417,6 +447,75 @@ def test_bars_without_a_fetch_time_are_not_cacheable():
     assert resp.headers["X-Cache"] == "MISS"
     assert resp.headers["Cache-Control"] == "no-store"
     assert "ETag" not in resp.headers
+
+
+def test_hist_segment_route_contract():
+    """The paging contract the frontend drives off: strictly-older bars, a
+    has-more flag, a segment ETag and a shared-cache-friendly policy."""
+    from app.models.trading import Bar
+
+    cursor = 1_800_000_000
+    seg = [
+        Bar(time=cursor - 900 + i * 60, open=100.0, high=101.0, low=99.0,
+            close=100.5, volume=10.0)
+        for i in range(3)
+    ]
+    client = _segment_client(seg, has_more=True)
+    resp = client.get(f"/api/market/bars?symbol=SPY&timeframe=15m&before={cursor}", headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert all(b["time"] < cursor for b in body)
+    assert resp.headers["X-Bars-Has-More"] == "1"
+    assert int(resp.headers["X-Bars-Oldest"]) == seg[0].time
+    assert resp.headers["ETag"].startswith(f'W/"SPY-15m-h{cursor}-')
+    assert resp.headers["Cache-Control"] == (
+        "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400"
+    )
+
+
+def test_hist_segment_conditional_request_returns_304():
+    from app.models.trading import Bar
+
+    cursor = 1_800_000_000
+    seg = [
+        Bar(time=cursor - 900, open=100.0, high=101.0, low=99.0, close=100.5, volume=10.0)
+    ]
+    client = _segment_client(seg, has_more=False)
+    first = client.get(f"/api/market/bars?symbol=SPY&timeframe=15m&before={cursor}", headers=AUTH)
+    etag = first.headers["ETag"]
+
+    second = client.get(
+        f"/api/market/bars?symbol=SPY&timeframe=15m&before={cursor}",
+        headers={**AUTH, "If-None-Match": etag},
+    )
+    assert second.status_code == 304
+    assert second.content == b""
+    # The paging headers survive the 304: a shared cache replaying it must
+    # still know the segment is a terminal edge.
+    assert second.headers["X-Bars-Has-More"] == "0"
+    assert second.headers["ETag"] == etag
+    assert second.headers["Cache-Control"].startswith("public, max-age=")
+
+
+def test_hist_segment_rejects_non_positive_cursor():
+    client = _segment_client([], has_more=False)
+
+    for bad in ("0", "-5"):
+        resp = client.get(f"/api/market/bars?symbol=SPY&timeframe=15m&before={bad}", headers=AUTH)
+        assert resp.status_code == 400, bad
+        assert "before" in resp.json()["detail"]
+
+
+def test_hist_segment_rejects_daily_timeframes():
+    """Daily and coarser buckets are served whole; a cursor there is a
+    client bug and must 400, not silently return a truncated window."""
+    client = _segment_client([], has_more=False)
+
+    for tf in ("1d", "1wk", "1mo"):
+        resp = client.get(f"/api/market/bars?symbol=SPY&timeframe={tf}&before=1800000000", headers=AUTH)
+        assert resp.status_code == 400, tf
+        assert "served whole" in resp.json()["detail"]
 
 
 def test_market_tickers_conditional_request(monkeypatch):

@@ -371,6 +371,31 @@ def test_hist_segment_is_served_from_cache_without_upstream(make_feed, monkeypat
     assert [b.time for b in bars] == [b.time for b in seg]
 
 
+def test_hist_segment_cache_hit_on_us_feed(make_feed, monkeypatch):
+    """The US feed mirrors the Yahoo feed's paging: a warm segment must be
+    served with zero upstream calls, and a stale one must stay on disk."""
+    feed = make_feed()
+    cursor = 1_800_000_000
+    seg = _hist_bars(cursor - 5 * 900, 4)
+    monkeypatch.setattr(
+        YahooFinanceAdapter, "fetch_bars",
+        lambda *a, **k: seg,
+    )
+    feed.get_historical_segment("SPY", "15m", before=cursor)
+
+    calls = []
+    def fetch(sym, *a, **k):
+        calls.append(sym)
+        return seg
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", fetch)
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert calls == [], "US feed must serve a warm segment without upstream"
+    assert [b.time for b in bars] == [b.time for b in seg]
+    assert fetched_at > 0
+    assert has_more is False
+
+
 def test_hist_segment_full_page_reports_has_more(make_feed, monkeypatch):
     feed = make_feed()
     cursor = 1_800_000_000

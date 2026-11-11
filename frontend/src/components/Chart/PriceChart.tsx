@@ -174,6 +174,8 @@ export function PriceChart() {
   
   const [chartType, setChartType] = useState<ChartType>('candlestick');
   const [timeRange, setTimeRange] = useState<TimeRange>('15m');
+  const timeRangeRef = useRef<TimeRange>('15m');
+  timeRangeRef.current = timeRange;
   const [klines, setKlines] = useState<KlineData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -336,8 +338,10 @@ export function PriceChart() {
       const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}`;
       const response = await apiFetch(url);
       if (!response.ok) throw response;
-      // 竞态保护：请求期间用户切走了标的，丢弃过期响应
+      // 竞态保护：请求期间用户切走了标的或周期，丢弃过期响应
+      // （在途 15m 段绝不许落进已切到 1h 的序列）
       if (selectedSymbolRef.current !== symbol) return;
+      if (tfForHistory(timeRangeRef.current) !== tf) return;
 
       const data = await response.json();
       const more: KlineData[] = data.map((k: any) => ({

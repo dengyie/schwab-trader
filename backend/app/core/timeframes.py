@@ -69,6 +69,19 @@ HIST_SEGMENT_TTL_SECONDS = 7 * 24 * 3600.0
 # the edge segment plus a few pages back. A 4th segment evicts the oldest.
 MAX_HIST_SEGMENTS_PER_KEY = 3
 
+# Bars per historical page by bucket granularity (daily+ buckets change once
+# per session, so a smaller page is plenty; minute buckets fall back to
+# HIST_SEGMENT_BARS). Shared by the Yahoo and Alpaca feeds — this is the
+# paging contract, not a per-feed preference.
+HIST_PAGE_BARS: Dict[str, int] = {
+    "1d": HIST_SEGMENT_BARS_DAILY,
+    "1wk": HIST_SEGMENT_BARS_DAILY,
+    "1mo": HIST_SEGMENT_BARS_DAILY,
+}
+# A page fetches a window wide enough to plausibly fill the page size; the
+# result is trimmed to the page contract afterwards.
+HIST_PAGE_SPAN_SECONDS = 366 * 86400
+
 # Yahoo Finance (interval, range) pairs per timeframe.
 YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = {
     "1m": ("1m", "7d"),

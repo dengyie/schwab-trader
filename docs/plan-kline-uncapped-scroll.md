@@ -194,3 +194,14 @@ const loadOlder = useCallback(async () => {
 - Yahoo 429 计数进 health——已列 §7.12 待办，独立小切片；
 - 代理池/号池——永久否决（公众项目不产品化 ToS 违规）；
 - `1d/1wk/1mo` 分页——一次拉全量已够，键爆炸不值得。
+
+## 八、上线后 Code Review 闭环（2026-11-11）
+
+a9438a4 生产评审修复（commit 本节同批）：
+
+- **F1（P2，已修）**：`loadOlder` 竞态守卫原本只比对 symbol，换周期瞬间在途段响应可把 15m 段注入 1h 序列。新增 `timeRangeRef`，响应落地前比对 `tfForHistory(timeRangeRef.current) !== tf` 即丢弃（PriceChart.tsx）。
+- **F2（P2，已修）**：路由层分段契约补 4 个 HTTP 测试——段 200 全头断言（has-more/oldest/ETag/public s-maxage）、段 304（含 304 上 X-Bars-Has-More 存活断言）、`before<=0 → 400`、日级 `before → 400`（test_api_integration.py）。另补 US feed 段缓存命中零上游测试（test_bar_cache.py）。263 绿。
+- **F3（P3，需确认项已文档化）**：`/api/market/bars` 分段响应 `public, s-maxage=604800` 与 `require_auth` 并存的边界已写入 routes.py 注释：安全前提是载荷为用户无关的公共行情数据且域名未启用 CF 代理/共享缓存规则；启用任一前提变化时必须重审。
+- **F4/F6（P3，已修）**：删除死常量 `HIST_SEGMENT_BARS_MIN`；sim feed `get_historical_segment` 补 `Tuple[List[Bar], float, bool]` 注解并去掉逐 bar `random.Random` 构造。
+- **F5（P3，已修）**：`HIST_PAGE_BARS`/`HIST_PAGE_SPAN_SECONDS` 上移 `app/core/timeframes.py` 单源，Yahoo/Alpaca 两 feed 改为导入，消除双份拷贝漂移风险。
+- **F7/F8（Suggestion，文档化）**：`X-Bars-Oldest` 为运维/调试契约，前端翻页实际由 `X-Bars-Has-More` 驱动；任意 cursor 值构造缓存键的边界由全局上限（MAX_CACHE_ENTRIES=300 / MAX_DISK_FILES=400）兜住，记录为已知边界，不改代码。

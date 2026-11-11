@@ -332,6 +332,15 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             # History does not age: browsers keep the segment for a day and
             # the CDN edge for a week; the ETag still turns a revalidation
             # into a 304. Fresh-window headers below are untouched.
+            # Cache-contract caveats:
+            # - ``public``/``s-maxage`` invites a shared cache to store these
+            #   responses even though the route sits behind require_auth. Safe
+            #   only while the payload is user-identical public market data
+            #   (it is) and the domain is not yet CF-proxied; revisit before
+            #   enabling any shared-cache rule, or if this endpoint ever gains
+            #   a per-user dimension.
+            # - ``X-Bars-Oldest`` is an ops/debug contract: the frontend drives
+            #   paging off ``X-Bars-Has-More`` and does not read this header.
             response.headers["ETag"] = etag
             response.headers["X-Bars-Has-More"] = "1" if has_more else "0"
             response.headers["X-Bars-Oldest"] = str(bars[0].time if bars else 0)

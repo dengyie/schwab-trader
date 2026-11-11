@@ -25,8 +25,9 @@ from app.core.markets import (
     within_day_range,
 )
 from app.core.timeframes import (
+    HIST_PAGE_BARS,
+    HIST_PAGE_SPAN_SECONDS,
     HIST_SEGMENT_BARS,
-    HIST_SEGMENT_BARS_DAILY,
     TIMEFRAME_SPAN_DAYS,
     TIMEFRAME_TTLS,
 )
@@ -34,12 +35,6 @@ from app.engine.bar_cache import BarCache
 from app.engine.state_store import JsonStateStore
 
 logger = logging.getLogger(__name__)
-
-# Bars per historical page by bucket granularity (mirrors YahooQuoteFeed).
-HIST_PAGE_BARS = {"1d": HIST_SEGMENT_BARS_DAILY, "1wk": HIST_SEGMENT_BARS_DAILY, "1mo": HIST_SEGMENT_BARS_DAILY}
-# A page fetches a window wide enough to plausibly fill the page size; the
-# result is trimmed to the page contract afterwards.
-HIST_PAGE_SPAN_SECONDS = 366 * 86400
 
 # Upper bound on cached (symbol, timeframe) bar entries; evicts oldest first.
 MAX_CACHE_ENTRIES = 300
