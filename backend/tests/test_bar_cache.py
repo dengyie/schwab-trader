@@ -10,11 +10,14 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 
+from app.adapters import defeatbeta_adapter
 from app.adapters.alpaca_adapter import AlpacaDataAdapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
+from app.core.timeframes import DAILY_WINDOW_SPAN_SECONDS
 from app.engine.alpaca_market_feed import MAX_CACHE_ENTRIES, AlpacaMarketFeedService
 from app.engine.bar_cache import BarCache
 from app.models.trading import Bar
@@ -524,8 +527,8 @@ def test_daily_window_defeatbeta_failure_stays_empty_and_cools(make_feed, monkey
 
 
 def test_daily_window_fallback_only_for_us_daily(make_feed, monkeypatch):
-    """The gate: intraday windows must never touch defeatbeta — it is US
-    daily-only by construction (data/US/*.parquet)."""
+    """The gate has two halves: intraday windows and non-US symbols must
+    never touch defeatbeta — it is US daily-only by construction."""
     feed = make_feed()
     calls = []
 
@@ -539,3 +542,84 @@ def test_daily_window_fallback_only_for_us_daily(make_feed, monkeypatch):
     # but defeatbeta cannot answer intraday, so it must not be consulted).
     feed.get_bars("SPY", "15m")
     assert calls == []
+
+    # Non-US daily: the dataset has no HK bars, so even a daily window
+    # must not scan it.
+    class _HK:
+        code = "HK"
+    monkeypatch.setattr("app.engine.alpaca_market_feed.market_of", lambda sym: _HK())
+    feed.get_bars("SPY", "1d")
+    assert calls == []
+
+
+def test_daily_window_fallback_trims_to_yahoo_daily_window(make_feed, monkeypatch):
+    """The fallback must not hand the chart a wider window than Yahoo's own
+    whole-window daily fetch (5y): when Yahoo recovers, the chart would
+    visibly shrink back. A listing dead for the whole window keeps its full
+    real history — the trim must never blank the only data available."""
+    feed = make_feed()
+    now = time.time()
+    cutoff = now - DAILY_WINDOW_SPAN_SECONDS
+    recent = Bar(time=int(now) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
+    ancient = Bar(time=int(cutoff) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_daily_history",
+        lambda sym: ([ancient, recent], time.time()),
+    )
+    bars, _ = feed.get_bars_with_meta("SPY", "1d")
+    assert [b.time for b in bars] == [recent.time], "bars older than the 5y window are trimmed"
+
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_daily_history",
+        lambda sym: ([ancient], time.time()),
+    )
+    bars, _ = feed.get_bars_with_meta("DEAD", "1d")
+    assert [b.time for b in bars] == [ancient.time], "a full-window-dead listing keeps its history"
+
+
+def test_defeatbeta_scan_does_not_block_other_symbols(monkeypatch):
+    """The dataset scan is seconds of network IO; it must run outside the
+    cache lock, or one hung upstream serializes every other symbol's
+    fallback (and the health probe's stats() call) behind it."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def scan(sym):
+        if sym == "SLOW":
+            started.set()
+            release.wait(5.0)
+        return []
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter._load_daily_bars", scan)
+
+    in_flight = threading.Thread(target=defeatbeta_adapter.fetch_daily_history, args=("SLOW",))
+    in_flight.start()
+    assert started.wait(5.0), "the slow scan should have started"
+
+    t0 = time.time()
+    result = defeatbeta_adapter.fetch_daily_history("FAST")
+    elapsed = time.time() - t0
+    release.set()
+    in_flight.join(5.0)
+
+    assert result is not None
+    assert elapsed < 1.0, "another symbol's in-flight scan must not block this one"
+
+
+def test_defeatbeta_rows_skip_partial_and_stamp_session_open():
+    """One malformed row must not fail the whole symbol's history (a partial
+    row is not a candle), and the daily stamp must match Yahoo's session-open
+    convention — 9:30 America/New_York, prod-measured 13:30 UTC in summer /
+    14:30 UTC in winter — so the two sources are interchangeable."""
+    rows = [
+        ("2025-07-01", 10.0, 11.0, 9.5, 10.5, 100),
+        ("2025-07-02", 10.0, None, 9.5, 10.5, 100),
+        ("2026-11-10", 20.0, 21.0, 19.5, 20.5, 200),
+    ]
+    bars = defeatbeta_adapter._rows_to_bars(rows)
+    assert len(bars) == 2
+    assert datetime.fromtimestamp(bars[0].time, tz=timezone.utc).isoformat() == "2025-07-01T13:30:00+00:00"
+    assert datetime.fromtimestamp(bars[1].time, tz=timezone.utc).isoformat() == "2026-11-10T14:30:00+00:00"

@@ -123,14 +123,6 @@ jobs:
           test -d "$stage/backend" && test -d "$stage/dist"
           mkdir -p "$backup"
 
-          # Self-heal bytecode-cache ownership: one manual root-uid run of the
-          # app leaves __pycache__ dirs owned by root, and the --delete sweep
-          # below then dies with "Permission denied" (exit 23, 2026-11-11).
-          # Bytecode is disposable, so any root-owned one is simply removed.
-          for pyc in $(find "$live_backend" -name '__pycache__' -not -user "$(id -u)" 2>/dev/null); do
-            sudo -n rm -rf "$pyc" || true
-          done
-
           rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
             --exclude 'data' "$live_backend/" "$backup/backend/"
           [ -d "$live_dist" ] && rsync -a "$live_dist/" "$backup/dist/" || true
@@ -140,7 +132,14 @@ jobs:
             trap - EXIT
             if [ "$rc" -ne 0 ]; then
               echo "Deploy failed (exit $rc); restoring $backup" >&2
-              rsync -a --delete --exclude '.venv' --exclude 'data' "$backup/backend/" "$live_backend/"
+              # Bytecode is excluded, not swept: a --delete touch on a
+              # root-owned __pycache__ (left by a manual root-uid run) dies
+              # with "Permission denied" (exit 23, 2026-11-11) and kills the
+              # rollback itself. Stale bytecode is harmless — Python
+              # revalidates against source mtime — so no sweep ever needs it.
+              rsync -a --delete --exclude '.venv' --exclude 'data' \
+                --exclude '__pycache__' --exclude '.pytest_cache' \
+                "$backup/backend/" "$live_backend/"
               if [ -d "$backup/dist" ]; then
                 rsync -a --delete "$backup/dist/" "$live_dist/"
               fi

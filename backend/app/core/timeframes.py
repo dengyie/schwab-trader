@@ -96,3 +96,10 @@ YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = {
     "1wk": ("1wk", "10y"),
     "1mo": ("1mo", "max"),
 }
+
+# Whole-window daily span in seconds — mirrors YAHOO_TIMEFRAME_MAP["1d"]'s
+# range="5y". Kept in seconds because the defeatbeta fallback trims its bars
+# to the same window Yahoo serves, so the chart does not change width when
+# the fallback hands back to a recovered Yahoo. If the "1d" range above ever
+# changes, change this with it.
+DAILY_WINDOW_SPAN_SECONDS = 5 * 366 * 86400

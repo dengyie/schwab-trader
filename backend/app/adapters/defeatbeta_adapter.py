@@ -3,17 +3,20 @@ DefeatBeta (HuggingFace Parquet) adapter — deep US daily history as a fallback
 
 The dataset is one 450MB Parquet file of US daily bars served by HuggingFace
 (``defeatbeta/yahoo-finance-data``), scanned with DuckDB over httpfs. Facts
-measured directly (2026-11-11):
+measured directly (2026-11-11/12):
 
 * US-only by construction — the dataset is partitioned ``data/US/*.parquet``;
   a HK/JP/CN symbol simply has no rows, which is why this adapter gates on the
   symbol's market before touching the network.
 * Daily bars to the early 1990s (AAPL: 8k rows), ``report_date`` VARCHAR dates,
   prices already split-adjusted; no intraday data at all.
-* A whole-symbol scan costs ~2s server-side (server-side projection prunes the
-  file); this module caches the per-symbol frame for a day so one scan serves
-  every paging click that session, and cools down 10 minutes after a failure
-  so a network partition does not turn each click into another 2s stall.
+* A whole-symbol scan costs ~2-7s (prod-measured 6.8s for KO, cold) — this
+  module caches the per-symbol frame for a day so one scan serves every
+  request that session, and cools down 10 minutes after a failure so an
+  outage does not turn each click into another scan.
+* The dataset trails Yahoo by one session (its newest bar is yesterday's
+  session while Yahoo already has today's) — acceptable for a resilience
+  fallback, not a primary feed.
 
 The role here is narrow: when Yahoo answers the whole-window daily request
 with nothing (rate-limited via the Edge disguise, or the symbol predates
@@ -21,6 +24,12 @@ Yahoo's coverage), this fills the daily window instead of leaving the chart
 blank. Daily keys are served whole by design — there is no daily paging —
 so the whole-window fetch IS the daily request; a later successful Yahoo
 refresh overwrites the fallback bars through the normal cache cycle.
+
+Timestamps: the dataset stamps each session at 00:00 UTC, but Yahoo stamps
+its dailies at the session open (prod-measured 13:30 UTC summer / 14:30 UTC
+winter — i.e. 9:30 America/New_York). Bars are restamped to that convention
+so the two sources are interchangeable on the daily key, and day-range
+guard logic that expects open-stamped dailies keeps working.
 
 DuckDB is queried directly instead of via the defeatbeta-api package: the
 package's 0.0.63 requires Python >=3.11 (prod runs 3.10) while its older
@@ -33,8 +42,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from app.models.trading import Bar
 
@@ -46,15 +56,55 @@ _DATASET_URL = (
 )
 # One symbol's full daily history (~8k rows) cached for a day — the dataset
 # itself updates daily, so a longer TTL would serve stale bars after an
-# overnight session, a shorter one would re-scan per paging click.
+# overnight session, a shorter one would re-scan per request.
 _DEFEATBETA_TTL_SECONDS = 24 * 3600.0
 _DEFEATBETA_COOLDOWN_SECONDS = 600.0
 _MAX_CACHED_SYMBOLS = 64
+# A cold scan is a few seconds; a hung HuggingFace connection must not pin a
+# caller thread forever (duckdb 1.5.x exposes no http timeout setting, so the
+# bound lives here). 30s is ~4x the prod-measured worst case.
+_SCAN_TIMEOUT_SECONDS = 30.0
+# Yahoo daily bars are stamped at the session open; the dataset stamps the
+# same session at 00:00 UTC. Restamping to the open convention keeps the
+# two sources interchangeable on the daily key (see module docstring).
+_SESSION_OPEN_TZ = ZoneInfo("America/New_York")
 
 _cache_lock = threading.Lock()
 _frame_cache: Dict[str, Tuple[float, List[Bar]]] = {}
 _cooldown: Dict[str, float] = {}
 _last_error: str = ""
+
+
+def _session_open_epoch(report_date: str) -> int:
+    """Epoch of 9:30 America/New_York on that session date.
+
+    DST-aware: 13:30 UTC in summer, 14:30 UTC in winter — the same instant
+    Yahoo stamps the session's daily bar with.
+    """
+    day = datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
+    return int(day.replace(hour=9, minute=30, tzinfo=_SESSION_OPEN_TZ).timestamp())
+
+
+def _rows_to_bars(rows: list) -> List[Bar]:
+    """Dataset rows → Bars, oldest first.
+
+    Any row with a missing OHLC field is skipped (a partial row is not a
+    candle), mirroring the Yahoo adapter's row discipline — one malformed
+    row must not fail the whole symbol's history.
+    """
+    bars: List[Bar] = []
+    for report_date, o, h, low, c, v in rows:
+        if None in (o, h, low, c):
+            continue
+        bars.append(Bar(
+            time=_session_open_epoch(report_date),
+            open=round(float(o), 4),
+            high=round(float(h), 4),
+            low=round(float(low), 4),
+            close=round(float(c), 4),
+            volume=float(v or 0),
+        ))
+    return bars
 
 
 def _load_daily_bars(symbol: str) -> List[Bar]:
@@ -68,33 +118,44 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
     import duckdb
 
     sym = symbol.upper()
-    rows = duckdb.sql(
+    rows = duckdb.execute(
         f"""
         SELECT report_date, open, high, low, close, volume
         FROM '{_DATASET_URL}'
-        WHERE symbol = '{sym}'
+        WHERE symbol = ?
         ORDER BY report_date
-        """
+        """,
+        [sym],
     ).fetchall()
+    return _rows_to_bars(rows)
 
-    bars: List[Bar] = []
-    for report_date, o, h, low, c, v in rows:
-        # report_date is a VARCHAR session date; the daily bucket is midnight
-        # UTC of that session — the same convention the chart's daily key
-        # already uses (Yahoo dailies are stamped the same way).
-        day = datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
-        ts = int(day.replace(tzinfo=timezone.utc).timestamp())
-        if o is None or c is None:
-            continue
-        bars.append(Bar(
-            time=ts,
-            open=round(float(o), 4),
-            high=round(float(h), 4),
-            low=round(float(low), 4),
-            close=round(float(c), 4),
-            volume=float(v or 0),
-        ))
-    return bars
+
+def _load_daily_bars_bounded(symbol: str) -> List[Bar]:
+    """``_load_daily_bars`` with a wall-clock bound.
+
+    duckdb has no configurable http timeout, so the scan runs on a helper
+    thread the caller stops waiting on after ``_SCAN_TIMEOUT_SECONDS``. The
+    orphaned scan keeps no lock (the caller's cache lock is released before
+    this runs) and its result is discarded; the cooldown then keeps further
+    scans from piling up on a dead upstream.
+    """
+    outcome: List[Tuple[str, object]] = []
+
+    def _run() -> None:
+        try:
+            outcome.append(("ok", _load_daily_bars(symbol)))
+        except BaseException as exc:  # propagate everything, incl. duckdb errors
+            outcome.append(("error", exc))
+
+    scanner = threading.Thread(target=_run, daemon=True, name="defeatbeta-scan")
+    scanner.start()
+    scanner.join(_SCAN_TIMEOUT_SECONDS)
+    if scanner.is_alive():
+        raise TimeoutError(f"DefeatBeta scan for {symbol} exceeded {_SCAN_TIMEOUT_SECONDS:.0f}s")
+    kind, value = outcome[0]
+    if kind == "error":
+        raise value
+    return value  # type: ignore[return-value]
 
 
 def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
@@ -103,7 +164,8 @@ def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
     Returns ``(bars, fetched_at)`` or ``None`` when upstream failed (the
     caller keeps its own cooldown). The per-symbol frame is cached for a
     day, so one dataset scan serves every request that session — including
-    the empty result of a symbol the dataset does not list.
+    the empty result of a symbol the dataset does not list. Callers get a
+    copy: the cached frame must stay immutable behind the lock.
     """
     global _last_error
     key = symbol.upper()
@@ -111,27 +173,25 @@ def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
     with _cache_lock:
         hit = _frame_cache.get(key)
         if hit and now - hit[0] < _DEFEATBETA_TTL_SECONDS:
-            return hit[1], time.time()
+            return list(hit[1]), now
         if now - _cooldown.get(key, 0.0) < _DEFEATBETA_COOLDOWN_SECONDS:
             return None
-        try:
-            all_bars = _load_daily_bars(key)
-        except Exception as exc:
-            _cooldown[key] = now
-            _last_error = str(exc)
-            logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
-            return None
-        _frame_cache[key] = (now, all_bars)
+    # The scan runs OUTSIDE the lock: it is seconds of network IO, and a hung
+    # upstream must not serialize every other symbol's fallback behind it.
+    try:
+        all_bars = _load_daily_bars_bounded(key)
+    except Exception as exc:
+        with _cache_lock:
+            _cooldown[key] = time.time()
+            _last_error = str(exc)[:200]
+        logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
+        return None
+    with _cache_lock:
+        _frame_cache[key] = (time.time(), all_bars)
         if len(_frame_cache) > _MAX_CACHED_SYMBOLS:
             oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
             _frame_cache.pop(oldest, None)
-    return all_bars, time.time()
-
-
-def cooldown_remaining(symbol: str) -> float:
-    key = symbol.upper()
-    with _cache_lock:
-        return max(0.0, _DEFEATBETA_COOLDOWN_SECONDS - (time.time() - _cooldown.get(key, 0.0)))
+    return list(all_bars), time.time()
 
 
 def stats() -> Dict[str, object]:

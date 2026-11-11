@@ -26,6 +26,7 @@ from app.core.markets import (
     within_day_range,
 )
 from app.core.timeframes import (
+    DAILY_WINDOW_SPAN_SECONDS,
     HIST_PAGE_BARS,
     HIST_PAGE_SPAN_SECONDS,
     HIST_SEGMENT_BARS,
@@ -264,6 +265,10 @@ class AlpacaMarketFeedService:
             "consecutive_failures": self._stream_failures,
             "quota_exceeded": self._stream_quota,
             "last_error": self._stream_last_error,
+            # The US daily-history fallback's own observability: cached frames
+            # and the last upstream failure, so an outage is readable in
+            # /api/health instead of only in the app log.
+            "daily_fallback": defeatbeta_adapter.stats(),
         }
 
     def _preload_historical_bars_sync(self) -> None:
@@ -352,9 +357,14 @@ class AlpacaMarketFeedService:
                 # DefeatBeta's 30y US dailies fill the window instead of
                 # leaving the daily chart blank; a later successful Yahoo
                 # refresh overwrites the fallback through the normal cycle.
+                # Trimmed to Yahoo's own whole-window daily span, so the chart
+                # does not suddenly "shrink" back when Yahoo recovers — unless
+                # that would empty the window (a listing dead for 5y+ years
+                # keeps its full real history, which Yahoo could not serve).
                 fallback = defeatbeta_adapter.fetch_daily_history(sym)
                 if fallback:
-                    bars = fallback[0]
+                    cutoff = time.time() - DAILY_WINDOW_SPAN_SECONDS
+                    bars = [b for b in fallback[0] if b.time >= cutoff] or fallback[0]
             if bars:
                 # NOTE: never write last_trade_prices here — a historical close
                 # must not overwrite a fresher live trade price.

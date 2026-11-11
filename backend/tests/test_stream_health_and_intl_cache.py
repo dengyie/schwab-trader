@@ -499,3 +499,26 @@ def test_intl_health_reports_yahoo_rate_limit_stats(yahoo):
 
     YahooFinanceAdapter.record_success()
     assert feed.health()["rate_limit"]["consecutive"] == 0, "streak clears, total keeps history"
+
+
+# -- defeatbeta daily-fallback observability ---------------------------------
+def test_us_stream_health_reports_daily_fallback_stats(monkeypatch):
+    """The daily fallback's state must be readable in /api/health: whether
+    frames are cached and what the dataset last failed with — an outage that
+    currently only shows as a blank daily chart must be nameable."""
+    monkeypatch.setattr(AlpacaMarketFeedService, "_preload_historical_bars_sync", lambda self: None)
+    feed = AlpacaMarketFeedService(initial_symbols=["SPY"], api_key="k", api_secret="s")
+
+    stats = feed.stream_health()["daily_fallback"]
+    assert set(stats) == {"cached_symbols", "last_error"}
+    assert stats["cached_symbols"] == 0 and stats["last_error"] is None
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    def dead_scan(sym):
+        raise ConnectionError("dataset unreachable")
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter._load_daily_bars", dead_scan)
+    assert feed.get_bars("SPY", "1d") == []
+
+    stats = feed.stream_health()["daily_fallback"]
+    assert stats["last_error"] and "dataset unreachable" in stats["last_error"]
+    assert stats["cached_symbols"] == 0, "failures must not cache frames"

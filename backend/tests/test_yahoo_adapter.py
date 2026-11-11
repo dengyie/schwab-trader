@@ -190,6 +190,24 @@ class _DelistedClient:
             "code": "Not Found", "description": "No data found, symbol may be delisted"}}}
 
 
+class _OkChartClient:
+    """HTTP 200 with one daily bar, for the explicit-window (period1/period2) path."""
+    status_code = 200
+    def get(self, *a, **k):
+        return self
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"chart": {"result": [{
+            "meta": {},
+            "timestamp": [1794371400],
+            "indicators": {"quote": [{
+                "open": [100.0], "high": [101.0], "low": [99.0],
+                "close": [100.5], "volume": [123.0],
+            }]},
+        }], "error": None}}
+
+
 @pytest.fixture(autouse=True)
 def _reset_rate_limit():
     YahooFinanceAdapter._rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
@@ -227,3 +245,14 @@ def test_success_resets_consecutive_streak():
                                    client=_DelistedClient())
     assert YahooFinanceAdapter.rate_limit_stats()["consecutive"] == 0
     assert YahooFinanceAdapter.rate_limit_stats()["count"] == 1, "total counts history, streak counts the fire"
+
+
+def test_fetch_bars_explicit_period1_defaults_period2_to_now():
+    """The segment path may pass only ``period1``; the ``period2=None`` branch
+    evaluates ``time.time()`` while building params. A missing module import
+    there used to NameError into the generic except and silently return [] —
+    which the defeatbeta fallback would then read as "Yahoo has nothing"."""
+    bars = YahooFinanceAdapter.fetch_bars(
+        "SPY", "1d", client=_OkChartClient(), period1=0, period2=None)
+    assert len(bars) == 1
+    assert bars[0].close == 100.5

@@ -5,6 +5,8 @@ with zero authentication, high depth, and consolidated US equity volume.
 """
 from __future__ import annotations
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict
 from zoneinfo import ZoneInfo
@@ -70,26 +72,31 @@ class YahooFinanceAdapter:
     # request volume far below the community thresholds, but when the VPS
     # exit IP does get throttled the whole intl feed goes quiet at once, so
     # the signal must be countable and visible, not just a log line.
+    # fetch_bars runs on several feed thread pools at once, so the counter
+    # is guarded: a torn increment would under-report exactly during the
+    # storm this counter exists to observe.
     _rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    _rate_limit_lock = threading.Lock()
 
     @classmethod
     def record_rate_limit(cls, detail: str) -> None:
         """Count one throttled upstream response, real or disguised."""
-        import time as _time
-
-        stats = cls._rate_limit
-        stats["count"] += 1
-        stats["consecutive"] += 1
-        stats["last_ts"] = _time.time()
+        with cls._rate_limit_lock:
+            stats = cls._rate_limit
+            stats["count"] += 1
+            stats["consecutive"] += 1
+            stats["last_ts"] = time.time()
         logger.warning("Yahoo rate limit signal (%s): %s", stats["count"], detail)
 
     @classmethod
     def record_success(cls) -> None:
-        cls._rate_limit["consecutive"] = 0
+        with cls._rate_limit_lock:
+            cls._rate_limit["consecutive"] = 0
 
     @classmethod
     def rate_limit_stats(cls) -> Dict[str, object]:
-        return dict(cls._rate_limit)
+        with cls._rate_limit_lock:
+            return dict(cls._rate_limit)
 
     @staticmethod
     def _looks_rate_limited(error: Dict[str, object]) -> bool:
