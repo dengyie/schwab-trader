@@ -476,3 +476,60 @@ def test_hist_segment_survives_a_restart(tmp_path):
     entry = reopened.get("SPY", tf)
     assert entry is not None
     assert entry.bars == seg
+
+
+def test_hist_segment_daily_falls_back_to_defeatbeta(make_feed, monkeypatch):
+    """Yahoo answering an empty daily window must not be cached as a terminal
+    edge: it may be the rate limit, not the listing's birth. DefeatBeta's 30y
+    US dailies fill the segment instead — the whole point of the fallback."""
+    feed = make_feed()
+    cursor = 1_800_000_000
+    deep = _hist_bars(cursor - 400 * 86400, 12, step=86400)  # 12 daily bars deep past
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_daily_history",
+        lambda sym, before, page_size: (deep, time.time()),
+    )
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "1d", before=cursor)
+    assert [b.time for b in bars] == [b.time for b in deep]
+    assert fetched_at > 0
+
+
+def test_hist_segment_defeatbeta_failure_keeps_terminal_edge(make_feed, monkeypatch):
+    """When the fallback is also unreachable, the empty window must still be
+    cached as the edge (previous behavior) — a paging UI that hammers a dead
+    upstream on every click is worse than an honest data start."""
+    feed = make_feed()
+    cursor = 1_800_000_000
+    calls = []
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    def dead_fallback(sym, before, page_size):
+        calls.append(sym)
+        return None
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter.fetch_daily_history", dead_fallback)
+
+    feed.get_historical_segment("SPY", "1d", before=cursor)
+    feed.get_historical_segment("SPY", "1d", before=cursor)
+    assert calls == ["SPY"], "the terminal edge is still cached after both sources fail"
+
+
+def test_hist_segment_fallback_only_for_us_daily(make_feed, monkeypatch):
+    """The gate: intraday windows and non-US symbols must never touch
+    defeatbeta — it is US daily-only by construction (data/US/*.parquet)."""
+    feed = make_feed()
+    cursor = 1_800_000_000
+    calls = []
+
+    def spy_fallback(sym, before, page_size):
+        calls.append(sym)
+        return None
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter.fetch_daily_history", spy_fallback)
+
+    # Intraday empty window on a US symbol: true edge (or Yahoo throttle —
+    # but defeatbeta cannot answer intraday, so it must not be consulted).
+    feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert calls == []

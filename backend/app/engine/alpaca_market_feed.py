@@ -16,6 +16,7 @@ import websockets
 
 from app.models.trading import Quote, Bar, Trade, OrderSide, utc_now
 from app.adapters.alpaca_adapter import AlpacaDataAdapter
+from app.adapters import defeatbeta_adapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.config import settings
 from app.core.markets import (
@@ -472,6 +473,14 @@ class AlpacaMarketFeedService:
                 period1 = oldest_allowed
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
             bars = [b for b in bars if b.time < before]
+            if not bars and tf == "1d" and market_of(sym).code == "US":
+                # An empty daily window is either the true edge or Yahoo being
+                # throttled/partial — indistinguishable from here, and storing
+                # the emptiness would freeze a false "data begins here" edge.
+                # DefeatBeta's 30y US dailies fill the segment instead.
+                fallback = defeatbeta_adapter.fetch_daily_history(sym, before, page_size)
+                if fallback:
+                    bars = fallback[0]
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:

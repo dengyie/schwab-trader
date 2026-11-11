@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from app.adapters import defeatbeta_adapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.markets import (
     SymbolRef,
@@ -332,6 +333,14 @@ class YahooQuoteFeed:
             )
             # Segment contract: strictly older than the cursor, newest N kept.
             bars = [b for b in bars if b.time < before]
+            if not bars and tf == "1d" and ref.market.code == "US":
+                # An empty daily window is either the true edge or Yahoo being
+                # throttled/partial — indistinguishable from here, and storing
+                # the emptiness would freeze a false "data begins here" edge.
+                # DefeatBeta's 30y US dailies fill the segment instead.
+                fallback = defeatbeta_adapter.fetch_daily_history(ref.symbol, before, page_size)
+                if fallback:
+                    bars = fallback[0]
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:
