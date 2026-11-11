@@ -17,7 +17,7 @@ import pytest
 from app.adapters import defeatbeta_adapter
 from app.adapters.alpaca_adapter import AlpacaDataAdapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
-from app.core.timeframes import DAILY_WINDOW_SPAN_SECONDS
+from app.core.timeframes import WHOLE_WINDOW_SPAN_SECONDS
 from app.engine.alpaca_market_feed import MAX_CACHE_ENTRIES, AlpacaMarketFeedService
 from app.engine.bar_cache import BarCache
 from app.models.trading import Bar
@@ -552,31 +552,82 @@ def test_daily_window_fallback_only_for_us_daily(make_feed, monkeypatch):
     assert calls == []
 
 
-def test_daily_window_fallback_trims_to_yahoo_daily_window(make_feed, monkeypatch):
+def test_whole_window_fallback_trims_to_yahoo_window(make_feed, monkeypatch):
     """The fallback must not hand the chart a wider window than Yahoo's own
-    whole-window daily fetch (5y): when Yahoo recovers, the chart would
-    visibly shrink back. A listing dead for the whole window keeps its full
-    real history — the trim must never blank the only data available."""
+    whole-window fetch (1d=5y, 1wk=10y): when Yahoo recovers, the chart would
+    visibly shrink back. 1mo is unbounded like its Yahoo source, and a
+    listing dead for the whole span keeps its full real history — the trim
+    must never blank the only data available."""
     feed = make_feed()
     now = time.time()
-    cutoff = now - DAILY_WINDOW_SPAN_SECONDS
+    cutoff_1d = now - WHOLE_WINDOW_SPAN_SECONDS["1d"]
     recent = Bar(time=int(now) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
-    ancient = Bar(time=int(cutoff) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
+    ancient = Bar(time=int(cutoff_1d) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
 
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
     monkeypatch.setattr(
-        "app.adapters.defeatbeta_adapter.fetch_daily_history",
-        lambda sym: ([ancient, recent], time.time()),
+        "app.adapters.defeatbeta_adapter.fetch_history",
+        lambda sym, tf: ([ancient, recent], time.time()),
     )
     bars, _ = feed.get_bars_with_meta("SPY", "1d")
     assert [b.time for b in bars] == [recent.time], "bars older than the 5y window are trimmed"
 
     monkeypatch.setattr(
-        "app.adapters.defeatbeta_adapter.fetch_daily_history",
-        lambda sym: ([ancient], time.time()),
+        "app.adapters.defeatbeta_adapter.fetch_history",
+        lambda sym, tf: ([ancient], time.time()),
     )
     bars, _ = feed.get_bars_with_meta("DEAD", "1d")
     assert [b.time for b in bars] == [ancient.time], "a full-window-dead listing keeps its history"
+
+    # 1mo is unbounded on both sides: nothing may be dropped.
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_history",
+        lambda sym, tf: ([ancient, recent], time.time()),
+    )
+    bars, _ = feed.get_bars_with_meta("DEAD2", "1mo")
+    assert [b.time for b in bars] == [ancient.time, recent.time]
+
+
+def test_weekly_monthly_fallback_aggregates_from_dailies(make_feed, monkeypatch):
+    """Yahoo answering a weekly/monthly whole-window request with nothing
+    must not leave those charts blank either: the dataset has no coarser
+    bars, so the fallback aggregates its dailies with Yahoo's conventions."""
+    feed = make_feed()
+    daily = defeatbeta_adapter._rows_to_bars([
+        # Two weeks apart, each with three sessions.
+        ("2026-11-02", 10.0, 12.0, 9.0, 11.0, 100),   # Mon
+        ("2026-11-03", 11.0, 13.0, 10.0, 12.0, 200),  # Tue
+        ("2026-11-04", 12.0, 14.0, 11.0, 13.0, 300),  # Wed
+        ("2026-11-09", 13.0, 15.0, 12.0, 14.0, 400),  # Mon next week
+    ])
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter._load_daily_bars",
+        lambda sym: daily,
+    )
+
+    bars, fetched_at = feed.get_bars_with_meta("SPY", "1wk")
+    assert fetched_at > 0
+    assert len(bars) == 2
+    first, second = bars
+    # Stamped midnight ET of the bucket's Monday (04:00Z/05:00Z by DST).
+    assert datetime.fromtimestamp(first.time, tz=timezone.utc).isoformat().startswith("2026-11-02T05:00")
+    assert (first.open, first.high, first.low, first.close, first.volume) == (10.0, 14.0, 9.0, 13.0, 600.0)
+    assert (second.open, second.close, second.volume) == (13.0, 14.0, 400.0)
+
+    bars, _ = feed.get_bars_with_meta("SPY", "1mo")
+    assert len(bars) == 1
+    # One monthly bucket stamped midnight ET of the 1st — Nov 1 2026 midnight
+    # is still EDT (the clocks fall back at 02:00 local), hence 04:00Z.
+    assert datetime.fromtimestamp(bars[0].time, tz=timezone.utc).isoformat().startswith("2026-11-01T04:00")
+    assert bars[0].close == 14.0 and bars[0].volume == 1000.0
+
+
+def test_fetch_history_rejects_unsupported_timeframes():
+    """The adapter is the single source of what it can answer; intraday keys
+    must never reach the dataset (it has no intraday bars)."""
+    for tf in ("15m", "1h", "1m", "4h", "bogus"):
+        assert defeatbeta_adapter.fetch_history("SPY", tf) is None
 
 
 def test_defeatbeta_scan_does_not_block_other_symbols(monkeypatch):

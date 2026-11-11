@@ -36,7 +36,7 @@ class YahooFinanceAdapter:
         "Accept": "application/json"
     }
 
-    TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = dict(YAHOO_TIMEFRAME_MAP)
+    TIMEFRAME_MAP: Dict[str, Tuple[str, Optional[str]]] = dict(YAHOO_TIMEFRAME_MAP)
 
     _shared_client: Optional[httpx.Client] = None
 
@@ -171,9 +171,8 @@ class YahooFinanceAdapter:
         interval, range_param = cls.TIMEFRAME_MAP[tf_key]
 
         url = f"{cls.BASE_URL}/{sym}"
-        params = {
+        params: Dict[str, object] = {
             "interval": interval,
-            "range": range_param,
             # Pre/post hours are thin, unrepresentative prints. Measured on SPY
             # 15m they carried lows of 691.53 and highs of 781.05 against a
             # 735.29 close -- a +-6.5% range that no session ever traded. The
@@ -181,6 +180,16 @@ class YahooFinanceAdapter:
             "includePrePost": "false",
             "events": "div,splits"
         }
+        if range_param is None:
+            # Whole listed history. Yahoo coarsens the interval when asked for
+            # range=max (measured 2026-11-12: interval=1mo + range=max returns
+            # 4 bars/year — quarterly buckets mislabeled as monthly — while an
+            # explicit epoch window keeps true monthly), so whole-history keys
+            # pass explicit bounds instead.
+            params["period1"] = 0
+            params["period2"] = int(time.time())
+        else:
+            params["range"] = range_param
 
         try:
             cli = client or cls.get_client()

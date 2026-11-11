@@ -23,7 +23,10 @@ with nothing (rate-limited via the Edge disguise, or the symbol predates
 Yahoo's coverage), this fills the daily window instead of leaving the chart
 blank. Daily keys are served whole by design — there is no daily paging —
 so the whole-window fetch IS the daily request; a later successful Yahoo
-refresh overwrites the fallback bars through the normal cache cycle.
+refresh overwrites the fallback bars through the normal cache cycle. The
+dataset has no coarser bars, so 1wk/1mo windows are aggregated from the
+same daily frame, stamped to Yahoo's measured conventions (see
+_aggregate_weekly/_aggregate_monthly).
 
 Timestamps: the dataset stamps each session at 00:00 UTC, but Yahoo stamps
 its dailies at the session open (prod-measured 13:30 UTC summer / 14:30 UTC
@@ -42,7 +45,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -192,6 +196,102 @@ def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
             oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
             _frame_cache.pop(oldest, None)
     return list(all_bars), time.time()
+
+
+# Bucket keys the dataset can answer: dailies directly, weekly/monthly by
+# aggregation (the dataset has no coarser bars). The feed's fallback gate
+# checks this set, so the adapter stays the single source of what it serves.
+SUPPORTED_TIMEFRAMES = ("1d", "1wk", "1mo")
+
+
+def fetch_history(symbol: str, timeframe: str) -> Optional[Tuple[List[Bar], float]]:
+    """Whole-history US bars for ``timeframe`` in SUPPORTED_TIMEFRAMES.
+
+    Dailies come straight from the dataset; weekly/monthly buckets are
+    aggregated from the same daily frame, stamped to Yahoo's conventions
+    (see _aggregate). Returns the same contract as ``fetch_daily_history``.
+    """
+    tf = (timeframe or "").lower()
+    if tf not in SUPPORTED_TIMEFRAMES:
+        return None
+    daily = fetch_daily_history(symbol)
+    if daily is None:
+        return None
+    bars, fetched_at = daily
+    if tf == "1d":
+        return bars, fetched_at
+    if tf == "1wk":
+        return _aggregate_weekly(bars), fetched_at
+    return _aggregate_monthly(bars), fetched_at
+
+
+def _aggregate_weekly(bars: List[Bar]) -> List[Bar]:
+    """Trading-week buckets from daily bars, oldest first.
+
+    Yahoo stamps a weekly bar at midnight America/New_York of the bucket's
+    Monday — calendar Monday, even when the Monday is a holiday
+    (prod-measured 2026-11-12: the MLK and Presidents' Day weeks are stamped
+    Mon 05:00Z). OHLCV aggregates across the week's sessions.
+    """
+    return _aggregate_buckets(
+        bars,
+        key=lambda d: d.isocalendar()[:2],
+        stamp=lambda d: _midnight_et(d - timedelta(days=d.weekday())),
+    )
+
+
+def _aggregate_monthly(bars: List[Bar]) -> List[Bar]:
+    """Calendar-month buckets from daily bars, oldest first.
+
+    Yahoo stamps the monthly bar at midnight America/New_York of the month's
+    first calendar day — the 1st, holiday or not (prod-measured: KO's
+    1985-01-01 stamp sits on New Year's Day).
+    """
+    return _aggregate_buckets(
+        bars,
+        key=lambda d: (d.year, d.month),
+        stamp=lambda d: _midnight_et(d.replace(day=1)),
+    )
+
+
+def _midnight_et(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=_SESSION_OPEN_TZ).timestamp())
+
+
+def _aggregate_buckets(
+    bars: List[Bar],
+    key: Callable[[date], object],
+    stamp: Callable[[date], int],
+) -> List[Bar]:
+    """Group daily bars by ``key(session_date)`` and fold each group into one
+    Bar stamped at ``stamp(session_date)`` of the group's first session.
+
+    Bars arrive open-stamped (9:30 ET), so the ET calendar date of ``time``
+    is the session date; groups are emitted oldest first.
+    """
+    buckets: Dict[object, List[Bar]] = {}
+    order: List[object] = []
+    for b in bars:
+        day = datetime.fromtimestamp(b.time, tz=_SESSION_OPEN_TZ).date()
+        k = key(day)
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(b)
+
+    aggregated: List[Bar] = []
+    for k in order:
+        chunk = buckets[k]
+        first_day = datetime.fromtimestamp(chunk[0].time, tz=_SESSION_OPEN_TZ).date()
+        aggregated.append(Bar(
+            time=stamp(first_day),
+            open=chunk[0].open,
+            high=round(max(b.high for b in chunk), 4),
+            low=round(min(b.low for b in chunk), 4),
+            close=chunk[-1].close,
+            volume=round(sum(b.volume for b in chunk), 2),
+        ))
+    return aggregated
 
 
 def stats() -> Dict[str, object]:

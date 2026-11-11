@@ -26,12 +26,12 @@ from app.core.markets import (
     within_day_range,
 )
 from app.core.timeframes import (
-    DAILY_WINDOW_SPAN_SECONDS,
     HIST_PAGE_BARS,
     HIST_PAGE_SPAN_SECONDS,
     HIST_SEGMENT_BARS,
     TIMEFRAME_SPAN_DAYS,
     TIMEFRAME_TTLS,
+    WHOLE_WINDOW_SPAN_SECONDS,
 )
 from app.engine.bar_cache import BarCache
 from app.engine.state_store import JsonStateStore
@@ -351,20 +351,25 @@ class AlpacaMarketFeedService:
         """Fetch one key and store it. The caller must own the refresh slot."""
         try:
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf)
-            if not bars and tf == "1d" and market_of(sym).code == "US":
-                # Yahoo answered the whole-window daily request with nothing:
-                # the 429 Edge disguise, or a listing Yahoo's coverage misses.
+            if not bars and tf in defeatbeta_adapter.SUPPORTED_TIMEFRAMES \
+                    and market_of(sym).code == "US":
+                # Yahoo answered the whole-window request with nothing: the
+                # 429 Edge disguise, or a listing Yahoo's coverage misses.
                 # DefeatBeta's 30y US dailies fill the window instead of
-                # leaving the daily chart blank; a later successful Yahoo
-                # refresh overwrites the fallback through the normal cycle.
-                # Trimmed to Yahoo's own whole-window daily span, so the chart
-                # does not suddenly "shrink" back when Yahoo recovers — unless
-                # that would empty the window (a listing dead for 5y+ years
-                # keeps its full real history, which Yahoo could not serve).
-                fallback = defeatbeta_adapter.fetch_daily_history(sym)
+                # leaving the chart blank (1d directly; 1wk/1mo aggregated);
+                # a later successful Yahoo refresh overwrites the fallback
+                # through the normal cycle. Trimmed to Yahoo's own whole-
+                # window span, so the chart does not "shrink" when Yahoo
+                # recovers — unless that would empty the window (a listing
+                # dead for the whole span keeps its full real history).
+                fallback = defeatbeta_adapter.fetch_history(sym, tf)
                 if fallback:
-                    cutoff = time.time() - DAILY_WINDOW_SPAN_SECONDS
-                    bars = [b for b in fallback[0] if b.time >= cutoff] or fallback[0]
+                    span = WHOLE_WINDOW_SPAN_SECONDS.get(tf)
+                    if span is None:
+                        bars = fallback[0]
+                    else:
+                        cutoff = time.time() - span
+                        bars = [b for b in fallback[0] if b.time >= cutoff] or fallback[0]
             if bars:
                 # NOTE: never write last_trade_prices here — a historical close
                 # must not overwrite a fresher live trade price.

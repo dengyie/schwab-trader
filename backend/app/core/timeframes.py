@@ -83,7 +83,12 @@ HIST_PAGE_BARS: Dict[str, int] = {
 HIST_PAGE_SPAN_SECONDS = 366 * 86400
 
 # Yahoo Finance (interval, range) pairs per timeframe.
-YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = {
+# A ``None`` range means "whole listed history via explicit epoch bounds":
+# Yahoo coarsens the interval server-side when range=max (measured
+# 2026-11-12: interval=1mo + range=max returns 4 bars/year — quarterly
+# buckets mislabeled as monthly — while every explicit range stays true
+# monthly), so whole-history keys must not ask for "max".
+YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, Optional[str]]] = {
     "1m": ("1m", "7d"),
     "5m": ("5m", "1mo"),
     "15m": ("15m", "1mo"),
@@ -94,12 +99,16 @@ YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = {
     # history: together with 1d this covers the "one year / five years / as
     # far back as it goes" chart asks.
     "1wk": ("1wk", "10y"),
-    "1mo": ("1mo", "max"),
+    "1mo": ("1mo", None),
 }
 
-# Whole-window daily span in seconds — mirrors YAHOO_TIMEFRAME_MAP["1d"]'s
-# range="5y". Kept in seconds because the defeatbeta fallback trims its bars
-# to the same window Yahoo serves, so the chart does not change width when
-# the fallback hands back to a recovered Yahoo. If the "1d" range above ever
-# changes, change this with it.
-DAILY_WINDOW_SPAN_SECONDS = 5 * 366 * 86400
+# Whole-window span in seconds per bucket, mirroring the ranges above — the
+# defeatbeta fallback trims its bars to the same window Yahoo serves, so the
+# chart does not change width when the fallback hands back to a recovered
+# Yahoo (``None`` = unbounded, same as the ``None`` range). If a range above
+# ever changes, change this with it.
+WHOLE_WINDOW_SPAN_SECONDS: Dict[str, Optional[int]] = {
+    "1d": 5 * 366 * 86400,
+    "1wk": 10 * 366 * 86400,
+    "1mo": None,
+}

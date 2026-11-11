@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+import time
 from app.models.trading import Bar
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.engine.alpaca_market_feed import AlpacaMarketFeedService, MAX_CACHE_ENTRIES
@@ -132,10 +133,13 @@ def test_long_horizon_timeframes_are_mapped_and_registered():
 
     assert set(YAHOO_TIMEFRAME_MAP) == set(TIMEFRAME_SECONDS)
 
-    # Weekly reaches a decade, monthly reaches the whole listing history.
+    # Weekly reaches a decade; monthly reaches the whole listed history —
+    # via explicit epoch bounds, because Yahoo coarsens range=max server-side
+    # (measured 2026-11-12: interval=1mo + range=max returns 4 bars/year,
+    # quarterly buckets mislabeled as monthly, while every explicit range —
+    # 5y/10y/20y/40y — and period1=0 stay true monthly).
     assert YAHOO_TIMEFRAME_MAP["1wk"] == ("1wk", "10y")
-    assert YAHOO_TIMEFRAME_MAP["1mo"] == ("1mo", "max")
-    # Daily spans the asked-for five years.
+    assert YAHOO_TIMEFRAME_MAP["1mo"] == ("1mo", None)
     assert YAHOO_TIMEFRAME_MAP["1d"] == ("1d", "5y")
 
     # The case trap: the API lowercases input, so a client sending "1M" lands
@@ -256,3 +260,31 @@ def test_fetch_bars_explicit_period1_defaults_period2_to_now():
         "SPY", "1d", client=_OkChartClient(), period1=0, period2=None)
     assert len(bars) == 1
     assert bars[0].close == 100.5
+
+
+def test_whole_history_timeframes_fetch_via_explicit_periods():
+    """range=max silently degrades the interval server-side (KO 1mo+max
+    returned 4 bars/year — quarterly mislabeled as monthly), so a whole-
+    history key must request an explicit epoch window instead of "max"."""
+    captured = {}
+
+    class _CaptureClient:
+        status_code = 200
+        def get(self, url, params=None, **k):
+            captured.update(params or {})
+            return self
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return _OkChartClient().json()
+
+    bars = YahooFinanceAdapter.fetch_bars("SPY", "1mo", client=_CaptureClient())
+    assert len(bars) == 1
+    assert "range" not in captured, "range=max coarsens the interval; whole history uses epochs"
+    assert captured.get("period1") == 0
+    assert captured.get("period2", 0) > time.time() - 60
+
+    # Explicit-range keys must keep the range form, untouched.
+    captured.clear()
+    YahooFinanceAdapter.fetch_bars("SPY", "1wk", client=_CaptureClient())
+    assert captured.get("range") == "10y" and "period1" not in captured
