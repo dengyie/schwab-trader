@@ -2,7 +2,7 @@
 Alpaca Paper Trading Broker implementation.
 Routes orders to Alpaca Paper Trading REST API and syncs cloud portfolio state.
 """
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Dict, List, Optional, Callable
 import time
 import httpx
@@ -288,11 +288,15 @@ class AlpacaPaperBroker(BaseBroker):
     }
 
     def _account_created_at(self) -> Optional[datetime]:
-        """Account creation instant (UTC), TTL-cached; None when unavailable.
+        """Start of the account's first ET trading day, TTL-cached; None when
+        unavailable.
 
         Live probing showed the venue pads pre-account entries inconsistently:
         daily series use 0.0, intraday ones have used base_value instead. The
-        creation timestamp is the only reliable padding boundary.
+        creation timestamp is the only reliable padding boundary — but the
+        venue's intraday series starts at that day's 09:30 ET open even when
+        the account was created mid-session, so the boundary is truncated to
+        midnight ET rather than the creation instant itself.
         """
         now = time.time()
         if self._account_created_at_cache_ts and now - self._account_created_at_cache_ts < 3600:
@@ -303,11 +307,16 @@ class AlpacaPaperBroker(BaseBroker):
                 return self._account_created_cache
             raw = resp.json().get("created_at")
             created = datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
+            if created is not None:
+                boundary = created.astimezone(timezone(timedelta(hours=-5)))
+                boundary = datetime.combine(boundary.date(), dtime.min, tzinfo=boundary.tzinfo)
+            else:
+                boundary = None
         except Exception:
             return self._account_created_cache
-        self._account_created_cache = created
+        self._account_created_cache = boundary
         self._account_created_at_cache_ts = now
-        return created
+        return boundary
 
     def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
         """Account equity curve from Alpaca's portfolio history endpoint.
@@ -315,8 +324,9 @@ class AlpacaPaperBroker(BaseBroker):
         Returns ``{"points": [{time, equity}], "base_value": float}`` or
         ``None`` when the venue has no history (fresh account) or the call
         fails; the UI renders an explicit empty state, never a fake curve.
-        Entries before the account existed (padded with 0.0 or base_value
-        depending on granularity) and null closes are skipped, not filled.
+        Entries before the account's first ET trading day (padded with 0.0
+        or base_value depending on granularity) and null closes are
+        skipped, not filled.
         """
         period = self.EQUITY_HISTORY_PERIODS.get(period.upper(), "1M")
         timeframe = self.EQUITY_HISTORY_TIMEFRAMES.get(timeframe.upper(), "1D")

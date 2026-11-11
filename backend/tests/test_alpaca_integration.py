@@ -516,18 +516,20 @@ def test_equity_history_skips_alpacas_zero_padding(monkeypatch):
 def test_equity_history_truncates_padding_by_account_creation(monkeypatch):
     # Live probing also caught intraday series padding pre-account entries
     # with base_value instead of 0.0, so a value filter alone cannot tell
-    # padding from a real (flat) session close. The creation timestamp is
-    # the authoritative boundary.
-    created = "2026-11-10T22:39:58.895409Z"
-    created_ts = 1794422398  # before the timestamps below
-    before, after = created_ts - 86400, created_ts + 86400
+    # padding from a real (flat) session close. The boundary is midnight ET
+    # of the account's first trading day: the venue starts an intraday
+    # series at that day's 09:30 open even for a mid-session signup.
+    created = "2026-11-10T22:39:58.895409Z"  # 17:39 ET, mid-session
+    et_midnight = "2026-11-10T04:00:00+00:00"
+    et_midnight_ts = 1794321600
+    before, first_open, later = et_midnight_ts - 86400, et_midnight_ts + 1800, et_midnight_ts + 86400
     broker = AlpacaPaperBroker(api_key="K", api_secret="S")
 
     def _route(url, **kwargs):
         if url.endswith("/account"):
             return _FakeClockResponse(200, {"created_at": created})
         return _FakeClockResponse(200, {
-            "timestamp": [before, after, after + 86400],
+            "timestamp": [before, first_open, later],
             "equity": [100000.0, 100000.0, 100500.0],  # padding is NOT 0 here
             "base_value": 100000.0,
         })
@@ -535,9 +537,10 @@ def test_equity_history_truncates_padding_by_account_creation(monkeypatch):
     monkeypatch.setattr(broker.client, "get", _route)
     history = broker.get_equity_history()
     assert history is not None
-    assert [p["time"] for p in history["points"]] == [after, after + 86400]
+    # The pre-day point dies; the first-session open survives.
+    assert [p["time"] for p in history["points"]] == [first_open, later]
 
-    # The creation timestamp is cached for an hour, not refetched per call.
+    # The boundary is cached for an hour, not refetched per call.
     account_calls = []
     real_route = _route
 
