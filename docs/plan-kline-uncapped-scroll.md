@@ -218,3 +218,20 @@ a9438a4 生产评审修复（commit 本节同批）：
 - US+1d 双重门：非美股/非日线永不触网（数据集 US-only by construction）。
 - prod 实测（2026-11-11）：KO 首扫 6.8s/8039 根（1994-11-30 起），缓存命中 0.000s；`/api/market/bars?symbol=KO&timeframe=1d` 整窗 200/1254 根正常。
 - 教训：**验收必须走产品真实路径**。路由门/前端开关与 feed 层实现之间存在断裂时，feed 层单测证明不了任何用户可见行为。
+
+### §9.1 上线后 review 闭环（2026-11-12，commit `79afc5f`）
+
+兜底上线次日做了全量生产 review（含 VPS sudoers、属主拓扑、时间戳约定的实证），10 项全部根因修复：
+
+- **F1（P2）**：`yahoo_adapter` 缺模块级 `import time`——`period2=None` 分支 NameError 被通用 except 吞掉静默返回空，正好在新兜底的上游一跳，会被当成"Yahoo 无数据"触发 dataset 扫描。潜伏 7 个 commit 未触发（两个调用方总是同时传 period1/period2），已修 + 回归测试走真实参数路径。
+- **F2（P2）**：deploy.yml 的 pycache "自愈"块实际无效——prod 实证 `schwab-deploy` 的 NOPASSWD 只有 systemctl restart/is-active，`sudo -n rm` 必败进 `|| true`。exit-23 的根因是**回滚 sweep 触碰字节码**本身：回滚 rsync 现与其它 sweep 一致排除 `__pycache__`/`.pytest_cache`（陈旧字节码无害：Python 按源码 mtime 复验），死块删除。教训：写"自愈"前先 `sudo -n -l` 验权限，`|| true` 会把未授权埋成静默成功。
+- **F3（P2）**：时间戳约定失真——dataset 戳 00:00 UTC，Yahoo 截开盘 9:30 ET（prod 实证夏 13:30Z/冬 14:30Z），旧注释声称"同一约定"是错的。adapter 现按 `9:30 America/New_York`（DST 感知）重戳，两源在日级键上可互换。
+- **F4（P2）**：秒级网络扫描原在 `_cache_lock` 内——一次 HF 挂起会串行化所有标的的兜底并阻塞 health 探针。扫描移出锁外 + 30s watchdog 线程限时（duckdb 1.5.x 无 http 超时设置）；回归测试证明另一标的的拉取不被阻塞。
+- **F5**：`daily_fallback {cached_symbols, last_error}` 接进 US feed `stream_health`（prod health 已可见）；死代码 `cooldown_remaining()` 删除。
+- **F6**：symbol 过滤参数化（prepared statement），dataset URL 保持模块常量。
+- **F7**：单行 `high/low=None` 会 `float(None)` 崩掉整个标的的史——`_rows_to_bars` 整行 OHLC None 检查（对齐 Yahoo adapter 的行纪律），可单测。
+- **F8**：gate 测试补非美股半边（HK）。
+- **F9**：兜底载荷裁剪到 Yahoo 整窗日线跨度（5y，`DAILY_WINDOW_SPAN_SECONDS` 紧挨 `YAHOO_TIMEFRAME_MAP` 单源注释绑定），避免 Yahoo 恢复时图表"缩水"；整窗皆旧（退市 5y+）保留全史，裁剪不得清空唯一可得的数据。
+- **F10**：429 计数器加锁（fetch_bars 跑在多线程池）；缓存帧以副本出借；docstring 补 dataset 落后一个交易日的实测事实。
+
+prod 验收（79afc5f 部署后）：health `feeds.us.daily_fallback` 透出；KO 1d 200/1255 根（最新 2026-11-11 14:30Z）；prod venv 内兜底重验 4.6s/8039 根、重戳生效（14:30Z）、参数化 SQL 生效。
