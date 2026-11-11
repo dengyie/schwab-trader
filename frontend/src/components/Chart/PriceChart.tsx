@@ -390,17 +390,23 @@ export function PriceChart() {
   // 序列预取：loadOlder 连续翻页直到该周期的可用历史补齐（或预算耗尽）。
   // 每页 loadOlder 自带竞态守卫；这里再守两道——最旧一根没前移说明整页
   // 重复（段缓存合并零新增），停；页数预算兜底防御上游契约意外。
+  // 补齐后 fitContent：预取的新增段在序列头部，setData 会把视口重置成
+  // 右锚默认缩放——不重适配的话用户看到的仍是"一个月"， older 数据只是
+  // 藏在视口左侧（正是本次用户反馈的现象）。
   const prefillRef = useRef<(() => Promise<void>) | null>(null);
   const PREFILL_PAGE_BUDGET = 6;
   prefillRef.current = async () => {
     if (!hasMoreRef.current) return;
     let lastOldest = klinesRef.current[0]?.time ?? 0;
+    let grew = false;
     for (let page = 0; page < PREFILL_PAGE_BUDGET && hasMoreRef.current; page++) {
       await loadOlderRef.current?.();
       const oldest = klinesRef.current[0]?.time ?? 0;
       if (oldest === lastOldest) return; // 无进展：到边（或重复页），不再翻
       lastOldest = oldest;
+      grew = true;
     }
+    if (grew) mainChartApiRef.current?.timeScale().fitContent();
   };
 
   // 合并更早的段到当前序列：按 time 去重、只增不减（纯函数在 klineMerge.ts，测试钉住）。
