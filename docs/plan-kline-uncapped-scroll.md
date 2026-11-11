@@ -205,3 +205,16 @@ a9438a4 生产评审修复（commit 本节同批）：
 - **F4/F6（P3，已修）**：删除死常量 `HIST_SEGMENT_BARS_MIN`；sim feed `get_historical_segment` 补 `Tuple[List[Bar], float, bool]` 注解并去掉逐 bar `random.Random` 构造。
 - **F5（P3，已修）**：`HIST_PAGE_BARS`/`HIST_PAGE_SPAN_SECONDS` 上移 `app/core/timeframes.py` 单源，Yahoo/Alpaca 两 feed 改为导入，消除双份拷贝漂移风险。
 - **F7/F8（Suggestion，文档化）**：`X-Bars-Oldest` 为运维/调试契约，前端翻页实际由 `X-Bars-Has-More` 驱动；任意 cursor 值构造缓存键的边界由全局上限（MAX_CACHE_ENTRIES=300 / MAX_DISK_FILES=400）兜住，记录为已知边界，不改代码。
+
+## 九、defeatbeta 美股日线兜底（2026-11-11，落地 + 一次生产验收纠偏）
+
+§7 的后续切片落地，动机收窄为**韧性**而非"更深历史"：日级三键整窗供给（§7 决策不变），Yahoo 被限流（含 Edge 伪装 200）时整窗日线请求返回空 → 日线图表直接空白。defeatbeta（HuggingFace `defeatbeta/yahoo-finance-data`，`data/US/stock_prices.parquet`，1992 年至今 8k+ 根/标的，已复权）在这一刻补位，Yahoo 恢复后由正常刷新周期覆盖。
+
+生产验收（d80fc4c 部署后）抓到一个真 bug：初版把兜底接在 `get_historical_segment` 里，但路由层对日级 `before` 直接 400（§7"整段供给"决策），该路径对 1d **不可达=死代码**——单测全绿是因为测试绕过路由直接调 feed。修复（001c1ba）：兜底移到唯一真实存在的日线请求路径——整窗拉取（alpaca feed `_fetch_upstream`；Yahoo intl feed 从不路由美股，其上的接线连 import 一起删除）。`fetch_daily_history(symbol)` 签名随之收缩为"全史、最旧在前"。
+
+实现要点：
+
+- 依赖只用 `duckdb>=1.0.0` 直连 Parquet URL（httpfs，~2-7s/标的首次，进程内 24h 缓存，失败 10min 冷却）。defeatbeta-api 弃用：0.0.63 要 py≥3.11（prod 3.10），旧版指向未分区数据集布局直接 404。
+- US+1d 双重门：非美股/非日线永不触网（数据集 US-only by construction）。
+- prod 实测（2026-11-11）：KO 首扫 6.8s/8039 根（1994-11-30 起），缓存命中 0.000s；`/api/market/bars?symbol=KO&timeframe=1d` 整窗 200/1254 根正常。
+- 教训：**验收必须走产品真实路径**。路由门/前端开关与 feed 层实现之间存在断裂时，feed 层单测证明不了任何用户可见行为。
