@@ -423,6 +423,16 @@ export function PriceChart() {
     if (merged === klinesRef.current) return; // 无新增（全部重复）
     klinesRef.current = merged;
     setKlines(merged);
+    // 常驻轻量诊断：线上核对"历史是否真的进了序列"用（/trade 控制台读
+    // window.__mergeLog）。不可变段合并频率极低，日志开销可忽略。
+    if (typeof window !== 'undefined') {
+      (window as any).__mergeLog = ((window as any).__mergeLog || []).concat([{
+        at: new Date().toISOString().slice(11, 19),
+        page: older.length,
+        total: merged.length,
+        first: merged[0]?.time,
+      }]);
+    }
   }, []);
 
   // 定时刷新（60秒间隔，避免速率限制）
