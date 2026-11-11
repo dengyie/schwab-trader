@@ -24,11 +24,22 @@ from app.core.markets import (
     market_of,
     within_day_range,
 )
-from app.core.timeframes import TIMEFRAME_TTLS
+from app.core.timeframes import (
+    HIST_SEGMENT_BARS,
+    HIST_SEGMENT_BARS_DAILY,
+    TIMEFRAME_SPAN_DAYS,
+    TIMEFRAME_TTLS,
+)
 from app.engine.bar_cache import BarCache
 from app.engine.state_store import JsonStateStore
 
 logger = logging.getLogger(__name__)
+
+# Bars per historical page by bucket granularity (mirrors YahooQuoteFeed).
+HIST_PAGE_BARS = {"1d": HIST_SEGMENT_BARS_DAILY, "1wk": HIST_SEGMENT_BARS_DAILY, "1mo": HIST_SEGMENT_BARS_DAILY}
+# A page fetches a window wide enough to plausibly fill the page size; the
+# result is trimmed to the page contract afterwards.
+HIST_PAGE_SPAN_SECONDS = 366 * 86400
 
 # Upper bound on cached (symbol, timeframe) bar entries; evicts oldest first.
 MAX_CACHE_ENTRIES = 300
@@ -415,6 +426,84 @@ class AlpacaMarketFeedService:
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
+
+    def get_historical_segment(
+        self, symbol: str, timeframe: str, before: int
+    ) -> Tuple[List[Bar], float, bool]:
+        """One immutable page of history strictly older than ``before``.
+
+        Mirrors ``YahooQuoteFeed.get_historical_segment``: the US feed's own
+        bar upstream is the same Yahoo chart endpoint, so the paging mechanics
+        are identical; the segment lives under the same (symbol, timeframe)
+        cache with an extended subkey.
+        """
+        sym = symbol.upper()
+        tf = timeframe.lower()
+        page_size = HIST_PAGE_BARS.get(tf, HIST_SEGMENT_BARS)
+        seg_tf = self._bar_cache.hist_timeframe(tf, before)
+        entry = self._bar_cache.get(sym, seg_tf)
+        if entry:
+            if not self._bar_cache.is_fresh(entry, seg_tf):
+                self._schedule_hist_refresh(sym, tf, seg_tf, before)
+            return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+
+        if self._bar_cache.is_cooling(sym, seg_tf):
+            return [], 0.0, False
+        if not self._bar_cache.begin_refresh(sym, seg_tf):
+            self._bar_cache.wait_for_refresh(sym, seg_tf)
+            entry = self._bar_cache.get(sym, seg_tf)
+            if entry:
+                return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+            return [], 0.0, False
+        try:
+            bars = self._fetch_hist_segment(sym, tf, seg_tf, before)
+        finally:
+            self._bar_cache.end_refresh(sym, seg_tf)
+        if bars is None:
+            return [], 0.0, False
+        return bars, self._bar_cache.fetched_at_of(sym, seg_tf), self._has_more(bars, page_size)
+
+    @staticmethod
+    def _has_more(bars: List[Bar], page_size: int) -> bool:
+        return len(bars) >= page_size
+
+    def _fetch_hist_segment(self, sym: str, tf: str, seg_tf: str, before: int) -> Optional[List[Bar]]:
+        try:
+            page_size = HIST_PAGE_BARS.get(tf, HIST_SEGMENT_BARS)
+            span_days = TIMEFRAME_SPAN_DAYS.get(tf)
+            oldest_allowed = int(time.time()) - span_days * 86400 if span_days else 0
+            period1 = max(0, before - HIST_PAGE_SPAN_SECONDS)
+            if oldest_allowed and period1 < oldest_allowed:
+                period1 = oldest_allowed
+            bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
+            bars = [b for b in bars if b.time < before]
+            if len(bars) > page_size:
+                bars = bars[-page_size:]
+            if not bars:
+                self._bar_cache.put(sym, seg_tf, [], time.time())
+                return []
+            self._bar_cache.put(sym, seg_tf, bars)
+            return bars
+        except Exception as err:
+            logger.warning("Yahoo hist segment failed for %s %s<%s: %s", sym, tf, before, err)
+            self._bar_cache.cool_down(sym, seg_tf)
+            return None
+
+    def _schedule_hist_refresh(self, sym: str, tf: str, seg_tf: str, before: int) -> None:
+        if self._bar_cache.is_cooling(sym, seg_tf):
+            return
+        if not self._bar_cache.begin_refresh(sym, seg_tf):
+            return
+        try:
+            self._refresh_pool_executor().submit(self._fetch_hist_segment_and_close, sym, tf, seg_tf, before)
+        except RuntimeError:
+            self._bar_cache.end_refresh(sym, seg_tf)
+
+    def _fetch_hist_segment_and_close(self, sym: str, tf: str, seg_tf: str, before: int) -> None:
+        try:
+            self._fetch_hist_segment(sym, tf, seg_tf, before)
+        finally:
+            self._bar_cache.end_refresh(sym, seg_tf)
 
     def _decorate_daily(self, quote: Optional[Quote]) -> Optional[Quote]:
         """Attach the consolidated daily context and the age of the print.

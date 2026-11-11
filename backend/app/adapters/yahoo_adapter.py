@@ -98,6 +98,8 @@ class YahooFinanceAdapter:
         timeframe: str = "15m",
         client: Optional[httpx.Client] = None,
         tz: Optional[ZoneInfo] = None,
+        period1: Optional[int] = None,
+        period2: Optional[int] = None,
     ) -> List[Bar]:
         sym = symbol.upper().replace("/", "-")
         tf_key = timeframe.lower()
@@ -121,6 +123,15 @@ class YahooFinanceAdapter:
 
         try:
             cli = client or cls.get_client()
+            if period1 is not None:
+                # Historical-segment fetch: an explicit epoch window instead of
+                # a trailing "range". Yahoo returns bars with time < period2,
+                # so the caller pages with period2 = the oldest bar it has.
+                # Without period1 the behavior above is byte-identical to the
+                # pre-paging adapter.
+                params.pop("range", None)
+                params["period1"] = int(period1)
+                params["period2"] = int(period2 if period2 is not None else int(time.time()))
             resp = cli.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()

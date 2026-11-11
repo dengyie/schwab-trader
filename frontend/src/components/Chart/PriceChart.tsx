@@ -10,6 +10,7 @@ import { useTradingStore } from '../../store/tradingStore';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { useI18n } from '../../i18n';
 import { Icon } from '../Icon';
+import { prependOlderSegment, keepHistoryAheadOfWindow } from '../../services/klineMerge';
 import styles from './PriceChart.module.css';
 
 export type ChartType = 'line' | 'candlestick';
@@ -39,7 +40,7 @@ const CHART_COLORS = {
   grid: 'rgba(48, 54, 61, 0.5)',
 };
 
-interface KlineData {
+export interface KlineData {
   time: UTCTimestamp;
   open: number;
   high: number;
@@ -85,6 +86,11 @@ const TIMEFRAME_SECONDS: Record<TimeRange, number> = {
 };
 
 // 计算移动平均线
+// 历史补载按后端 timeframe 键请求（后端 1wk/1mo 键刻意避开 "1M" 歧义）。
+function tfForHistory(range: TimeRange): string {
+  return INTERVAL_MAP[range] || range;
+}
+
 function calculateMA(data: KlineData[], period: number) {
   const result = [];
   for (let i = period - 1; i < data.length; i++) {
@@ -194,6 +200,19 @@ export function PriceChart() {
   const CACHE_FRESH_TTL = 15000; // 15秒内视为极速新鲜缓存，直接返回
   const MAX_CACHE_ENTRIES = 50; // 最大缓存条目数，防止无界增长
 
+  // 历史补载（左边界懒加载）：滑到图表左侧时按 before 游标拉更早的不可变段。
+  // 段数据永不过期（历史不会改变），本次会话内看过的 K 线永久保留。
+  const loadingMoreRef = useRef(false);
+  const hasMoreRef = useRef(true);
+  const loadOlderRef = useRef<(() => void) | null>(null);
+  const segmentsCacheRef = useRef<Map<string, { data: KlineData[]; hasMore: boolean }>>(new Map());
+  const MAX_SEGMENT_ENTRIES = 60; // 段缓存上限（不可变数据，仅防内存失控）
+  const HISTORY_CAPABLE: Record<string, boolean> = {
+    '1m': false,  // Yahoo 1m 物理上限即 7 天，初始拉取已是全量
+    '5m': true, '15m': true, '1h': true, '4h': true,
+    '1d': false, '1wk': false, '1mo': false, // 日级三键后端整段供给，不分页
+  };
+
   // 获取历史K线数据（带 SWR 零延迟双层缓存和重试）
   const fetchKlines = useCallback(async (symbol: string, interval: string, retryCount = 0) => {
     const tf = INTERVAL_MAP[interval as TimeRange] || interval || '15m';
@@ -245,17 +264,21 @@ export function PriceChart() {
       
       // 竞态保护：请求期间用户切走了标的，丢弃过期响应
       if (selectedSymbolRef.current !== symbol) return;
-      
+
+      // 只增不减：同一序列已有更早的历史段时，把新鲜段接到旧数据后面，
+      // 而不是整段替换——60s 轮询绝不能吞掉用户已经翻看过的历史。
+      const finalData = keepHistoryAheadOfWindow(klinesRef.current, formattedData);
+
       // 更新瞬时缓存，并实施 LRU 简单淘汰
       if (klinesCacheRef.current.size >= MAX_CACHE_ENTRIES) {
         const oldestKey = klinesCacheRef.current.keys().next().value;
         if (oldestKey) klinesCacheRef.current.delete(oldestKey);
       }
       const etag = response.headers.get('etag') || undefined;
-      klinesCacheRef.current.set(cacheKey, { data: formattedData, timestamp: now, etag });
-      
-      klinesRef.current = formattedData;
-      setKlines(formattedData);
+      klinesCacheRef.current.set(cacheKey, { data: finalData, timestamp: now, etag });
+
+      klinesRef.current = finalData;
+      setKlines(finalData);
       setError(null);
       setLoading(false);
     } catch (err) {
@@ -276,7 +299,7 @@ export function PriceChart() {
         setTimeout(() => fetchKlines(symbol, interval, retryCount + 1), 2000 * (retryCount + 1));
         return;
       }
-      
+
       setError(appError.message);
       setLoading(false);
     }
@@ -286,8 +309,75 @@ export function PriceChart() {
   useEffect(() => {
     isInitialFitRef.current = true;
     setLivePrice(null);
+    // 换标的/换周期 = 新的序列：重置补载状态（段缓存仍保留，切回不重拉）
+    hasMoreRef.current = HISTORY_CAPABLE[tfForHistory(timeRange)] ?? false;
     if (selectedSymbol) fetchKlines(selectedSymbol, INTERVAL_MAP[timeRange]);
   }, [selectedSymbol, timeRange, fetchKlines]);
+
+  // 左边界历史补载：请求 time < 最旧一根 的不可变段，prepend 后整段重画。
+  const loadOlder = useCallback(async () => {
+    const symbol = selectedSymbolRef.current;
+    const tf = tfForHistory(timeRange);
+    if (!symbol || loadingMoreRef.current || !hasMoreRef.current) return;
+    const list = klinesRef.current;
+    if (!list.length) return;
+
+    const oldest = list[0].time;
+    const segKey = `${symbol}-${tf}-h${oldest}`;
+    const segCached = segmentsCacheRef.current.get(segKey);
+    if (segCached) {
+      // 段缓存永不失效（不可变数据）：直接合并，零网络。
+      mergeOlderSegment(segCached.data, segCached.hasMore);
+      return;
+    }
+
+    loadingMoreRef.current = true;
+    try {
+      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}`;
+      const response = await apiFetch(url);
+      if (!response.ok) throw response;
+      // 竞态保护：请求期间用户切走了标的，丢弃过期响应
+      if (selectedSymbolRef.current !== symbol) return;
+
+      const data = await response.json();
+      const more: KlineData[] = data.map((k: any) => ({
+        time: (typeof k.time === 'number' ? k.time : Math.floor(new Date(k.time).getTime() / 1000)) as UTCTimestamp,
+        open: parseFloat(k.open),
+        high: parseFloat(k.high),
+        low: parseFloat(k.low),
+        close: parseFloat(k.close),
+        volume: parseFloat(k.volume || 0),
+      }));
+      const hasMore = response.headers.get('X-Bars-Has-More') === '1';
+
+      if (segmentsCacheRef.current.size >= MAX_SEGMENT_ENTRIES) {
+        const oldestSeg = segmentsCacheRef.current.keys().next().value;
+        if (oldestSeg) segmentsCacheRef.current.delete(oldestSeg);
+      }
+      segmentsCacheRef.current.set(segKey, { data: more, hasMore });
+      mergeOlderSegment(more, hasMore);
+    } catch (err) {
+      // 补载失败不打扰主图：静默降级，下个滑动手势可重试。
+      logError(handleApiError(err));
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [timeRange]);
+  // 图表初始化订阅持此 ref：回调永远调用最新的 loadOlder，不受 render 时序影响。
+  loadOlderRef.current = loadOlder;
+
+  // 合并更早的段到当前序列：按 time 去重、只增不减（纯函数在 klineMerge.ts，测试钉住）。
+  const mergeOlderSegment = useCallback((older: KlineData[], hasMore: boolean) => {
+    if (!older.length) {
+      hasMoreRef.current = false;
+      return;
+    }
+    hasMoreRef.current = hasMore;
+    const merged = prependOlderSegment(klinesRef.current, older);
+    if (merged === klinesRef.current) return; // 无新增（全部重复）
+    klinesRef.current = merged;
+    setKlines(merged);
+  }, []);
 
   // 定时刷新（60秒间隔，避免速率限制）
   useEffect(() => {
@@ -385,6 +475,13 @@ export function PriceChart() {
       if (!chart) return;
 
       mainChartApiRef.current = chart;
+
+      // 左边界历史补载：可见区间左缘越过 <10 根剩余时触发一次补载。
+      // subscribe 回调持有 ref，不随 render 重建；节流由 loadingMoreRef 保证。
+      chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range || range.from > 10) return;
+        void loadOlderRef.current?.();
+      });
 
       // 创建初始 series
       const candlestickSeries = chart.addSeries(CandlestickSeries, {

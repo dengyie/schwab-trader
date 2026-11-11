@@ -83,6 +83,27 @@ class MultiMarketFeed:
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")
 
+    def get_historical_segment(
+        self, symbol: str, timeframe: str, before: int
+    ) -> Tuple[List[Bar], float, bool]:
+        """One immutable history page for the owning feed.
+
+        Every concrete feed implements paging on the same Yahoo upstream (or
+        synthetically, in simulation), so a missing method here is a wiring
+        bug, surfaced by raising instead of silently returning "no history".
+        """
+        canonical, feed = self._route(symbol)
+        if feed is None:
+            return [], 0.0, False
+        getter = getattr(feed, "get_historical_segment", None)
+        if getter is None:
+            raise AttributeError(f"feed {type(feed).__name__} lacks get_historical_segment")
+        try:
+            return getter(canonical, timeframe=timeframe, before=before)
+        except Exception as exc:
+            logger.warning("History segment failed for %s (%s<%s): %s", canonical, timeframe, before, exc)
+            return [], 0.0, False
+
     def ensure_daily_stats(
         self, market: Optional[str] = None, symbols: Optional[List[str]] = None
     ) -> None:

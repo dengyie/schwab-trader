@@ -32,7 +32,7 @@ from app.core.markets import (
     resolve_symbol,
     within_day_range,
 )
-from app.core.timeframes import TIMEFRAME_SECONDS, TIMEFRAME_TTLS
+from app.core.timeframes import TIMEFRAME_SECONDS, TIMEFRAME_SPAN_DAYS, TIMEFRAME_TTLS
 
 # Outer bound on the feed probes behind /api/health. Each feed already caps
 # itself (MultiMarketFeed.HEALTH_PROBE_TIMEOUT); this covers a feed that
@@ -122,6 +122,25 @@ def _normalize_timeframe(timeframe: str) -> str:
             detail=f"Unsupported timeframe {timeframe!r}; supported: {sorted(TIMEFRAME_SECONDS)}",
         )
     return tf
+
+
+def _normalize_before(before: Optional[int], timeframe: str) -> Optional[int]:
+    """Validate the historical-segment cursor against the timeframe's span.
+
+    Daily and coarser buckets are fetched whole (see TIMEFRAME_SPAN_DAYS), so
+    a cursor there is a client bug and is rejected outright instead of being
+    silently served a truncated window.
+    """
+    if before is None:
+        return None
+    if before <= 0:
+        raise HTTPException(status_code=400, detail=f"Invalid before cursor: {before!r}")
+    if TIMEFRAME_SPAN_DAYS.get(timeframe) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Timeframe {timeframe!r} is served whole; paging is not offered",
+        )
+    return int(before)
 
 
 def _normalize_market(code: Optional[str]) -> str:
@@ -293,6 +312,7 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         symbol: str = "SPY",
         timeframe: str = "15m",
         market: Optional[str] = None,
+        before: Optional[int] = None,
         if_none_match: Optional[str] = Header(None),
     ) -> Any:
         # The feed serves whatever it has and refreshes in the background, so
@@ -301,6 +321,26 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         # Never fabricate candles: an empty list tells the client data is unavailable.
         sym = _normalize_symbol(symbol, market)
         tf = _normalize_timeframe(timeframe)
+        cursor = _normalize_before(before, tf)
+
+        if cursor is not None:
+            # Historical segment: immutable data strictly older than the
+            # cursor. Never refreshed on the hot path; failure == empty.
+            bars, fetched_at, has_more = actual_feed.get_historical_segment(sym, timeframe=tf, before=cursor)
+            records = ModelFeatureExporter.to_records(bars or [])
+            etag = f'W/"{sym}-{tf}-h{cursor}-{int(fetched_at)}"'
+            # History does not age: browsers keep the segment for a day and
+            # the CDN edge for a week; the ETag still turns a revalidation
+            # into a 304. Fresh-window headers below are untouched.
+            response.headers["ETag"] = etag
+            response.headers["X-Bars-Has-More"] = "1" if has_more else "0"
+            response.headers["X-Bars-Oldest"] = str(bars[0].time if bars else 0)
+            response.headers["Cache-Control"] = (
+                "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400"
+            )
+            if _etag_matches(if_none_match, etag):
+                return Response(status_code=304, headers=dict(response.headers))
+            return records
 
         if hasattr(actual_feed, "get_bars_with_meta"):
             bars, fetched_at = actual_feed.get_bars_with_meta(sym, timeframe=tf)

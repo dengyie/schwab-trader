@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from app.core.timeframes import HIST_SEGMENT_TTL_SECONDS, MAX_HIST_SEGMENTS_PER_KEY
 from app.models.trading import Bar
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ MAX_DISK_FILES = 400
 # After a failed fetch, do not retry that key for this long. Without it an
 # upstream outage turns every request (and every tab) into another attempt.
 FAILURE_COOLDOWN_SECONDS = 30.0
+
+# Separator for historical-segment subkeys: "SPY:15m#h1717200000". A "#"
+# cannot appear in a real timeframe key, so fresh-window code paths that
+# split on ":" still see the original timeframe as the second field.
+HIST_SEGMENT_MARK = "#"
 
 
 @dataclass(frozen=True)
@@ -86,27 +92,58 @@ class BarCache:
     def _key(symbol: str, timeframe: str) -> str:
         return f"{symbol.upper()}:{timeframe.lower()}"
 
+    @staticmethod
+    def hist_timeframe(timeframe: str, before: int) -> str:
+        """Subkey namespace for a historical segment ending before ``before``.
+
+        The segment lives in the same cache as the fresh window (same disk
+        dir, same single-flight machinery) under an extended timeframe key,
+        so no code path needs to know about segments beyond formatting.
+        """
+        return f"{timeframe.lower()}{HIST_SEGMENT_MARK}h{int(before)}"
+
+    @staticmethod
+    def is_hist_timeframe(timeframe: str) -> bool:
+        return HIST_SEGMENT_MARK in timeframe
+
     def _path(self, symbol: str, timeframe: str) -> Optional[Path]:
         if self._directory is None:
             return None
         safe_sym = "".join(c for c in symbol.upper() if c.isalnum() or c in ".-_")
-        safe_tf = "".join(c for c in timeframe.lower() if c.isalnum())
+        # Historical subkeys carry "#h<epoch>"; a "#" must not reach a file
+        # name, so a segment is written as {sym}_{tf}_h{epoch}.json — a name
+        # no fresh-window file ever uses, which keeps rollbacks trivial.
+        base_tf, before = timeframe.lower(), ""
+        if self.is_hist_timeframe(timeframe):
+            base_tf, _, before = timeframe.lower().partition(HIST_SEGMENT_MARK)
+            base_tf = f"{base_tf}_{before}"
+        safe_tf = "".join(c for c in base_tf if c.isalnum() or c == "_")
         return self._directory / f"{safe_sym}_{safe_tf}.json"
 
     # -- reads -----------------------------------------------------------
     def get(self, symbol: str, timeframe: str) -> Optional[CacheEntry]:
-        """Cached bars for a key, falling back to the on-disk copy."""
+        """Cached bars for a key, falling back to the on-disk copy.
+
+        A stored empty segment (a chart's terminal edge) is a real entry and
+        is returned as such; ``None`` means "nothing was ever fetched", which
+        is the only state that justifies an upstream round-trip.
+        """
         key = self._key(symbol, timeframe)
         with self._lock:
-            bars = self.bars.get(symbol.upper(), {}).get(timeframe.lower())
-            ts = self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
-            if bars:
+            sym_map = self.bars.get(symbol.upper(), {})
+            if timeframe.lower() in sym_map:
+                bars = sym_map[timeframe.lower()]
+                ts = self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
                 return CacheEntry(bars=bars, fetched_at=ts)
         return self._load_from_disk(symbol, timeframe)
 
     def is_fresh(self, entry: Optional[CacheEntry], timeframe: str) -> bool:
         if not entry or not entry.fetched_at:
             return False
+        if self.is_hist_timeframe(timeframe):
+            # History is immutable: a segment stays true for a week, whatever
+            # the fresh-window cadence of its base timeframe is.
+            return (time.time() - entry.fetched_at) < HIST_SEGMENT_TTL_SECONDS
         return (time.time() - entry.fetched_at) < self._ttl_for(timeframe)
 
     def age(self, entry: Optional[CacheEntry]) -> float:
@@ -135,8 +172,28 @@ class BarCache:
             key = self._key(sym, tf)
             self._order[key] = None
             self._order.move_to_end(key)
+            if self.is_hist_timeframe(tf):
+                self._evict_oldest_segment_locked(sym, tf)
             self._evict_locked()
         self._write_to_disk(sym, tf, bars, ts)
+
+    def _evict_oldest_segment_locked(self, sym: str, tf: str) -> None:
+        """Cap historical segments per (symbol, base-timeframe) family.
+
+        A chart pages back at most a few segments per session; beyond
+        MAX_HIST_SEGMENTS_PER_KEY the oldest cursor is dropped from RAM (its
+        disk copy remains and can be reloaded if the user really goes there
+        again). Segments sort naturally by the epoch in the subkey.
+        """
+        base = tf.split(HIST_SEGMENT_MARK)[0]
+        siblings = sorted(
+            (t for t in self.bars.get(sym, {}) if t.split(HIST_SEGMENT_MARK)[0] == base and HIST_SEGMENT_MARK in t),
+            key=lambda t: int(t.rsplit("h", 1)[1]),
+        )
+        for old_tf in siblings[:-MAX_HIST_SEGMENTS_PER_KEY] if len(siblings) > MAX_HIST_SEGMENTS_PER_KEY else []:
+            self.bars.get(sym, {}).pop(old_tf, None)
+            self.fetched_at.get(sym, {}).pop(old_tf, None)
+            self._order.pop(self._key(sym, old_tf), None)
 
     def _evict_locked(self) -> None:
         while len(self._order) > self.max_entries:

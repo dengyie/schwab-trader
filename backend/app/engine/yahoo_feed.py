@@ -19,16 +19,30 @@ from zoneinfo import ZoneInfo
 
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.markets import (
+    SymbolRef,
     freshness_updates,
     is_market_open,
     market_of,
     resolve_symbol,
 )
-from app.core.timeframes import TIMEFRAME_TTLS
+from app.core.timeframes import (
+    HIST_SEGMENT_BARS,
+    HIST_SEGMENT_BARS_DAILY,
+    TIMEFRAME_SPAN_DAYS,
+    TIMEFRAME_TTLS,
+)
 from app.engine.bar_cache import BarCache
 from app.models.trading import Bar, Quote, utc_now
 
 logger = logging.getLogger(__name__)
+
+# Bars per historical page, chosen per bucket granularity by the caller.
+HIST_PAGE_BARS = {"1d": HIST_SEGMENT_BARS_DAILY, "1wk": HIST_SEGMENT_BARS_DAILY, "1mo": HIST_SEGMENT_BARS_DAILY}
+# A page fetches a window wide enough to plausibly fill HIST_SEGMENT_BARS:
+# session days per calendar span differ by market, so page by raw time span
+# and trim to the page size afterwards.
+HIST_PAGE_SPAN_SECONDS = 366 * 86400
+HIST_SEGMENT_BARS_MIN = 2
 
 
 class YahooQuoteFeed:
@@ -261,6 +275,107 @@ class YahooQuoteFeed:
     def get_bars(self, symbol: str, timeframe: str = "15m") -> List[Bar]:
         bars, _ = self.get_bars_with_meta(symbol, timeframe)
         return bars
+
+    def get_historical_segment(
+        self, symbol: str, timeframe: str, before: int
+    ) -> Tuple[List[Bar], float, bool]:
+        """One immutable page of history strictly older than ``before``.
+
+        Returns (bars, fetched_at, has_more). Served from the segment cache
+        when present; otherwise a single-flight upstream fetch via
+        ``period1``/``period2``. Failures return ([], 0.0, False) after
+        arming the segment's cooldown — paging a dead edge must not storm.
+        """
+        ref = resolve_symbol(symbol)
+        if ref is None:
+            return [], 0.0, False
+        tf = timeframe.lower()
+        page_size = HIST_PAGE_BARS.get(tf, HIST_SEGMENT_BARS)
+        seg_tf = self._bar_cache.hist_timeframe(tf, before)
+        entry = self._bar_cache.get(ref.symbol, seg_tf)
+        if entry:
+            if not self._bar_cache.is_fresh(entry, seg_tf):
+                self._schedule_hist_refresh(ref.symbol, tf, seg_tf, before)
+            return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+
+        if not self._enabled or self._bar_cache.is_cooling(ref.symbol, seg_tf):
+            return [], 0.0, False
+        if not self._bar_cache.begin_refresh(ref.symbol, seg_tf):
+            self._bar_cache.wait_for_refresh(ref.symbol, seg_tf)
+            entry = self._bar_cache.get(ref.symbol, seg_tf)
+            if entry:
+                return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+            return [], 0.0, False
+        try:
+            bars = self._fetch_hist_segment(ref, tf, seg_tf, before)
+        finally:
+            self._bar_cache.end_refresh(ref.symbol, seg_tf)
+        if bars is None:
+            return [], 0.0, False
+        fetched = self._bar_cache.fetched_at_of(ref.symbol, seg_tf)
+        return bars, fetched, self._has_more(bars, page_size)
+
+    @staticmethod
+    def _has_more(bars: List[Bar], page_size: int) -> bool:
+        # A full page implies history continues beyond it; a short page means
+        # the physical limit of this timeframe was reached (or the market is
+        # younger than the window). Empty = terminal edge.
+        return len(bars) >= page_size
+
+    def _fetch_hist_segment(
+        self, ref: SymbolRef, tf: str, seg_tf: str, before: int
+    ) -> Optional[List[Bar]]:
+        try:
+            tz = ZoneInfo(ref.market.timezone)
+            page_size = HIST_PAGE_BARS.get(tf, HIST_SEGMENT_BARS)
+            span_days = TIMEFRAME_SPAN_DAYS.get(tf)
+            oldest_allowed = int(time.time()) - span_days * 86400 if span_days else 0
+            period1 = max(0, before - HIST_PAGE_SPAN_SECONDS)
+            if oldest_allowed and period1 < oldest_allowed:
+                period1 = oldest_allowed
+            bars = YahooFinanceAdapter.fetch_bars(
+                ref.symbol, timeframe=tf, tz=tz,
+                period1=period1, period2=before,
+            )
+            # Segment contract: strictly older than the cursor, newest N kept.
+            bars = [b for b in bars if b.time < before]
+            if len(bars) > page_size:
+                bars = bars[-page_size:]
+            if not bars:
+                # Nothing in this window: the true edge. Store the emptiness
+                # (with a fresh timestamp so the segment is served without
+                # re-hitting upstream) — a terminal state, not a failure.
+                self._bar_cache.put(ref.symbol, seg_tf, [], time.time())
+                return []
+            self._bar_cache.put(ref.symbol, seg_tf, bars)
+            return bars
+        except Exception as exc:
+            logger.warning("Yahoo hist segment failed for %s %s<%s: %s", ref.symbol, tf, before, exc)
+            self._bar_cache.cool_down(ref.symbol, seg_tf)
+            return None
+
+    def _schedule_hist_refresh(self, symbol: str, tf: str, seg_tf: str, before: int) -> None:
+        # Disabled feeds serve what is on disk but never reach upstream.
+        if not self._enabled or self._bar_cache.is_cooling(symbol, seg_tf):
+            return
+        if not self._bar_cache.begin_refresh(symbol, seg_tf):
+            return
+        ref = resolve_symbol(symbol)
+        if ref is None:
+            self._bar_cache.end_refresh(symbol, seg_tf)
+            return
+        try:
+            self._refresh_pool_executor().submit(
+                self._fetch_hist_segment_and_close, ref, tf, seg_tf, before
+            )
+        except RuntimeError:
+            self._bar_cache.end_refresh(symbol, seg_tf)
+
+    def _fetch_hist_segment_and_close(self, ref: SymbolRef, tf: str, seg_tf: str, before: int) -> None:
+        try:
+            self._fetch_hist_segment(ref, tf, seg_tf, before)
+        finally:
+            self._bar_cache.end_refresh(ref.symbol, seg_tf)
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.get_bars(symbol, timeframe="1m")

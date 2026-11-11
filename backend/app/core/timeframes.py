@@ -38,6 +38,37 @@ TIMEFRAME_TTLS: Dict[str, float] = {
     "1mo": 3600.0,
 }
 
+# Historical span ceiling per timeframe, in days. These are Yahoo's hard
+# limits, not preferences: past them the upstream API has no data, and the
+# chart shows a "data begins here" edge instead of pretending otherwise.
+# None = cursor paging is not offered for that timeframe (daily and coarser
+# buckets are fetched whole already; paging them would only multiply keys).
+TIMEFRAME_SPAN_DAYS: Dict[str, Optional[int]] = {
+    "1m": 7,
+    "5m": 60,
+    "15m": 60,
+    "1h": 730,
+    "4h": 730,
+    "1d": None,
+    "1wk": None,
+    "1mo": None,
+}
+
+# Bars served per historical segment (one "load older" page). Minute buckets
+# carry ~200KB per 2000 bars; daily+ buckets change once per session so a
+# smaller page is plenty.
+HIST_SEGMENT_BARS = 2000
+HIST_SEGMENT_BARS_DAILY = 400
+
+# History is immutable: a segment fetched once stays true for a week, so its
+# TTL dwarfs the fresh-window TTLs above. Refreshing it more often is pure
+# upstream waste.
+HIST_SEGMENT_TTL_SECONDS = 7 * 24 * 3600.0
+
+# At most this many historical segments are cached per (symbol, timeframe):
+# the edge segment plus a few pages back. A 4th segment evicts the oldest.
+MAX_HIST_SEGMENTS_PER_KEY = 3
+
 # Yahoo Finance (interval, range) pairs per timeframe.
 YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, str]] = {
     "1m": ("1m", "7d"),

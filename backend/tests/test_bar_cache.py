@@ -318,3 +318,136 @@ def test_iex_preload_bars_do_not_poison_the_cache(make_feed, monkeypatch, tmp_pa
     assert feed.historical_bars["SPY"] == venue_bars
     assert not (tmp_path / "bars" / "SPY_1m.json").exists()
     assert "1m" not in feed.multi_tf_bars.get("SPY", {})
+
+
+# -- Historical segments (paging back in time) ------------------------------
+def _hist_bars(start_ts, count, step=900, close=100.0):
+    """Ascending bars ending strictly before a cursor."""
+    return [
+        Bar(time=start_ts + i * step, open=close, high=close + 1, low=close - 1,
+            close=close + (i % 7), volume=10.0)
+        for i in range(count)
+    ]
+
+
+def test_hist_segment_fetches_strictly_older_bars(make_feed, monkeypatch):
+    feed = make_feed()
+    cursor = 1_800_000_000
+    seg = _hist_bars(cursor - 5 * 900, 4)
+    seen = {}
+
+    def fetch(sym, timeframe="15m", client=None, period1=None, period2=None):
+        seen["period1"], seen["period2"] = period1, period2
+        return seg
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", fetch)
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert [b.time for b in bars] == [b.time for b in seg]
+    assert all(b.time < cursor for b in bars)
+    assert fetched_at > 0
+    assert has_more is False, "a short page means the physical edge was reached"
+    assert seen["period2"] == cursor, "the cursor must cap the window's end"
+
+
+def test_hist_segment_is_served_from_cache_without_upstream(make_feed, monkeypatch):
+    feed = make_feed()
+    cursor = 1_800_000_000
+    seg = _hist_bars(cursor - 5 * 900, 4)
+    monkeypatch.setattr(
+        YahooFinanceAdapter, "fetch_bars",
+        lambda *a, **k: seg,
+    )
+    feed.get_historical_segment("SPY", "15m", before=cursor)
+
+    calls = []
+    def fetch(sym, *a, **k):
+        calls.append(sym)
+        return seg
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", fetch)
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert calls == [], "an immutable segment must never re-fetch while fresh"
+    assert [b.time for b in bars] == [b.time for b in seg]
+
+
+def test_hist_segment_full_page_reports_has_more(make_feed, monkeypatch):
+    feed = make_feed()
+    cursor = 1_800_000_000
+    seg = _hist_bars(cursor - 2001 * 900, 2000)
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: seg)
+
+    bars, _, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert len(bars) == 2000, "page is trimmed to the segment contract"
+    assert has_more is True, "a full page implies history continues above it"
+    assert all(b.time < cursor for b in bars)
+
+
+def test_hist_segment_empty_window_is_a_cached_terminal_state(make_feed, monkeypatch):
+    feed = make_feed()
+    cursor = 1_800_000_000
+    calls = []
+
+    def fetch(sym, *a, **k):
+        calls.append(sym)
+        return []
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", fetch)
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert bars == [] and has_more is False
+    # The emptiness is cached: a second page must not hit upstream again.
+    bars2, _, has_more2 = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert calls == ["SPY"], "the terminal edge must be cached, not re-fetched"
+    assert bars2 == [] and has_more2 is False
+
+
+def test_hist_segment_failure_fails_quietly(make_feed, monkeypatch):
+    feed = make_feed()
+
+    def boom(*a, **k):
+        raise ConnectionError("upstream down")
+
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", boom)
+
+    bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=1_800_000_000)
+    assert (bars, fetched_at, has_more) == ([], 0.0, False)
+
+
+def test_hist_segment_ram_cap_evicts_oldest_cursor(make_feed):
+    feed = make_feed()
+    base = 1_800_000_000
+    for i in range(4):
+        before = base - i * 900 * 2000
+        feed._bar_cache.put("SPY", BarCache.hist_timeframe("15m", before), _hist_bars(before - 900, 3))
+
+    live = [
+        tf for tf in feed._bar_cache.bars["SPY"]
+        if tf.startswith("15m#h")
+    ]
+    assert len(live) == 3, "at most MAX_HIST_SEGMENTS_PER_KEY segments stay in RAM"
+    # The oldest cursor is the one dropped.
+    oldest = BarCache.hist_timeframe("15m", base - 3 * 900 * 2000)
+    assert oldest not in feed._bar_cache.bars["SPY"]
+
+
+def test_hist_segment_disk_file_has_dedicated_name(tmp_path):
+    cache = BarCache(directory=str(tmp_path))
+    tf = cache.hist_timeframe("15m", 1_800_000_000)
+    cache.put("SPY", tf, _hist_bars(1_800_000_000 - 900, 2))
+    assert (tmp_path / "bars" / "SPY_15m_h1800000000.json").exists()
+    # A fresh-window file must never be created for a segment.
+    assert not (tmp_path / "bars" / "SPY_15m.json").exists()
+
+
+def test_hist_segment_survives_a_restart(tmp_path):
+    cache = BarCache(directory=str(tmp_path))
+    tf = cache.hist_timeframe("15m", 1_800_000_000)
+    seg = _hist_bars(1_800_000_000 - 3 * 900, 3)
+    cache.put("SPY", tf, seg)
+
+    reopened = BarCache(directory=str(tmp_path))
+    entry = reopened.get("SPY", tf)
+    assert entry is not None
+    assert entry.bars == seg

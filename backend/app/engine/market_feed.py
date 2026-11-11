@@ -8,6 +8,7 @@ import time
 from typing import Dict, List, Callable, Optional, Set
 from datetime import datetime, timezone
 from app.models.trading import Quote, Bar, Trade, OrderSide, utc_now
+from app.core.timeframes import TIMEFRAME_SECONDS
 
 
 class MarketFeedService:
@@ -69,6 +70,37 @@ class MarketFeedService:
 
     def get_historical_bars(self, symbol: str) -> List[Bar]:
         return self.historical_bars.get(symbol.upper(), [])
+
+    def get_historical_segment(self, symbol: str, timeframe: str, before: int):
+        """Synthetic history for the simulation feed: a deterministic random
+        walk strictly older than the cursor. Lets local --sim development
+        exercise the chart's paging UI without any upstream session. A short
+        page (has_more=False) after a few segments keeps the synthetic past
+        finite, like a real venue's data start."""
+        sym = symbol.upper()
+        tf_seconds = TIMEFRAME_SECONDS.get(timeframe.lower(), 900)
+        base = self.base_prices.get(sym, 150.0)
+        # Deterministic per (symbol, cursor): the same page refetched during a
+        # session shows the same candles.
+        rng = random.Random(f"{sym}:{before}")
+        count = 30
+        bars: List[Bar] = []
+        price = base * (1.0 + rng.gauss(0, 0.002))
+        for i in range(count):
+            bar_time = before - (count - i) * tf_seconds
+            close_p = round(price * (1.0 + rng.gauss(0, 0.0015)), 2)
+            bars.append(Bar(
+                time=bar_time,
+                open=round(price, 2),
+                high=round(max(price, close_p) * 1.0008, 2),
+                low=round(min(price, close_p) * 0.9992, 2),
+                close=close_p,
+                volume=random.Random(f"{sym}:{bar_time}").randint(1000, 25000),
+            ))
+            price = close_p
+        # Keep the synthetic past bounded: the third page back is the edge.
+        has_more = before > int(time.time()) - 4 * 30 * tf_seconds * 30
+        return bars, time.time(), has_more
 
     def get_latest_quote(self, symbol: str) -> Optional[Quote]:
         sym = symbol.upper()
