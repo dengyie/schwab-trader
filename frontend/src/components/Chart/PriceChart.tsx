@@ -706,6 +706,24 @@ export function PriceChart() {
     }
   }, [chartType, chartReady]);
 
+  // fitContent 在数据根数超过容器宽度时会被 minBarSpacing 钳制（814px 宽、
+  // minBarSpacing=1 只能显示 813 根）：预填两个月的 15m 序列后 fit 的几何
+  // 结果就是"从中间某根开始"，用户看到的仍是约一个月——历史进了序列却
+  // 永远在视口左侧之外。fit 前按数据量放宽下限（library 默认 0 = 不钳），
+  // 手动缩放仍受同一 options 约束，0.5px/根的密度依然可读。
+  const fitFullSpan = useCallback(() => {
+    const chart = mainChartApiRef.current;
+    if (!chart) return;
+    const count = klinesRef.current.length;
+    if (count > 0) {
+      const width = chart.timeScale().width();
+      if (width > 0 && count >= width) {
+        chart.timeScale().applyOptions({ minBarSpacing: Math.min(1, width / (count + 20)) });
+      }
+    }
+    chart.timeScale().fitContent();
+  }, []);
+
   // 更新主数据 (仅在首度加载或主动重置时调用 fitContent，保护用户缩放与手势操作)
   useEffect(() => {
     if (!mainSeriesRef.current || !chartReady || klines.length === 0) return;
@@ -717,20 +735,20 @@ export function PriceChart() {
         mainSeriesRef.current.setData(klines);
       }
       if (isInitialFitRef.current) {
-        mainChartApiRef.current?.timeScale().fitContent();
+        fitFullSpan();
         isInitialFitRef.current = false;
       }
       // 预取补齐后的重适配：必须在本次 setData 之后执行（命令式 fit 会被
       // 这里的 setData 重置抹掉，见 prefillFitPendingRef 注释）。
       // prefillFitTick 在内：循环结束时已无更多合并 flush，靠它驱动重跑。
       if (prefillFitPendingRef.current) {
-        mainChartApiRef.current?.timeScale().fitContent();
+        fitFullSpan();
         prefillFitPendingRef.current = false;
       }
     } catch (err) {
       console.error('Failed to update chart data:', err);
     }
-  }, [klines, chartReady, chartType, prefillFitTick]);
+  }, [klines, chartReady, chartType, prefillFitTick, fitFullSpan]);
 
   // 初始化成交量
   useEffect(() => {
@@ -1067,7 +1085,7 @@ export function PriceChart() {
 
   // 重置图表视图
   const handleReset = useCallback(() => {
-    mainChartApiRef.current?.timeScale().fitContent();
+    fitFullSpan();
   }, []);
 
   // 切换全屏
