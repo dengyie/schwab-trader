@@ -64,8 +64,9 @@ describe('keepHistoryAheadOfWindow', () => {
   });
 
   it('preserves history even when the fresh window is empty (upstream hiccup)', () => {
-    // The poller returned an empty body: the paged history must survive.
+    // The poller returned an empty body: the paged history must survive,
+    // not be wiped by the transient empty response.
     const pagedHistory = [bar(1000), bar(1100)];
-    expect(keepHistoryAheadOfWindow(pagedHistory, [])).toEqual([]);
+    expect(keepHistoryAheadOfWindow(pagedHistory, [])).toEqual(pagedHistory);
   });
 });

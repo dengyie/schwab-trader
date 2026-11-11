@@ -30,7 +30,10 @@ export function prependOlderSegment(series: KlineData[], older: KlineData[]): Kl
  * later — so "keep" here is exact, not best-effort.)
  */
 export function keepHistoryAheadOfWindow(series: KlineData[], window: KlineData[]): KlineData[] {
-  if (!window.length || !series.length || series[0].time >= window[0].time) return window;
+  // 空窗（上游瞬时故障返回空体）也绝不清掉已翻看的历史——"轮询只增不减"
+  // 的另一半契约；series 为空时保持返回空窗不变。
+  if (!window.length) return series.length ? series : window;
+  if (!series.length || series[0].time >= window[0].time) return window;
   const cutoff = window[0].time;
   const older = series.filter(k => k.time < cutoff);
   if (!older.length) return window;

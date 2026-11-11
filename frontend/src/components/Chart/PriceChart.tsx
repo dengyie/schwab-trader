@@ -205,7 +205,8 @@ export function PriceChart() {
   // 历史补载（左边界懒加载）：滑到图表左侧时按 before 游标拉更早的不可变段。
   // 段数据永不过期（历史不会改变），本次会话内看过的 K 线永久保留。
   const loadingMoreRef = useRef(false);
-  const hasMoreRef = useRef(true);
+  // 当前序列键（symbol-tf）：fetchKlines 用它区分同序列轮询与换标的换血。
+  const currentSeqKeyRef = useRef('');  const hasMoreRef = useRef(true);
   const loadOlderRef = useRef<(() => void) | null>(null);
   const segmentsCacheRef = useRef<Map<string, { data: KlineData[]; hasMore: boolean }>>(new Map());
   const MAX_SEGMENT_ENTRIES = 60; // 段缓存上限（不可变数据，仅防内存失控）
@@ -219,13 +220,21 @@ export function PriceChart() {
   const fetchKlines = useCallback(async (symbol: string, interval: string, retryCount = 0) => {
     const tf = INTERVAL_MAP[interval as TimeRange] || interval || '15m';
     const cacheKey = `${symbol}-${tf}`;
+    // 同序列判定：轮询/304 与换标的走不同合并规则——前者绝不许丢已补载的
+    // 历史（SWR 缓存只是整窗快照），后者必须整段换血（上个标的的历史段
+    // 绝不能接进新标的的图）。
+    const sameSeq = currentSeqKeyRef.current === cacheKey;
+    currentSeqKeyRef.current = cacheKey;
     const cached = klinesCacheRef.current.get(cacheKey);
     const now = Date.now();
-    
+
     // SWR 策略：如果有历史缓存，瞬时展示，切股票/切周期零延迟！
     if (cached) {
-      klinesRef.current = cached.data;
-      setKlines(cached.data);
+      const restored = sameSeq
+        ? keepHistoryAheadOfWindow(klinesRef.current, cached.data)
+        : cached.data;
+      klinesRef.current = restored;
+      setKlines(restored);
       setLoading(false);
       setError(null);
       // 如果处于极度新鲜期（15秒内），免去网络请求
@@ -267,9 +276,11 @@ export function PriceChart() {
       // 竞态保护：请求期间用户切走了标的，丢弃过期响应
       if (selectedSymbolRef.current !== symbol) return;
 
-      // 只增不减：同一序列已有更早的历史段时，把新鲜段接到旧数据后面，
-      // 而不是整段替换——60s 轮询绝不能吞掉用户已经翻看过的历史。
-      const finalData = keepHistoryAheadOfWindow(klinesRef.current, formattedData);
+      // 只增不减（仅限同序列）：轮询的新鲜窗接到已补载的历史段后面，而
+      // 不是整段替换；换标的/换周期则整段换血，杜绝跨标的串数据。
+      const finalData = sameSeq
+        ? keepHistoryAheadOfWindow(klinesRef.current, formattedData)
+        : formattedData;
 
       // 更新瞬时缓存，并实施 LRU 简单淘汰
       if (klinesCacheRef.current.size >= MAX_CACHE_ENTRIES) {
