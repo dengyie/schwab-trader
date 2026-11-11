@@ -230,6 +230,23 @@ class TestRouter:
         assert cn["market"] == "CN"
         assert router.get_market_clock("XX") is None
 
+    def test_equity_history_forwards_to_us_book(self, fx):
+        # The curve belongs to the venue holding the account (US), never the
+        # virtual international ledger.
+        class _Recording:
+            def __init__(self):
+                self.calls = []
+
+            def get_equity_history(self, period="1M", timeframe="1D"):
+                self.calls.append((period, timeframe))
+                return {"points": [{"time": 1, "equity": 2.0}], "base_value": 2.0}
+
+        us_recorder, intl_recorder = _Recording(), _Recording()
+        router = MarketRouterBroker(us_recorder, intl_recorder)  # type: ignore[arg-type]
+        assert router.get_equity_history(period="1W", timeframe="5Min") is not None
+        assert us_recorder.calls == [("1W", "5Min")]
+        assert intl_recorder.calls == []
+
 
 class TestFxService:
     def test_fallback_rates_without_network(self):

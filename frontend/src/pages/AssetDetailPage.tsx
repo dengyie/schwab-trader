@@ -20,11 +20,17 @@ type TimeRange = '1D' | '7D' | '30D' | 'ALL';
 type SortField = 'value' | 'balance' | 'pnl' | 'pnlPercent';
 type SortOrder = 'asc' | 'desc';
 
-/** Venue equity curve, one point per session close (Alpaca portfolio history). */
-type EquityHistory = { points: { time: number; equity: number }[]; baseValue: number | null };
+/** Venue equity curve (Alpaca portfolio history), intraday for 1D, daily closes otherwise. */
+type EquityHistory = { points: { time: number; equity: number }[] };
 
-// The venue only maps day-granular periods; a week of trading days is "1W".
-const HISTORY_PERIODS: Record<TimeRange, string> = { '1D': '1D', '7D': '1W', '30D': '1M', 'ALL': 'ALL' };
+// The venue only maps day-granular periods for longer ranges; "1D" rides the
+// intraday curve (Alpaca spells it "5Min", lowercase "5m" is rejected).
+const HISTORY_PARAMS: Record<TimeRange, string> = {
+  '1D': 'period=1D&timeframe=5Min',
+  '7D': 'period=1W&timeframe=1D',
+  '30D': 'period=1M&timeframe=1D',
+  'ALL': 'period=ALL&timeframe=1D',
+};
 
 // 格式化数字
 function formatNumber(value: number, decimals = 2): string {
@@ -48,16 +54,44 @@ function usdSigned(value: number): string {
   return formatMoney(value, 'USD', { signed: true });
 }
 
+/**
+ * 从真实数据点时间戳生成 4 个横轴刻度：首、两个内插点、尾。
+ * Alpaca 时间戳锚定美股交易日，标签固定按 America/New_York 渲染——
+ * 否则东八区浏览器会把日内曲线标成 "22:30–05:00"。日线显示 "Nov 11"，
+ * 跨年补年份；日内显示 "HH:MM"。纯函数便于测试。
+ */
+export function chartTimeLabels(times: number[]): string[] {
+  const n = times.length;
+  if (n < 2) return [];
+  const indices = [0, Math.round((n - 1) / 3), Math.round((2 * (n - 1)) / 3), n - 1];
+  const span = times[n - 1] - times[0];
+  const intraday = span < 24 * 60 * 60;
+  const ET = 'America/New_York';
+  const fmtDay = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: ET });
+  const fmtYear = new Intl.DateTimeFormat('en-US', { year: 'numeric', timeZone: ET });
+  const fmtTime = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: ET });
+  return indices.map((idx) => {
+    const d = new Date(times[idx] * 1000);
+    const label = intraday ? fmtTime.format(d) : fmtDay.format(d);
+    // 年跨度的首尾刻度补年份，消除跨年误读。
+    return !intraday && span > 365 * 24 * 60 * 60
+      ? `${label} ${fmtYear.format(d)}`
+      : label;
+  });
+}
+
 // 增强型投资组合图表组件
-function PortfolioChart({ 
+function PortfolioChart({
   data,
+  times,
   color,
   height = 100,
   timeRange,
   fmt
-}: { 
-  data: number[]; 
-  color: string; 
+}: {
+  data: number[];
+  times?: number[];
+  color: string;
   height?: number;
   timeRange: TimeRange;
   fmt: (v: number) => string;
@@ -89,8 +123,12 @@ function PortfolioChart({
   // 生成Y轴刻度
   const yTicks = [min, (min + max) / 2, max];
   
-  // 生成X轴时间标签
+  // 生成X轴时间标签：优先用真实数据点的时间戳（与 hover 数值一一对应）；
+  // 没有时间戳才退回按当前时间推算的近似刻度。
   const getTimeLabels = () => {
+    if (times && times.length === data.length && times.length >= 2) {
+      return chartTimeLabels(times);
+    }
     const now = new Date();
     switch (timeRange) {
       case '1D':
@@ -483,16 +521,17 @@ export function AssetDetailPage() {
   const setSelectedSymbol = useWatchlistStore((state) => state.setSelectedSymbol);
   const fxRates = useMarketsStore((state) => state.fxRates);
 
-  // 券商端的逐日净值曲线（Alpaca portfolio history）。404 表示账户太新、
-  // 场内还没有历史——保留 null 让空态文案出现，绝不拿 0 值伪造走势。
+  // 券商端的净值曲线（Alpaca portfolio history；1D 走日内 5 分钟粒度）。
+  // 404 表示账户太新、场内还没有历史——保留 null 让空态文案出现，绝不拿
+  // 0 值伪造走势。注意 apiFetch 对 401 是 throw（登录门接管），进的是 catch。
   useEffect(() => {
     let cancelled = false;
     setEquityLoading(true);
-    apiFetch(`/portfolio/history?period=${HISTORY_PERIODS[timeRange]}&timeframe=1D`)
+    apiFetch(`/portfolio/history?${HISTORY_PARAMS[timeRange]}`)
       .then(async (res) => {
         if (cancelled) return;
         if (!res.ok) {
-          if (res.status !== 401) setEquityHistory(null);
+          setEquityHistory(null);
           return;
         }
         const data = await res.json();
@@ -501,7 +540,6 @@ export function AssetDetailPage() {
             time: p.time,
             equity: p.equity,
           })),
-          baseValue: data.base_value ?? null,
         });
       })
       .catch(() => { if (!cancelled) setEquityHistory(null); })
@@ -665,6 +703,10 @@ export function AssetDetailPage() {
   // 券商净值曲线 → 图表点序列；没有真实历史就保持空数组走空态。
   const portfolioHistoryData = useMemo<number[]>(
     () => (equityHistory ? equityHistory.points.map((p) => p.equity) : []),
+    [equityHistory],
+  );
+  const portfolioHistoryTimes = useMemo<number[]>(
+    () => (equityHistory ? equityHistory.points.map((p) => p.time) : []),
     [equityHistory],
   );
 
@@ -955,6 +997,7 @@ export function AssetDetailPage() {
             {portfolioHistoryData.length >= 2 ? (
               <PortfolioChart
                 data={portfolioHistoryData}
+                times={portfolioHistoryTimes}
                 color={totals.totalPnl >= 0 ? 'var(--color-success)' : 'var(--color-error)'}
                 height={120}
                 timeRange={timeRange}

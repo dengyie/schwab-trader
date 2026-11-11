@@ -457,8 +457,6 @@ def test_equity_history_parses_and_skips_null_days(monkeypatch):
 
 
 def test_equity_history_is_cached_and_returns_a_copy(monkeypatch):
-    import time as _time
-
     calls = []
     broker = AlpacaPaperBroker(api_key="K", api_secret="S")
 
@@ -497,3 +495,58 @@ def test_equity_history_serves_stale_curve_on_transient_failure(monkeypatch):
     still = broker.get_equity_history()
     assert still is not None
     assert still["points"][-1]["equity"] == 101200.0
+
+
+def test_equity_history_skips_alpacas_zero_padding(monkeypatch):
+    # Observed live: Alpaca pads days before the account existed with 0.0
+    # equity instead of null. Zero-filling those draws a fake "from $0"
+    # rocket; they are pre-account padding, not real closes.
+    broker = _broker_with_clock(
+        monkeypatch,
+        _FakeClockResponse(200, {
+            "timestamp": [1793840400, 1793926800, 1794013200, 1794272400],
+            "equity": [0.0, 0.0, 0.0, 100000.0],
+            "base_value": 100000.0,
+        }),
+    )
+    assert broker.get_equity_history() is None  # one real point < 2
+
+
+def test_equity_history_unknown_timeframe_collapses_to_default(monkeypatch):
+    # Arbitrary strings must neither reach the venue nor grow the cache:
+    # each unknown key collapses onto the default instead of becoming a
+    # permanent cache entry.
+    sent = []
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, _history_payload()))
+    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()))
+    broker.get_equity_history(timeframe="; DROP TABLE users")
+    assert sent[-1] == {"period": "1M", "timeframe": "1D"}
+
+
+def test_equity_history_intraday_timeframe_maps_to_venue_spelling(monkeypatch):
+    # Alpaca spells intraday timeframes "1Min"/"5Min"/"15Min"; anything else
+    # is rejected with 40010001. Case-insensitive input maps onto that.
+    sent = []
+    broker = _broker_with_clock(monkeypatch, _FakeClockResponse(200, _history_payload()))
+    monkeypatch.setattr(broker.client, "get", lambda url, **kw: sent.append(kw.get("params")) or _FakeClockResponse(200, _history_payload()))
+    broker.get_equity_history(timeframe="5min")
+    assert sent[-1] == {"period": "1M", "timeframe": "5Min"}
+    broker.get_equity_history(timeframe="15Min")
+    assert sent[-1] == {"period": "1M", "timeframe": "15Min"}
+
+
+def test_equity_history_empty_result_is_cached_briefly(monkeypatch):
+    # A fresh account would otherwise hit the venue on every page view;
+    # the empty answer gets a short TTL so recovery is quick.
+    calls = []
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+
+    def _counting(url, **kwargs):
+        calls.append(1)
+        return _FakeClockResponse(200, {"timestamp": [1, 2], "equity": [None, None]})
+
+    monkeypatch.setattr(broker.client, "get", _counting)
+    assert broker.get_equity_history() is None
+    assert broker.get_equity_history() is None
+    assert calls == [1], "an empty result must be served from cache"
+    assert broker._equity_history_cache["1M:1D"] == (None, broker._equity_history_cache["1M:1D"][1])
