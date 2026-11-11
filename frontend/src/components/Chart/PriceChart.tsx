@@ -395,8 +395,14 @@ export function PriceChart() {
   // older 数据只是藏在视口左侧（正是本次用户反馈的现象）。fit 不能在这
   // 里命令式调用：它跑在 React 刷新之前，随后的 setData 会把它抹掉——
   // 用标志位让 [klines] effect 在 setData 之后执行 fit。
+  // 竞态陷阱（线上首载实测）：网络页合并触发的 [klines] effect 在循环
+  // 进行中就已跑完，此时标志位还是 false；循环结束后置位，若之后不再有
+  // flush（终页 hasMore=0、无更多合并），标志位永远无人消费——视口停在
+  // 默认右锚。置位后追加一次受控 flush（tick 进 effect deps），保证
+  // effect 必然在标志位生效后再跑一次。
   const prefillRef = useRef<(() => Promise<void>) | null>(null);
   const prefillFitPendingRef = useRef(false);
+  const [prefillFitTick, setPrefillFitTick] = useState(0);
   const PREFILL_PAGE_BUDGET = 6;
   prefillRef.current = async () => {
     if (!hasMoreRef.current) return;
@@ -409,7 +415,10 @@ export function PriceChart() {
       lastOldest = oldest;
       grew = true;
     }
-    if (grew) prefillFitPendingRef.current = true;
+    if (grew) {
+      prefillFitPendingRef.current = true;
+      setPrefillFitTick(t => t + 1);
+    }
   };
 
   // 合并更早的段到当前序列：按 time 去重、只增不减（纯函数在 klineMerge.ts，测试钉住）。
@@ -707,6 +716,7 @@ export function PriceChart() {
       }
       // 预取补齐后的重适配：必须在本次 setData 之后执行（命令式 fit 会被
       // 这里的 setData 重置抹掉，见 prefillFitPendingRef 注释）。
+      // prefillFitTick 在内：循环结束时已无更多合并 flush，靠它驱动重跑。
       if (prefillFitPendingRef.current) {
         mainChartApiRef.current?.timeScale().fitContent();
         prefillFitPendingRef.current = false;
@@ -714,7 +724,7 @@ export function PriceChart() {
     } catch (err) {
       console.error('Failed to update chart data:', err);
     }
-  }, [klines, chartReady, chartType]);
+  }, [klines, chartReady, chartType, prefillFitTick]);
 
   // 初始化成交量
   useEffect(() => {
