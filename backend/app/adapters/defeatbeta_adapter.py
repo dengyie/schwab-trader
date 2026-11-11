@@ -71,7 +71,7 @@ _SCAN_TIMEOUT_SECONDS = 30.0
 # Yahoo daily bars are stamped at the session open; the dataset stamps the
 # same session at 00:00 UTC. Restamping to the open convention keeps the
 # two sources interchangeable on the daily key (see module docstring).
-_SESSION_OPEN_TZ = ZoneInfo("America/New_York")
+_ET = ZoneInfo("America/New_York")
 
 _cache_lock = threading.Lock()
 _frame_cache: Dict[str, Tuple[float, List[Bar]]] = {}
@@ -86,7 +86,7 @@ def _session_open_epoch(report_date: str) -> int:
     Yahoo stamps the session's daily bar with.
     """
     day = datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
-    return int(day.replace(hour=9, minute=30, tzinfo=_SESSION_OPEN_TZ).timestamp())
+    return int(day.replace(hour=9, minute=30, tzinfo=_ET).timestamp())
 
 
 def _rows_to_bars(rows: list) -> List[Bar]:
@@ -255,7 +255,7 @@ def _aggregate_monthly(bars: List[Bar]) -> List[Bar]:
 
 
 def _midnight_et(day: date) -> int:
-    return int(datetime(day.year, day.month, day.day, tzinfo=_SESSION_OPEN_TZ).timestamp())
+    return int(datetime(day.year, day.month, day.day, tzinfo=_ET).timestamp())
 
 
 def _aggregate_buckets(
@@ -272,7 +272,7 @@ def _aggregate_buckets(
     buckets: Dict[object, List[Bar]] = {}
     order: List[object] = []
     for b in bars:
-        day = datetime.fromtimestamp(b.time, tz=_SESSION_OPEN_TZ).date()
+        day = datetime.fromtimestamp(b.time, tz=_ET).date()
         k = key(day)
         if k not in buckets:
             buckets[k] = []
@@ -282,7 +282,7 @@ def _aggregate_buckets(
     aggregated: List[Bar] = []
     for k in order:
         chunk = buckets[k]
-        first_day = datetime.fromtimestamp(chunk[0].time, tz=_SESSION_OPEN_TZ).date()
+        first_day = datetime.fromtimestamp(chunk[0].time, tz=_ET).date()
         aggregated.append(Bar(
             time=stamp(first_day),
             open=chunk[0].open,

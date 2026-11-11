@@ -587,6 +587,17 @@ def test_whole_window_fallback_trims_to_yahoo_window(make_feed, monkeypatch):
     bars, _ = feed.get_bars_with_meta("DEAD2", "1mo")
     assert [b.time for b in bars] == [ancient.time, recent.time]
 
+    # 1wk trims to its own span (10y): the 5y-old bar survives, the
+    # decade-old one does not.
+    cutoff_1wk = now - WHOLE_WINDOW_SPAN_SECONDS["1wk"]
+    decade_old = Bar(time=int(cutoff_1wk) - 100 * 86400, open=10, high=11, low=9, close=10, volume=1)
+    monkeypatch.setattr(
+        "app.adapters.defeatbeta_adapter.fetch_history",
+        lambda sym, tf: ([decade_old, ancient, recent], time.time()),
+    )
+    bars, _ = feed.get_bars_with_meta("DEAD3", "1wk")
+    assert [b.time for b in bars] == [ancient.time, recent.time]
+
 
 def test_weekly_monthly_fallback_aggregates_from_dailies(make_feed, monkeypatch):
     """Yahoo answering a weekly/monthly whole-window request with nothing
@@ -674,3 +685,51 @@ def test_defeatbeta_rows_skip_partial_and_stamp_session_open():
     assert len(bars) == 2
     assert datetime.fromtimestamp(bars[0].time, tz=timezone.utc).isoformat() == "2025-07-01T13:30:00+00:00"
     assert datetime.fromtimestamp(bars[1].time, tz=timezone.utc).isoformat() == "2026-11-10T14:30:00+00:00"
+
+
+def test_aggregation_buckets_across_year_boundary():
+    """ISO-week keys must survive the year boundary: the week containing New
+    Year folds under its own ISO year (2026-W53, and 2026 has 53 weeks
+    because its Jan 1 is a Thursday), monthly buckets fold by calendar
+    month, and every stamp stays the bucket anchor's midnight ET."""
+    daily = defeatbeta_adapter._rows_to_bars([
+        ("2026-12-28", 10.0, 11.0, 9.0, 10.5, 100),  # Mon, ISO 2026-W53
+        ("2026-12-31", 10.5, 12.0, 10.0, 11.5, 200),  # Thu, same ISO week
+        ("2027-01-04", 11.5, 13.0, 11.0, 12.5, 400),  # Mon, ISO 2027-W01
+    ])
+    weekly = defeatbeta_adapter._aggregate_weekly(daily)
+    assert len(weekly) == 2
+    assert datetime.fromtimestamp(weekly[0].time, tz=timezone.utc).isoformat().startswith("2026-12-28T05:00")
+    assert datetime.fromtimestamp(weekly[1].time, tz=timezone.utc).isoformat().startswith("2027-01-04T05:00")
+    assert (weekly[0].open, weekly[0].high, weekly[0].close, weekly[0].volume) == (10.0, 12.0, 11.5, 300.0)
+
+    monthly = defeatbeta_adapter._aggregate_monthly(daily)
+    assert len(monthly) == 2
+    assert datetime.fromtimestamp(monthly[0].time, tz=timezone.utc).isoformat().startswith("2026-12-01T05:00")
+    assert datetime.fromtimestamp(monthly[1].time, tz=timezone.utc).isoformat().startswith("2027-01-01T05:00")
+    assert (monthly[1].open, monthly[1].close, monthly[1].volume) == (11.5, 12.5, 400.0)
+
+
+def test_scan_timeout_arms_cooldown_and_reports_error(monkeypatch):
+    """A hung dataset scan must be bounded: the watchdog turns it into a
+    cooldown plus a health-visible error instead of pinning the caller
+    thread on a dead upstream."""
+    import app.adapters.defeatbeta_adapter as db
+
+    def hung_scan(sym):
+        time.sleep(5.0)
+        return []
+
+    monkeypatch.setattr("app.adapters.defeatbeta_adapter._load_daily_bars", hung_scan)
+    monkeypatch.setattr(db, "_SCAN_TIMEOUT_SECONDS", 0.1)
+
+    t0 = time.time()
+    assert db.fetch_daily_history("SPY") is None
+    assert time.time() - t0 < 2.0, "the watchdog bounds the wait"
+    stats = db.stats()
+    assert stats["last_error"] and "exceeded" in stats["last_error"]
+
+    # The armed cooldown absorbs the immediate retry without re-scanning.
+    t0 = time.time()
+    assert db.fetch_daily_history("SPY") is None
+    assert time.time() - t0 < 0.5, "cooldown short-circuits before the scan"

@@ -147,6 +147,24 @@ def test_long_horizon_timeframes_are_mapped_and_registered():
     assert {"1m", "1wk", "1mo"} <= set(TIMEFRAME_SECONDS)
 
 
+def test_fallback_contract_maps_stay_in_sync():
+    """The fallback's three contract structures must agree: what the adapter
+    can answer (SUPPORTED_TIMEFRAMES), what window it trims to
+    (WHOLE_WINDOW_SPAN_SECONDS), and what window Yahoo serves
+    (YAHOO_TIMEFRAME_MAP). One key added to one map without the others would
+    trim silently wrong or not at all — the maps are bound here, not just by
+    adjacent comments."""
+    from app.adapters import defeatbeta_adapter
+    from app.core.timeframes import WHOLE_WINDOW_SPAN_SECONDS, YAHOO_TIMEFRAME_MAP
+
+    keys = {"1d", "1wk", "1mo"}
+    assert set(defeatbeta_adapter.SUPPORTED_TIMEFRAMES) == keys
+    assert set(WHOLE_WINDOW_SPAN_SECONDS) == keys
+    for key in keys:
+        # Unbounded span ⇔ unbounded Yahoo range (1mo whole history).
+        assert (WHOLE_WINDOW_SPAN_SECONDS[key] is None) == (YAHOO_TIMEFRAME_MAP[key][1] is None)
+
+
 def test_bar_cache_is_bounded(monkeypatch):
     feed = _make_feed(monkeypatch)
     for i in range(MAX_CACHE_ENTRIES + 20):

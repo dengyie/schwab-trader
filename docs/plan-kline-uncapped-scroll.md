@@ -240,7 +240,7 @@ prod 验收（79afc5f 部署后）：health `feeds.us.daily_fallback` 透出；K
 
 继续迭代时对 Yahoo 上游的实弹探测抓到第二个真 bug，并顺手补齐兜底的最后缺口：
 
-**主路径 bug：`interval=1mo & range=max` 不是真月K。** 实测 KO 全史 42 年里每年恰好 4 根（季度桶冒充月K），而 SPY（34 年）幸免——Yahoo 对超过 ~35 年历史的月K请求静默降级粒度；显式 range（5y/10y/20y/40y）与显式 `period1=0&period2=now`（504 根、42 年全部 12 根/年）均不受影响。§7.9 当时以 SPY 验收（407 根真月K）恰好落在幸免侧，KO 的降级直到这次换标的探测才暴露。修复：`YAHOO_TIMEFRAME_MAP["1mo"] = ("1mo", None)`——`None` range 语义为"整史走显式 epoch 边界"，adapter 的整窗分支据此发 `period1=0/period2=now`。**教训：验收样本要换标的**；"range=max" 在 Yahoo 语义里不等于"全史原粒度"。
+**主路径 bug：`interval=1mo & range=max` 不是真月K。** 实测 KO 全史 42 年里每年恰好 4 根（季度桶冒充月K），而 SPY（34 年）未降级——降级机制未知，目前只有两点经验边界（KO 42y 降级、SPY 34y 未降级），不应当作 spec 外推；但显式 range（5y/10y/20y/40y）与显式 `period1=0&period2=now`（504 根、42 年全部 12 根/年）均实测为真月K，修复完全绕开该行为，不依赖规则成立。§7.9 当时以 SPY 验收（407 根真月K）恰好落在幸免侧，KO 的降级直到这次换标的探测才暴露。修复：`YAHOO_TIMEFRAME_MAP["1mo"] = ("1mo", None)`——`None` range 语义为"整史走显式 epoch 边界"，adapter 的整窗分支据此发 `period1=0/period2=now`。**教训：验收样本要换标的**；"range=max" 在 Yahoo 语义里不等于"全史原粒度"。
 
 **兜底缺口：1wk/1mo 无兜底。** dataset 无更粗粒度，但日线帧可聚合——adapter 新增 `fetch_history(symbol, timeframe)` 分发（`SUPPORTED_TIMEFRAMES = (1d, 1wk, 1mo)`），周桶按 ISO 周折叠、月桶按日历月折叠，戳对齐 Yahoo 实测约定：**桶锚点日历日的 00:00 ET**（周一遇节假日仍戳周一零点；月戳 1 号零点——KO 1985-01-01 戳在元旦上为证）。`DAILY_WINDOW_SPAN_SECONDS` 单值改为 `WHOLE_WINDOW_SPAN_SECONDS` 地图（1d=5y / 1wk=10y / 1mo=None），与 range 地图并排注释绑定。实弹验证：KO 聚合周桶 1668 个、全部周一戳，且与 Yahoo 自家周K同周 OHLCV 逐字段一致。
 
