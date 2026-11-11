@@ -540,6 +540,12 @@ export function PriceChart() {
       if (!chart) return;
 
       mainChartApiRef.current = chart;
+      // 常驻轻量诊断：线上核对视口状态用（/trade 控制台读
+      // window.__chartApi.timeScale().getVisibleLogicalRange() / fitContent()）。
+      if (typeof window !== 'undefined') {
+        (window as any).__chartApi = chart;
+        (window as any).__mainSeries = mainSeriesRef.current;
+      }
 
       // 左边界历史补载：可见区间左缘越过 <10 根剩余时触发一次补载。
       // subscribe 回调持有 ref，不随 render 重建；节流由 loadingMoreRef 保证。
