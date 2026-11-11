@@ -391,7 +391,7 @@ def test_bars_response_carries_cache_validators():
     etag = resp.headers["ETag"]
     assert etag.startswith('W/"SPY-15m-')
     # 15m TTL is 120s, so a just-fetched response is reusable for a while.
-    assert resp.headers["Cache-Control"].startswith("private, max-age=")
+    assert resp.headers["Cache-Control"].startswith("public, max-age=")
     assert int(resp.headers["Cache-Control"].split("=")[1]) > 0
 
 
@@ -435,7 +435,7 @@ def test_stale_bars_are_served_but_marked_stale():
     assert resp.status_code == 200
     assert len(resp.json()) == 3
     assert resp.headers["X-Cache"] == "STALE"
-    assert resp.headers["Cache-Control"] == "private, max-age=0"
+    assert resp.headers["Cache-Control"] == "public, max-age=0"
     assert int(resp.headers["Age"]) >= 3600
 
 

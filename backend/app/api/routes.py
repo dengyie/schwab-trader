@@ -380,10 +380,17 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             "ETag": etag,
             "Age": str(int(age)),
             "X-Cache": "HIT" if age < ttl else "STALE",
-            # Browsers and Caddy may reuse it for the rest of its TTL; after
-            # that they revalidate, and the ETag turns an unchanged fetch into
-            # a 304 instead of a 200 carrying 200KB of identical candles.
-            "Cache-Control": f"private, max-age={remaining}",
+            # ``public`` on purpose (2026-11-12): the fresh window is the
+            # same user-identical public market data the segments serve,
+            # and the auth header is not part of CF's cache key — so the
+            # edge may share it across users for ``max-age``. The live
+            # deltas arrive over the websocket stream; the REST response
+            # is just the seed. Measured: every fresh-window poll used to
+            # traverse CF→origin (~600ms RTT for an Asia client); at the
+            # edge it is a HIT. ``remaining`` counts from the fetch, so a
+            # stale entry is served with max-age≈0 and the edge simply
+            # revalidates each poll while the background refresh runs.
+            "Cache-Control": f"public, max-age={remaining}",
         }
         if _etag_matches(if_none_match, etag):
             return Response(status_code=304, headers=headers)
