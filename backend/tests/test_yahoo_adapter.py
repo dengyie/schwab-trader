@@ -149,3 +149,81 @@ def test_bar_cache_is_bounded(monkeypatch):
         feed._cache_put(f"SYM{i}", "1m", [Bar(time=i, open=1, high=1, low=1, close=1, volume=1)])
     total = sum(len(tfs) for tfs in feed.multi_tf_bars.values())
     assert total == MAX_CACHE_ENTRIES
+
+
+# -- IP throttling observability --------------------------------------------
+class _RateLimitedClient:
+    """Yahoo answering HTTP 429 — the explicit throttle."""
+    status_code = 429
+    def get(self, *a, **k):
+        return self
+    def raise_for_status(self):
+        import httpx
+        req = httpx.Request("GET", "https://query1.finance.yahoo.com/x")
+        import httpx as _h
+        self._resp = _h.Response(429, request=req)
+        raise _h.HTTPStatusError("429", request=req, response=self._resp)
+    def json(self):
+        return {}
+
+class _EdgeDisguiseClient:
+    """Yahoo answering HTTP 200 with the 'Edge: too many requests' chart.error
+    disguise (yfinance #2284/#2297/#2721)."""
+    status_code = 200
+    def get(self, *a, **k):
+        return self
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"chart": {"result": None, "error": {
+            "code": "Bad Request", "description": "Edge: Too Many Requests"}}}
+
+class _DelistedClient:
+    """A genuinely dead symbol: HTTP 200, chart.error 'Not Found'."""
+    status_code = 200
+    def get(self, *a, **k):
+        return self
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"chart": {"result": None, "error": {
+            "code": "Not Found", "description": "No data found, symbol may be delisted"}}}
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    YahooFinanceAdapter._rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    yield
+    YahooFinanceAdapter._rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+
+
+def test_http_429_is_counted():
+    stats_before = YahooFinanceAdapter.rate_limit_stats()["count"]
+    YahooFinanceAdapter.fetch_meta("0700.HK", client=_RateLimitedClient())
+    YahooFinanceAdapter.fetch_bars("0700.HK", timeframe="15m", client=_RateLimitedClient())
+    stats = YahooFinanceAdapter.rate_limit_stats()
+    assert stats["count"] == stats_before + 2
+    assert stats["consecutive"] == 2
+    assert stats["last_ts"] > 0
+
+
+def test_edge_disguise_is_counted_but_delisted_is_not():
+    YahooFinanceAdapter.fetch_bars("0700.HK", timeframe="15m", client=_EdgeDisguiseClient())
+    assert YahooFinanceAdapter.rate_limit_stats()["count"] == 1, "the Edge disguise is a throttle signal"
+
+    # A real delisting must not pollute the throttle counter: the chart edge
+    # and an ops alarm would otherwise fire for a dead ticker.
+    YahooFinanceAdapter.fetch_bars("DEAD.SYM", timeframe="15m", client=_DelistedClient())
+    stats = YahooFinanceAdapter.rate_limit_stats()
+    assert stats["count"] == 1
+    assert stats["consecutive"] == 0, "a non-throttle response resets the streak"
+
+
+def test_success_resets_consecutive_streak():
+    YahooFinanceAdapter.fetch_bars("0700.HK", timeframe="15m", client=_EdgeDisguiseClient())
+    assert YahooFinanceAdapter.rate_limit_stats()["consecutive"] == 1
+
+    YahooFinanceAdapter.fetch_bars("0700.HK", timeframe="15m",
+                                   client=_DelistedClient())
+    assert YahooFinanceAdapter.rate_limit_stats()["consecutive"] == 0
+    assert YahooFinanceAdapter.rate_limit_stats()["count"] == 1, "total counts history, streak counts the fire"

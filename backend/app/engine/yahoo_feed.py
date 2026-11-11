@@ -407,6 +407,10 @@ class YahooQuoteFeed:
 
         There is no socket to report: this feed is a poller, so the useful
         facts are whether it is running and how many symbols it is watching.
+        ``rate_limit`` carries Yahoo's IP throttling signal (real 429s and the
+        "possibly delisted" disguise): on a shared-VPS exit IP this is the one
+        upstream failure mode that silences the whole feed at once, so it is
+        counted rather than left as a log line.
         """
         with self._lock:
             watching = len(set(self._active) | set(self._on_demand))
@@ -415,6 +419,7 @@ class YahooQuoteFeed:
             "enabled": bool(self._enabled),
             "running": bool(self._running),
             "watching": watching,
+            "rate_limit": YahooFinanceAdapter.rate_limit_stats(),
         }
 
     async def _poll_loop(self) -> None:

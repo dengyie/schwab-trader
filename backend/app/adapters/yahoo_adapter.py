@@ -63,6 +63,47 @@ class YahooFinanceAdapter:
                 pass
             cls._shared_client = None
 
+    # -- IP throttling observability ---------------------------------------
+    # Yahoo has no official rate-limit contract: it throttles per IP, and a
+    # 429 disguises itself as "possibly delisted" / an Edge error inside an
+    # HTTP 200 (yfinance #2284/#2297/#2721). The feed's cache discipline keeps
+    # request volume far below the community thresholds, but when the VPS
+    # exit IP does get throttled the whole intl feed goes quiet at once, so
+    # the signal must be countable and visible, not just a log line.
+    _rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+
+    @classmethod
+    def record_rate_limit(cls, detail: str) -> None:
+        """Count one throttled upstream response, real or disguised."""
+        import time as _time
+
+        stats = cls._rate_limit
+        stats["count"] += 1
+        stats["consecutive"] += 1
+        stats["last_ts"] = _time.time()
+        logger.warning("Yahoo rate limit signal (%s): %s", stats["count"], detail)
+
+    @classmethod
+    def record_success(cls) -> None:
+        cls._rate_limit["consecutive"] = 0
+
+    @classmethod
+    def rate_limit_stats(cls) -> Dict[str, object]:
+        return dict(cls._rate_limit)
+
+    @staticmethod
+    def _looks_rate_limited(error: Dict[str, object]) -> bool:
+        """A chart.error payload that is the 429 disguise, not a bad symbol.
+
+        Yahoo serves HTTP 200 with ``chart.error`` when throttled; the tell is
+        the Edge/Too-Many-Requests wording (the same text yfinance's crumb
+        path surfaces). A genuinely delisted symbol yields "Not Found" etc.
+        """
+        code = str(error.get("code", ""))
+        description = str(error.get("description", ""))
+        text = f"{code} {description}".lower()
+        return "too many requests" in text or "edge" in text
+
     @classmethod
     def fetch_meta(
         cls, symbol: str, client: Optional[httpx.Client] = None
@@ -84,9 +125,22 @@ class YahooFinanceAdapter:
             payload = resp.json()
             results = payload.get("chart", {}).get("result") or []
             if not results:
+                # HTTP 200 but no result: either a dead symbol or the 429
+                # disguise — chart.error tells them apart.
+                error = payload.get("chart", {}).get("error") or {}
+                if cls._looks_rate_limited(error):
+                    cls.record_rate_limit(f"meta {sym}: {error.get('code')}: {error.get('description')}")
+                else:
+                    cls.record_success()
                 return None
             meta = results[0].get("meta") or {}
+            cls.record_success()
             return meta if meta else None
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 429:
+                cls.record_rate_limit(f"meta {sym}: HTTP 429")
+            logger.warning("YahooFinanceAdapter fetch_meta error for %s: %s", sym, exc)
+            return None
         except Exception as exc:
             logger.warning("YahooFinanceAdapter fetch_meta error for %s: %s", sym, exc)
             return None
@@ -139,7 +193,15 @@ class YahooFinanceAdapter:
             chart = data.get("chart", {})
             result_list = chart.get("result")
             if not result_list:
+                # HTTP 200 but no result: a dead symbol — or the 429
+                # disguise, which chart.error distinguishes.
+                error = chart.get("error") or {}
+                if cls._looks_rate_limited(error):
+                    cls.record_rate_limit(f"bars {sym} {timeframe}: {error.get('code')}: {error.get('description')}")
+                else:
+                    cls.record_success()
                 return []
+            cls.record_success()
 
             res = result_list[0]
             timestamps = res.get("timestamp", [])
@@ -185,6 +247,13 @@ class YahooFinanceAdapter:
                 )
 
             return raw_bars
+        except httpx.HTTPStatusError as e:
+            # The explicit throttle response, before it blends into the
+            # generic warning below.
+            if e.response is not None and e.response.status_code == 429:
+                cls.record_rate_limit(f"bars {sym} {timeframe}: HTTP 429")
+            logger.warning("YahooFinanceAdapter fetch_bars error for %s (%s): %s", sym, timeframe, e)
+            return []
         except Exception as e:
             logger.warning("YahooFinanceAdapter fetch_bars error for %s (%s): %s", sym, timeframe, e)
             return []

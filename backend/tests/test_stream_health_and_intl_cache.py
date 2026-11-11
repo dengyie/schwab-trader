@@ -479,3 +479,23 @@ def test_health_payload_runs_the_real_composite_probe():
     assert body["feeds"]["us"]["quota_exceeded"] is True
     assert body["feeds"]["intl"]["enabled"] is True
     assert body["degraded"] == ["market_stream_quota_exceeded"]
+
+
+# -- Yahoo IP-throttle observability ----------------------------------------
+def test_intl_health_reports_yahoo_rate_limit_stats(yahoo):
+    """The throttle signal must reach the health payload, not die in the log.
+
+    Yahoo throttles per exit IP and disguises 429s as "possibly delisted";
+    when the VPS IP gets limited the whole intl feed goes quiet at once, so
+    feeds.intl.health() is where ops looks first — and the counter must be
+    there (§7.12 待办的落地).
+    """
+    feed = yahoo()
+    assert feed.health()["rate_limit"] == {"count": 0, "consecutive": 0, "last_ts": 0.0}
+
+    YahooFinanceAdapter.record_rate_limit("bars 0700.HK 15m: HTTP 429")
+    stats = feed.health()["rate_limit"]
+    assert stats["count"] == 1 and stats["consecutive"] == 1 and stats["last_ts"] > 0
+
+    YahooFinanceAdapter.record_success()
+    assert feed.health()["rate_limit"]["consecutive"] == 0, "streak clears, total keeps history"
