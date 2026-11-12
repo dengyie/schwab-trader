@@ -490,8 +490,8 @@ export function PriceChart() {
           secondsVisible: false,
           borderColor: CHART_COLORS.border,
           rightOffset: 12,
-          barSpacing: 8,
-          minBarSpacing: 1,
+          // library 默认 0.5：fit 全跨度 15m 序列（~0.72px/根）不被下限挡住。
+          minBarSpacing: 0.5,
           fixLeftEdge: false,
           fixRightEdge: false,
         },
@@ -709,24 +709,16 @@ export function PriceChart() {
   // fitContent 在数据根数超过容器宽度时会被 minBarSpacing 钳制（814px 宽、
   // minBarSpacing=1 只能显示 813 根）：预填两个月的 15m 序列后 fit 的几何
   // 结果就是"从中间某根开始"，用户看到的仍是约一个月——历史进了序列却
-  // 永远在视口左侧之外。fit 的 barSpacing=width/(count+rightOffset) 是双向
-  // clamp（下限 minBarSpacing、上限 maxBarSpacing），所以顺序必须是：
-  // 先完全解除下限（library 默认 0=不钳）→ fit 落到真实 barSpacing →
-  // 再把下限略收在 fit 值之下（保住 fit 成果，同时保留后续缩放下限）。
-  // 注意不能在 fit 前预设下限：此刻 width 可能尚未定稿（价格轴占位在
-  // 之后才发生），预设值偏大就会反过来钳住 fit 本身（线上实测踩过）。
+  // 永远在视口左侧之外。fit 的 barSpacing=width/(count+rightOffset) 会被
+  // minBarSpacing 从下方钳制，所以 fit 前把下限恢复到 library 默认 0.5
+  // （fit 需要的 ~0.72 > 0.5 天然不挡；手动缩小仍受 0.5 保护）。
+  // 不能在 fit 后把下限钉到 fitted 值：fit 可能发生在小窗口（bs=8），
+  // 钉死 7.84 后历史合并的 fit 反而被钳回小视口（线上实测踩过）。
   const fitFullSpan = useCallback(() => {
     const ts = mainChartApiRef.current?.timeScale();
     if (!ts) return;
-    const count = klinesRef.current.length;
-    ts.applyOptions({ minBarSpacing: 0 });
+    ts.applyOptions({ minBarSpacing: 0.5 });
     ts.fitContent();
-    if (count > 1) {
-      // fit 后 barSpacing 已是 width/(count+rightOffset) 的精确值；把它
-      // 原样设为下限（clamp 双向相等 ⇒ 不再变动，轻微缩小防浮点抖动）。
-      const fitted = ts.options().barSpacing;
-      if (fitted > 0) ts.applyOptions({ minBarSpacing: fitted * 0.98 });
-    }
   }, []);
 
   // 更新主数据 (仅在首度加载或主动重置时调用 fitContent，保护用户缩放与手势操作)
