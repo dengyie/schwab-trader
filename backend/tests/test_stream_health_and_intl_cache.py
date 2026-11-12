@@ -523,6 +523,22 @@ def test_us_stream_health_reports_daily_fallback_stats(monkeypatch):
     assert set(stats) == {"cached_symbols", "last_error"}
     assert stats["cached_symbols"] == 0 and stats["last_error"] is None
 
+
+def test_us_stream_health_reports_deep_hist_error_stats(monkeypatch):
+    """The deep-history chain's HTTP failures must be visible in /api/health:
+    its failure mode is chart holes, not an exception any probe would see."""
+    monkeypatch.setattr(AlpacaMarketFeedService, "_preload_historical_bars_sync", lambda self: None)
+    feed = AlpacaMarketFeedService(initial_symbols=["SPY"], api_key="k", api_secret="s")
+    AlpacaMarketFeedService._deep_hist_errors.update(
+        {"count": 0, "consecutive": 0, "last_ts": 0.0})
+
+    assert feed.stream_health()["deep_hist_errors"] == \
+        {"count": 0, "consecutive": 0, "last_ts": 0.0}
+
+    AlpacaMarketFeedService.record_deep_hist_error(429)
+    stats = feed.stream_health()["deep_hist_errors"]
+    assert stats["count"] == 1 and stats["consecutive"] == 1 and stats["last_ts"] > 0
+
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
     def dead_scan(sym):
         raise ConnectionError("dataset unreachable")

@@ -40,6 +40,8 @@ def feed(monkeypatch):
                         lambda self: None)
     monkeypatch.setattr(AlpacaMarketFeedService, "refresh_daily_stats",
                         lambda self, *a, **k: None)
+    AlpacaMarketFeedService._deep_hist_errors.update(
+        {"count": 0, "consecutive": 0, "last_ts": 0.0})
     return AlpacaMarketFeedService(initial_symbols=["QQQ"], api_key="k",
                                    api_secret="s")
 
@@ -122,8 +124,11 @@ def test_alpaca_page_keeps_has_more_contract(feed):
 
 
 def test_fetch_alpaca_hist_pages_to_window_end(feed, monkeypatch):
-    """next_page_token chains until exhausted; end is shifted so the window
-    stays strictly < before despite Alpaca's inclusive bound."""
+    """next_page_token chains until exhaustion — past the naive 10-page
+    bound (measured reality: a response holds ~750 bars, not limit=10000,
+    so a 366d window needs more than 10 pages) — and the gathered window
+    must REACH the cursor: the newest bar abuts ``before`` within one
+    bucket, otherwise no later page could ever fill the hole."""
 
     class _Resp:
         status_code = 200
@@ -133,12 +138,12 @@ def test_fetch_alpaca_hist_pages_to_window_end(feed, monkeypatch):
             return self._p
 
     class _Client:
-        def __init__(self, pages):
-            self.pages = list(pages)
+        def __init__(self, maker):
+            self.maker = maker
             self.calls = []
         def get(self, url, params=None, **k):
             self.calls.append(dict(params or {}))
-            return _Resp(self.pages.pop(0))
+            return _Resp(self.maker(len(self.calls)))
 
     class _Ctx:
         def __init__(self, inner): self.inner = inner
@@ -146,22 +151,97 @@ def test_fetch_alpaca_hist_pages_to_window_end(feed, monkeypatch):
         def __exit__(self, *a): return False
 
     before = NOW - 90 * 86400
-    t0 = before - 10001 * 900  # room for 10000 page-1 bars ending at before-1800
-    page1 = {"bars": {"QQQ": [{"t": datetime.fromtimestamp(t, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                               "o": 680, "h": 685, "l": 675, "c": 681, "v": 100}
-                              for t in range(t0, t0 + 10000 * 900, 900)]},
-             "next_page_token": "T2"}
-    page2 = {"bars": {"QQQ": [{"t": datetime.fromtimestamp(before - 900, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                               "o": 680, "h": 685, "l": 675, "c": 681, "v": 100}]},
-             "next_page_token": None}
-    client = _Client([page1, page2])
+    BUCKET = 900
+    N_PAGES = 12  # crosses the old fixed cap of 10
+    PER_PAGE = 700  # measured IEX reality: far below limit=10000
+    t_end = before - BUCKET  # newest bar the chain can return
+    total = N_PAGES * PER_PAGE
+    t_start = t_end - (total - 1) * BUCKET
+
+    def page(n):  # 1-based
+        times = range(t_start + (n - 1) * PER_PAGE * BUCKET,
+                      t_start + n * PER_PAGE * BUCKET, BUCKET)
+        payload = {"bars": {"QQQ": [
+            {"t": datetime.fromtimestamp(t, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+             "o": 680, "h": 685, "l": 675, "c": 681, "v": 100}
+            for t in times]}}
+        if n < N_PAGES:
+            payload["next_page_token"] = f"T{n + 1}"
+        return payload
+
+    client = _Client(page)
     monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client",
                         lambda *a, **k: _Ctx(client))
 
-    out = feed._fetch_alpaca_hist("QQQ", "15m", t0, before)
-    # page1's 10000 bars + page2's final bar; every bar strictly < before.
-    assert len(out) == 10001
+    out = feed._fetch_alpaca_hist("QQQ", "15m", t_start, before)
+    assert len(out) == total
     assert all(b.time < before for b in out)
-    # page_token chained the second request.
-    assert len(client.calls) == 2
-    assert client.calls[1].get("page_token") == "T2"
+    # Window continuity: the newest gathered bar abuts the cursor.
+    assert max(b.time for b in out) == t_end
+    # The chain walked every page via the token.
+    assert len(client.calls) == N_PAGES
+    for i, call in enumerate(client.calls[1:], start=2):
+        assert call.get("page_token") == f"T{i}"
+
+
+def test_fetch_alpaca_hist_http_error_raises(feed, monkeypatch):
+    """A non-200 anywhere in the chain raises (caller cool-downs instead of
+    caching an empty segment as a fake physical boundary) and is counted."""
+
+    class _Resp:
+        status_code = 500
+        def json(self):
+            return {}
+
+    class _Client:
+        def get(self, url, params=None, **k):
+            return _Resp()
+
+    class _Ctx:
+        def __init__(self, inner): self.inner = inner
+        def __enter__(self): return self.inner
+        def __exit__(self, *a): return False
+
+    before = NOW - 90 * 86400
+    monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client",
+                        lambda *a, **k: _Ctx(_Client()))
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        feed._fetch_alpaca_hist("QQQ", "15m", before - 86400, before)
+    stats = AlpacaMarketFeedService.deep_hist_error_stats()
+    assert stats["count"] == 1 and stats["consecutive"] == 1
+    # And the failure must NOT be cached as an empty segment: it reaches
+    # the caller as an exception, which cool-downs the key instead.
+    with patch.object(feed, "_fetch_alpaca_hist",
+                      side_effect=RuntimeError("HTTP 500")), \
+         patch.object(YahooFinanceAdapter, "fetch_bars") as yahoo:
+        out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
+    yahoo.assert_not_called()
+    assert out is None
+    assert feed._bar_cache.get("QQQ", "15m<h%d" % before) is None
+
+
+def test_deep_hist_success_resets_consecutive(feed, monkeypatch):
+    AlpacaMarketFeedService.record_deep_hist_error(429)
+    AlpacaMarketFeedService.record_deep_hist_error(429)
+    assert AlpacaMarketFeedService.deep_hist_error_stats()["consecutive"] == 2
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"bars": {"QQQ": []}}  # empty page, still a success
+
+    class _Client:
+        def get(self, url, params=None, **k):
+            return _Resp()
+
+    class _Ctx:
+        def __init__(self, inner): self.inner = inner
+        def __enter__(self): return self.inner
+        def __exit__(self, *a): return False
+
+    before = NOW - 90 * 86400
+    monkeypatch.setattr("app.engine.alpaca_market_feed.httpx.Client",
+                        lambda *a, **k: _Ctx(_Client()))
+    feed._fetch_alpaca_hist("QQQ", "15m", before - 86400, before)
+    stats = AlpacaMarketFeedService.deep_hist_error_stats()
+    assert stats["count"] == 2 and stats["consecutive"] == 0

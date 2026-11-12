@@ -355,6 +355,11 @@ class AlpacaMarketFeedService:
             # broken span contract (e.g. a tightened 59d ceiling blanking
             # every 5m/15m window) is visible on the US side as well.
             "yahoo_http_errors": YahooFinanceAdapter.http_error_stats(),
+            # Same story for the deep-history archive: the paging chain
+            # serves everything past Yahoo's 59d ceiling, and its failure
+            # mode (HTTP error mid-chain) is chart holes, not an exception
+            # the probe would see.
+            "deep_hist_errors": self.deep_hist_error_stats(),
         }
 
     def _preload_historical_bars_sync(self) -> None:
@@ -669,10 +674,19 @@ class AlpacaMarketFeedService:
 
         Alpaca's ``end`` is inclusive while the segment contract is strictly
         ``time < before``, so the bound is shifted one second. The whole
-        window is gathered (``limit`` maxes at 10000/page; ``next_page_token``
-        chains the rest) and the caller trims to the page contract, so
+        window is gathered and the caller trims to the page contract, so
         ``X-Bars-Has-More`` keeps meaning "this window is longer than one
         page" — not "the HTTP page was full".
+
+        The chain MUST run to exhaustion: the per-response page is much
+        smaller than the requested ``limit`` (measured 2026-11-13: ~750
+        bars per response on QQQ 15m regardless of limit=10000), so a
+        fixed small page count silently truncates the 366d window and
+        strands a multi-month hole next to the cursor that no later page
+        can fill (paging only walks older). Alpaca always terminates the
+        token chain; the cap only guards a runaway loop. Any HTTP failure
+        raises — the caller cool-downs instead of caching, because a
+        partial gather cached as a real segment would be a fake boundary.
         """
         tf_map = {"5m": "5Min", "15m": "15Min"}
         interval = tf_map[tf]
@@ -685,21 +699,53 @@ class AlpacaMarketFeedService:
             "adjustment": "split",
         }
         bars: List[Bar] = []
+        pages = 0
         with httpx.Client(headers=self.headers, timeout=30.0) as client:
-            for _ in range(10):  # window wider than 100k bars would be absurd
+            while True:
                 resp = client.get(f"{self.data_base_url}/stocks/bars", params=params)
                 if resp.status_code != 200:
-                    logger.warning("Alpaca deep hist HTTP %s for %s %s<%s",
-                                   resp.status_code, sym, tf, before)
-                    return []
+                    self.record_deep_hist_error(resp.status_code)
+                    raise RuntimeError(
+                        f"Alpaca deep hist HTTP {resp.status_code} for {sym} {tf} <{before}")
                 payload = resp.json()
+                pages += 1
                 bars.extend(AlpacaDataAdapter.parse_rest_bars_response(payload, symbol=sym))
                 token = payload.get("next_page_token")
                 if not token:
                     break
+                if pages >= 100:  # 100 pages ≈ 75k bars — no real 366d window needs this
+                    self.record_deep_hist_error(0)
+                    raise RuntimeError(
+                        f"Alpaca deep hist token chain did not terminate for {sym} {tf} <{before}")
                 params["page_token"] = token
+        self.deep_hist_ok()
         bars = [b for b in bars if b.time < before]
         return bars
+
+    # Deep-history HTTP-failure observability (mirror of the Yahoo adapter's
+    # counter): a broken archive or a rate-limited chain must be visible in
+    # /api/health, not only as multi-month chart holes that log lines.
+    _deep_hist_errors = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    _deep_hist_lock = threading.Lock()
+
+    @classmethod
+    def record_deep_hist_error(cls, status: int) -> None:
+        with cls._deep_hist_lock:
+            stats = cls._deep_hist_errors
+            stats["count"] += 1
+            stats["consecutive"] += 1
+            stats["last_ts"] = time.time()
+
+    @classmethod
+    def deep_hist_ok(cls) -> None:
+        """A fully gathered chain: the upstream is answering — reset the streak."""
+        with cls._deep_hist_lock:
+            cls._deep_hist_errors["consecutive"] = 0
+
+    @classmethod
+    def deep_hist_error_stats(cls) -> Dict[str, Any]:
+        with cls._deep_hist_lock:
+            return dict(cls._deep_hist_errors)
 
     def _schedule_hist_refresh(self, sym: str, tf: str, seg_tf: str, before: int) -> None:
         if self._bar_cache.is_cooling(sym, seg_tf):
