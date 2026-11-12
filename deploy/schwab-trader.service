@@ -1,0 +1,50 @@
+[Unit]
+Description=Schwab & Alpaca Trader Hub Quant Service
+After=network.target
+
+[Service]
+Type=simple
+User=mango
+Group=mango
+WorkingDirectory=/opt/schwab-trader/backend
+Environment="PYTHONPATH=/opt/schwab-trader/backend"
+Environment="MARKET_DATA_PROVIDER=alpaca"
+Environment="BROKER_PROVIDER=alpaca_paper"
+EnvironmentFile=/etc/schwab-trader.env
+Environment="STATIC_DIR=/opt/schwab-trader/frontend/dist"
+ExecStart=/opt/schwab-trader/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8800 --workers 1
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# --- Resource protection (added 2026-11-12) ---------------------------------
+# Root cause: the VPS has 958MB RAM and shares the host with ad-hoc dev
+# loads (e.g. `go test` compiling modernc.org/libc on the same box). Under
+# that pressure the kernel swapped this service out (79MB in swap); the main
+# thread then stalled in do_swap_page on EVERY request — health/bars timed
+# out at 30s+ while the process itself was "active" and the journal was
+# clean. Fix: protect the service in the cgroup hierarchy instead of
+# hoping the box stays quiet.
+#
+# MemoryLow: when global reclaim kicks in, OTHER cgroups reclaim first;
+# this service's working set stays resident. 400M is ~2/3 of peak RSS
+# headroom (observed RSS ~65M; 400M leaves room for burst without starving
+# the rest of the box since MemoryLow is not a reservation).
+MemoryLow=400M
+# Never let this service be the OOM victim of someone else's runaway test:
+# oom_score_adj -500 puts it near the back of the badness() queue.
+OOMScoreAdjust=-500
+# Best-effort CPU/IO weights (default 100): dev loads get throttled first
+# when they compete, this service keeps serving.
+CPUWeight=200
+IOWeight=200
+# Cap in-service swap: swapping this process out is what made it unresponsive,
+# so keep its own swap use bounded. 256M (the unit default here) still allowed
+# 100M+ to accumulate over repeated storms and left the main thread stalling
+# in do_swap_page; the live-tuned value is 64M — enough burst headroom for a
+# restart, small enough that reclaim swaps the *file cache* back in instead.
+MemorySwapMax=64M
+
+[Install]
+WantedBy=multi-user.target
