@@ -234,8 +234,10 @@ class _OkChartClient:
 @pytest.fixture(autouse=True)
 def _reset_rate_limit():
     YahooFinanceAdapter._rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    YahooFinanceAdapter._http_errors = {"count": 0, "consecutive": 0, "last_ts": 0.0}
     yield
     YahooFinanceAdapter._rate_limit = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    YahooFinanceAdapter._http_errors = {"count": 0, "consecutive": 0, "last_ts": 0.0}
 
 
 def test_http_429_is_counted():
@@ -268,6 +270,43 @@ def test_success_resets_consecutive_streak():
                                    client=_DelistedClient())
     assert YahooFinanceAdapter.rate_limit_stats()["consecutive"] == 0
     assert YahooFinanceAdapter.rate_limit_stats()["count"] == 1, "total counts history, streak counts the fire"
+
+
+class _ServerErrorClient:
+    """Yahoo answering HTTP 500 — a non-throttle HTTP contract break."""
+    status_code = 500
+    def get(self, *a, **k):
+        return self
+    def raise_for_status(self):
+        import httpx
+        req = httpx.Request("GET", "https://query1.finance.yahoo.com/x")
+        resp = httpx.Response(500, request=req)
+        raise httpx.HTTPStatusError("500", request=req, response=resp)
+    def json(self):
+        return {}
+
+
+def test_http_status_error_is_counted_and_success_resets_it():
+    """The fresh-window spans are a *measured* contract (59d ceiling). The day
+    Yahoo tightens it, every 5m/15m fresh fetch 422s at once — that drift must
+    surface in health, not die in a log line (F3, review of f59ea03)."""
+    YahooFinanceAdapter.fetch_bars("SPY", "15m", client=_ServerErrorClient())
+    stats = YahooFinanceAdapter.http_error_stats()
+    assert stats["count"] == 1 and stats["consecutive"] == 1 and stats["last_ts"] > 0
+
+    # A 429 belongs to the throttle counter, not this one.
+    YahooFinanceAdapter.fetch_bars("0700.HK", timeframe="15m", client=_RateLimitedClient())
+    assert YahooFinanceAdapter.http_error_stats()["count"] == 1
+    assert YahooFinanceAdapter.rate_limit_stats()["count"] == 1
+
+    YahooFinanceAdapter.fetch_bars("SPY", "15m", client=_ServerErrorClient())
+    assert YahooFinanceAdapter.http_error_stats()["consecutive"] == 2
+
+    # Empty-but-200 is a data question (delisting), not a contract break;
+    # and a success resets the streak.
+    YahooFinanceAdapter.fetch_bars("DEAD.SYM", timeframe="15m", client=_DelistedClient())
+    assert YahooFinanceAdapter.http_error_stats()["count"] == 2
+    assert YahooFinanceAdapter.http_error_stats()["consecutive"] == 0
 
 
 def test_fetch_bars_explicit_period1_defaults_period2_to_now():
@@ -329,8 +368,10 @@ def test_intraday_seed_windows_fetch_the_full_ceiling_span():
     bars = YahooFinanceAdapter.fetch_bars("SPY", "15m", client=_CaptureClient())
     assert len(bars) == 1
     assert "range" not in captured
-    span = captured["period2"] - captured["period1"]
-    assert span == FRESH_WINDOW_SPAN_SECONDS["15m"]
+    # Literal, not the constant: the point is to catch the constant itself
+    # drifting past the measured ceiling (60d already 422s).
+    assert captured["period2"] - captured["period1"] == 59 * 86400
+    assert FRESH_WINDOW_SPAN_SECONDS == {"5m": 59 * 86400, "15m": 59 * 86400}
     assert captured["period2"] > time.time() - 60
 
     # Other range keys are untouched.

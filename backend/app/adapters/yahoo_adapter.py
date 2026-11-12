@@ -96,11 +96,39 @@ class YahooFinanceAdapter:
     def record_success(cls) -> None:
         with cls._rate_limit_lock:
             cls._rate_limit["consecutive"] = 0
+        with cls._http_errors_lock:
+            cls._http_errors["consecutive"] = 0
 
     @classmethod
     def rate_limit_stats(cls) -> Dict[str, object]:
         with cls._rate_limit_lock:
             return dict(cls._rate_limit)
+
+    # -- HTTP failure observability ----------------------------------------
+    # The fresh-window spans (FRESH_WINDOW_SPAN_SECONDS) are a *measured*
+    # upstream contract, not a documented one: the day Yahoo tightens the
+    # 59d ceiling, every 5m/15m fresh fetch starts 422-ing and those charts
+    # go blank — quietly, since a failed fetch only leaves a log line. This
+    # counter (consecutive, so a one-off blip reads as noise) makes that
+    # drift visible in health the same way the 429 counter makes throttling
+    # visible. HTTP-level failures only: an empty-but-200 answer is a data
+    # question (delisting, coverage), not a contract break.
+    _http_errors = {"count": 0, "consecutive": 0, "last_ts": 0.0}
+    _http_errors_lock = threading.Lock()
+
+    @classmethod
+    def record_http_error(cls, status: int, detail: str) -> None:
+        with cls._http_errors_lock:
+            stats = cls._http_errors
+            stats["count"] += 1
+            stats["consecutive"] += 1
+            stats["last_ts"] = time.time()
+        logger.warning("Yahoo HTTP %s (%s): %s", status, stats["consecutive"], detail)
+
+    @classmethod
+    def http_error_stats(cls) -> Dict[str, object]:
+        with cls._http_errors_lock:
+            return dict(cls._http_errors)
 
     @staticmethod
     def _looks_rate_limited(error: Dict[str, object]) -> bool:
@@ -276,10 +304,13 @@ class YahooFinanceAdapter:
 
             return raw_bars
         except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else 0
             # The explicit throttle response, before it blends into the
             # generic warning below.
-            if e.response is not None and e.response.status_code == 429:
+            if status == 429:
                 cls.record_rate_limit(f"bars {sym} {timeframe}: HTTP 429")
+            elif status:
+                cls.record_http_error(status, f"bars {sym} {timeframe}")
             logger.warning("YahooFinanceAdapter fetch_bars error for %s (%s): %s", sym, timeframe, e)
             return []
         except Exception as e:

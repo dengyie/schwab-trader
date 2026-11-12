@@ -405,16 +405,22 @@ export function PriceChart() {
   const [prefillFitTick, setPrefillFitTick] = useState(0);
   // 预取提示：慢网/多页补载（1h 首屏 6 个月 → 2 年）时让用户知道更早的
   // 历史正在到位，而不是误以为当前窗口就是全部。快路径（段缓存命中）
-  // <500ms 完成则不显示，避免角标闪烁。
+  // <500ms 完成则不显示，避免角标闪烁。token 守卫并发：切标的/周期会
+  // 叠出第二个 prefill，旧循环的 finally 绝不许清掉新循环的定时器
+  // （否则新序列补载期间角标丢失）。
   const [prefillVisible, setPrefillVisible] = useState(false);
   const prefillHintTimerRef = useRef<number | null>(null);
+  const prefillTokenRef = useRef(0);
   const PREFILL_PAGE_BUDGET = 6;
   prefillRef.current = async () => {
     if (!hasMoreRef.current) return;
     let lastOldest = klinesRef.current[0]?.time ?? 0;
     let grew = false;
+    const token = ++prefillTokenRef.current;
     if (prefillHintTimerRef.current !== null) window.clearTimeout(prefillHintTimerRef.current);
-    prefillHintTimerRef.current = window.setTimeout(() => setPrefillVisible(true), 500);
+    prefillHintTimerRef.current = window.setTimeout(() => {
+      if (prefillTokenRef.current === token) setPrefillVisible(true);
+    }, 500);
     try {
       for (let page = 0; page < PREFILL_PAGE_BUDGET && hasMoreRef.current; page++) {
         await loadOlderRef.current?.();
@@ -424,11 +430,13 @@ export function PriceChart() {
         grew = true;
       }
     } finally {
-      if (prefillHintTimerRef.current !== null) {
-        window.clearTimeout(prefillHintTimerRef.current);
-        prefillHintTimerRef.current = null;
+      if (prefillTokenRef.current === token) {
+        if (prefillHintTimerRef.current !== null) {
+          window.clearTimeout(prefillHintTimerRef.current);
+          prefillHintTimerRef.current = null;
+        }
+        setPrefillVisible(false);
       }
-      setPrefillVisible(false);
     }
     if (grew) {
       prefillFitPendingRef.current = true;

@@ -342,6 +342,11 @@ class AlpacaMarketFeedService:
             # and the last upstream failure, so an outage is readable in
             # /api/health instead of only in the app log.
             "daily_fallback": defeatbeta_adapter.stats(),
+            # The intraday charts' actual upstream is Yahoo (Alpaca serves
+            # quotes/1m); surface its HTTP-failure counter here too so a
+            # broken span contract (e.g. a tightened 59d ceiling blanking
+            # every 5m/15m window) is visible on the US side as well.
+            "yahoo_http_errors": YahooFinanceAdapter.http_error_stats(),
         }
 
     def _preload_historical_bars_sync(self) -> None:

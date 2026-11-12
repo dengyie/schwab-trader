@@ -498,6 +498,16 @@ def test_intl_health_reports_yahoo_rate_limit_stats(yahoo):
     assert stats["count"] == 1 and stats["consecutive"] == 1 and stats["last_ts"] > 0
 
     YahooFinanceAdapter.record_success()
+
+
+def test_intl_health_reports_yahoo_http_error_stats(yahoo):
+    """Non-429 HTTP failures reach health too (the tightened-span drift case)."""
+    feed = yahoo()
+    assert feed.health()["http_errors"] == {"count": 0, "consecutive": 0, "last_ts": 0.0}
+
+    YahooFinanceAdapter.record_http_error(422, "bars SPY 15m")
+    stats = feed.health()["http_errors"]
+    assert stats["count"] == 1 and stats["consecutive"] == 1 and stats["last_ts"] > 0
     assert feed.health()["rate_limit"]["consecutive"] == 0, "streak clears, total keeps history"
 
 

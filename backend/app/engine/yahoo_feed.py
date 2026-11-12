@@ -410,7 +410,10 @@ class YahooQuoteFeed:
         ``rate_limit`` carries Yahoo's IP throttling signal (real 429s and the
         "possibly delisted" disguise): on a shared-VPS exit IP this is the one
         upstream failure mode that silences the whole feed at once, so it is
-        counted rather than left as a log line.
+        counted rather than left as a log line. ``http_errors`` carries the
+        same story for non-429 HTTP statuses — notably the day Yahoo tightens
+        a measured span contract (e.g. the 59d 5m/15m ceiling) and every
+        fresh fetch for those timeframes starts failing at once.
         """
         with self._lock:
             watching = len(set(self._active) | set(self._on_demand))
@@ -420,6 +423,7 @@ class YahooQuoteFeed:
             "running": bool(self._running),
             "watching": watching,
             "rate_limit": YahooFinanceAdapter.rate_limit_stats(),
+            "http_errors": YahooFinanceAdapter.http_error_stats(),
         }
 
     async def _poll_loop(self) -> None:
