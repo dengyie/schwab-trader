@@ -122,7 +122,11 @@ def reconcile_intraday_volume(
     11-05 15m bar carried 95M shares where the same 1h slot showed 11.7M.
     The 4h view inherits the error because it is aggregated from 1h bars.
     The 1d endpoint and ``daily_stats`` (regularMarketVolume) agree with each
-    other, so per venue-local day they are the authority.
+    other, so per venue-local day they are the authority. The intl feed
+    (HK/JP/CN) is not covered here, deliberately: an upstream audit found
+    zero inflated days across 0700.HK/7203.T/600519.SS (410 trading days,
+    sums under-reporting rather than inflating), so there is nothing to
+    reconcile for the YahooQuoteFeed path yet.
 
     Each day is checked independently: when its bars sum to more than
     ``oversize_factor`` × the authoritative total, that day's bars are scaled
@@ -442,7 +446,11 @@ class AlpacaMarketFeedService:
         volume = stats.get("volume")
         if volume and stats.get("consolidated"):
             today = datetime.now(tz).strftime("%Y-%m-%d")
-            authority[today] = float(volume)
+            # A session total only grows, so whichever source reports more is
+            # the better one: intraday the stats entry is the fresher running
+            # total, after the close a stale pre-close entry must not drag the
+            # cached 1d bar's final figure down.
+            authority[today] = max(authority.get(today, 0.0), float(volume))
         return authority
 
     def _reconcile_volume(self, sym: str, tf: str, bars: List[Bar]) -> List[Bar]:

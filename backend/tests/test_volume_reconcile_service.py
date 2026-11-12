@@ -66,6 +66,27 @@ def test_iex_fallback_stats_never_become_authority(feed):
     assert feed._volume_authority("QQQ") == {}
 
 
+def test_authority_prefers_the_larger_of_today_report(feed):
+    # A session total only grows. Intraday the stats entry is fresher and
+    # larger than the cached 1d bar; after the close a stale pre-close stats
+    # entry must not drag the 1d bar's final figure down — in both directions
+    # the larger of the two is the better authority.
+    day_ts = int(datetime.now(ET).replace(hour=14, minute=30, second=0,
+                                           microsecond=0).timestamp())
+    feed._cache_put("QQQ", "1d", [Bar(time=day_ts, open=680.0, high=686.0,
+                                      low=679.0, close=685.0,
+                                      volume=12_000_000.0)])
+    feed.daily_stats["QQQ"] = {"volume": 15_000_000.0, "consolidated": 1.0}
+    assert feed._volume_authority("QQQ")[TODAY] == 15_000_000.0
+
+    # Post-close: the 1d cache refetched the final figure while stats froze
+    # at its pre-close value.
+    feed._cache_put("QQQ", "1d", [Bar(time=day_ts, open=680.0, high=686.0,
+                                      low=679.0, close=685.0,
+                                      volume=21_000_000.0)])
+    assert feed._volume_authority("QQQ")[TODAY] == 21_000_000.0
+
+
 def test_fetch_upstream_scales_inflated_bars(feed, monkeypatch):
     bars = _bars(SESSION_TIMES, INFLATED_VOLS)
     monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars",
@@ -115,3 +136,43 @@ def test_fetch_hist_segment_scales_inflated_bars(feed, monkeypatch):
     before = SESSION_TIMES[-1] + 900
     out = feed._fetch_hist_segment("QQQ", "15m", "15m<%d" % before, before)
     assert abs(sum(b.volume for b in out) - QQQ_DAILY) <= len(out) / 2
+
+
+def test_fetch_upstream_scales_aggregated_4h(feed, monkeypatch):
+    # 4h is aggregated from 1h inside the adapter; the day sum lands on one
+    # fat bar and must still be reconciled on the fresh-window path.
+    bars = [Bar(time=SESSION_TIMES[0], open=680.0, high=686.0, low=679.0,
+                close=685.0, volume=352_400_000.0)]
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: bars)
+    _consolidated_today(feed)
+
+    out = feed._fetch_upstream("QQQ", "4h")
+    assert out[0].volume == QQQ_DAILY
+
+
+def test_stale_1d_cache_still_anchors_authority(feed, monkeypatch):
+    # A stale 1d series is still the per-day truth for past days (a close
+    # does not move); freshness must not gate the authority. Today's running
+    # total comes from stats instead.
+    old_ts = int(datetime.now(ET).replace(hour=14, minute=30, second=0,
+                                          microsecond=0).timestamp()) - 86400
+    feed._cache_put("QQQ", "1d", [Bar(time=old_ts, open=680.0, high=686.0,
+                                      low=679.0, close=685.0,
+                                      volume=20_000_000.0)],
+                    ts=0.0)  # fetched_at 0 → stale by any TTL
+    _consolidated_today(feed)
+
+    authority = feed._volume_authority("QQQ")
+    assert authority[YDAY] == 20_000_000.0
+    assert authority[TODAY] == QQQ_DAILY
+
+
+def test_unregistered_symbol_is_passthrough(feed, monkeypatch):
+    # A symbol with no 1d series and no daily_stats carries no authority —
+    # its bars must be passed through untouched (market_of falls back to US).
+    bars = _bars(SESSION_TIMES, INFLATED_VOLS)
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: bars)
+
+    assert feed._volume_authority("NOTAMARKET") == {}
+    out = feed._fetch_upstream("NOTAMARKET", "15m")
+    assert [b.volume for b in out] == INFLATED_VOLS
