@@ -106,6 +106,14 @@ INTRADAY_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h"})
 # total mid-session) from being rewritten on a guess.
 INTRADAY_VOLUME_OVERSIZED = 2.0
 
+# US intraday timeframes whose history continues past Yahoo's coverage
+# ceiling via the Alpaca IEX archive (free feed, measured 2026-11-13: 15m/5m
+# bars back to 2020-07-27 — five years; 1m stays on Yahoo's 7d window, which
+# already covers its whole upstream). The archive is IEX-only: OHLC is real
+# traded price, per-bar volume is ~2% of the consolidated tape — honest
+# under-reporting the reconciliation never rewrites.
+ALPACA_DEEP_HIST_TIMEFRAMES = frozenset({"5m", "15m"})
+
 
 def reconcile_intraday_volume(
     bars: List[Bar],
@@ -622,11 +630,24 @@ class AlpacaMarketFeedService:
             page_size = HIST_PAGE_BARS.get(tf, HIST_SEGMENT_BARS)
             span_days = TIMEFRAME_SPAN_DAYS.get(tf)
             oldest_allowed = int(time.time()) - span_days * 86400 if span_days else 0
+            alpaca_deep = (
+                span_days is not None and tf in ALPACA_DEEP_HIST_TIMEFRAMES
+                and market_of(sym).code == "US"
+                and oldest_allowed and before < oldest_allowed
+            )
             period1 = max(0, before - HIST_PAGE_SPAN_SECONDS)
-            if oldest_allowed and period1 < oldest_allowed:
-                period1 = oldest_allowed
-            bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
-            bars = [b for b in bars if b.time < before]
+            if alpaca_deep:
+                # Past Yahoo's coverage ceiling: this page can only come from
+                # the IEX archive (measured 2026-11-13: 15m/5m bars back to
+                # 2020-07). OHLC is real traded price; per-bar volume runs ~2%
+                # of the consolidated tape — under-reporting, which the
+                # reconciliation below deliberately never rewrites.
+                bars = self._fetch_alpaca_hist(sym, tf, period1, before)
+            else:
+                if oldest_allowed and period1 < oldest_allowed:
+                    period1 = oldest_allowed
+                bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
+                bars = [b for b in bars if b.time < before]
             # Reconcile before the page trim: a day split across the page
             # boundary would sum to less than its real total and could slip
             # past the threshold.
@@ -642,6 +663,43 @@ class AlpacaMarketFeedService:
             logger.warning("Yahoo hist segment failed for %s %s<%s: %s", sym, tf, before, err)
             self._bar_cache.cool_down(sym, seg_tf)
             return None
+
+    def _fetch_alpaca_hist(self, sym: str, tf: str, period1: int, before: int) -> List[Bar]:
+        """One deep-history window from the Alpaca IEX archive, paged to the end.
+
+        Alpaca's ``end`` is inclusive while the segment contract is strictly
+        ``time < before``, so the bound is shifted one second. The whole
+        window is gathered (``limit`` maxes at 10000/page; ``next_page_token``
+        chains the rest) and the caller trims to the page contract, so
+        ``X-Bars-Has-More`` keeps meaning "this window is longer than one
+        page" — not "the HTTP page was full".
+        """
+        tf_map = {"5m": "5Min", "15m": "15Min"}
+        interval = tf_map[tf]
+        params: Dict[str, Any] = {
+            "symbols": sym,
+            "timeframe": interval,
+            "start": datetime.fromtimestamp(period1, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": datetime.fromtimestamp(before - 1, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": "10000",
+            "adjustment": "split",
+        }
+        bars: List[Bar] = []
+        with httpx.Client(headers=self.headers, timeout=30.0) as client:
+            for _ in range(10):  # window wider than 100k bars would be absurd
+                resp = client.get(f"{self.data_base_url}/stocks/bars", params=params)
+                if resp.status_code != 200:
+                    logger.warning("Alpaca deep hist HTTP %s for %s %s<%s",
+                                   resp.status_code, sym, tf, before)
+                    return []
+                payload = resp.json()
+                bars.extend(AlpacaDataAdapter.parse_rest_bars_response(payload, symbol=sym))
+                token = payload.get("next_page_token")
+                if not token:
+                    break
+                params["page_token"] = token
+        bars = [b for b in bars if b.time < before]
+        return bars
 
     def _schedule_hist_refresh(self, sym: str, tf: str, seg_tf: str, before: int) -> None:
         if self._bar_cache.is_cooling(sym, seg_tf):
