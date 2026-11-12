@@ -11,6 +11,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Callable, Optional, Set, Tuple
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import httpx
 import websockets
 
@@ -94,6 +95,74 @@ def is_quota_rejection(message: str) -> bool:
     """
     text = (message or "").lower()
     return any(marker in text for marker in QUOTA_ERROR_MARKERS)
+
+
+# Timeframes whose upstream volume needs reconciliation against the daily
+# tape. 1d/1wk/1mo are excluded because they ARE the authority.
+INTRADAY_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h"})
+# A day whose intraday sum exceeds the authoritative total by more than this
+# factor is data corruption, not tape drift: it gets rescaled. The margin
+# keeps genuinely busy days (a late-day surge summing to 1.3x the running
+# total mid-session) from being rewritten on a guess.
+INTRADAY_VOLUME_OVERSIZED = 2.0
+
+
+def reconcile_intraday_volume(
+    bars: List[Bar],
+    volume_by_day: Dict[str, float],
+    tz_name: str,
+    *,
+    oversize_factor: float = INTRADAY_VOLUME_OVERSIZED,
+) -> List[Bar]:
+    """Scale down intraday days whose summed volume contradicts the daily tape.
+
+    Yahoo's intraday endpoints (15m/1h) inflate volume for some symbols —
+    measured 2026-11-12: QQQ's 15m bars summed to 374M shares against a real
+    session total of 21M (~18x) while SPY read a plausible 1.3x, and a single
+    11-05 15m bar carried 95M shares where the same 1h slot showed 11.7M.
+    The 4h view inherits the error because it is aggregated from 1h bars.
+    The 1d endpoint and ``daily_stats`` (regularMarketVolume) agree with each
+    other, so per venue-local day they are the authority.
+
+    Each day is checked independently: when its bars sum to more than
+    ``oversize_factor`` × the authoritative total, that day's bars are scaled
+    proportionally (factor = daily / summed), which preserves the intraday
+    shape — only the unit is wrong upstream. Days at or under the threshold
+    are left untouched (a mildly elevated sum may be real, and an
+    under-reporting day cannot be reconstructed from its own bars). Days with
+    no authoritative figure are passed through as-is.
+    """
+    if not bars or not volume_by_day:
+        return bars
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return bars
+
+    day_of: Dict[int, str] = {}
+    day_sum: Dict[str, float] = {}
+    for i, b in enumerate(bars):
+        if b.volume <= 0:
+            continue
+        day = datetime.fromtimestamp(b.time, tz=tz).strftime("%Y-%m-%d")
+        day_of[i] = day
+        day_sum[day] = day_sum.get(day, 0.0) + b.volume
+
+    factors: Dict[str, float] = {}
+    for day, total in day_sum.items():
+        authority = volume_by_day.get(day)
+        if authority and total > authority * oversize_factor:
+            factors[day] = authority / total
+    if not factors:
+        return bars
+
+    out: List[Bar] = []
+    for i, b in enumerate(bars):
+        day = day_of.get(i)
+        if day is not None and day in factors:
+            b = b.model_copy(update={"volume": round(b.volume * factors[day])})
+        out.append(b)
+    return out
 
 
 class AlpacaMarketFeedService:
@@ -347,6 +416,53 @@ class AlpacaMarketFeedService:
                 )
             return self._refresh_pool
 
+    def _volume_authority(self, sym: str) -> Dict[str, float]:
+        """Per-day authoritative session volumes, keyed by venue-local day.
+
+        The cached 1d series is the per-day truth (the 1d endpoint is not
+        subject to the intraday inflation — measured: QQQ's 11-12 1d bar
+        agrees with daily_stats' regularMarketVolume while its 15m bars run
+        18x). ``daily_stats`` covers today when no 1d series is cached yet,
+        but only in its consolidated form: the Alpaca snapshot fallback is a
+        single IEX venue (~2% of tape) and would shrink honest bars 50x.
+        Deliberately cache-only — never a network call inside a fetch path.
+        """
+        authority: Dict[str, float] = {}
+        try:
+            tz = ZoneInfo(market_of(sym).timezone)
+        except Exception:
+            return authority
+        entry = self._bar_cache.get(sym, "1d")
+        if entry and entry.bars:
+            for b in entry.bars:
+                if b.volume > 0:
+                    day = datetime.fromtimestamp(b.time, tz=tz).strftime("%Y-%m-%d")
+                    authority[day] = b.volume
+        stats = self.daily_stats.get(sym) or {}
+        volume = stats.get("volume")
+        if volume and stats.get("consolidated"):
+            today = datetime.now(tz).strftime("%Y-%m-%d")
+            authority[today] = float(volume)
+        return authority
+
+    def _reconcile_volume(self, sym: str, tf: str, bars: List[Bar]) -> List[Bar]:
+        """Guard every Yahoo-sourced intraday cache write (see the helper).
+
+        Runs on both the fresh-window and the historical-segment fetch paths,
+        which also covers 4h: the adapter aggregates it from 1h before this
+        sees the bars, and the per-day sums are identical.
+        """
+        if tf not in INTRADAY_TIMEFRAMES or not bars:
+            return bars
+        authority = self._volume_authority(sym)
+        if not authority:
+            return bars
+        try:
+            return reconcile_intraday_volume(bars, authority, market_of(sym).timezone)
+        except Exception as err:
+            logger.warning("Volume reconcile skipped for %s %s: %s", sym, tf, err)
+            return bars
+
     def _fetch_upstream(self, sym: str, tf: str) -> Optional[List[Bar]]:
         """Fetch one key and store it. The caller must own the refresh slot."""
         try:
@@ -371,6 +487,7 @@ class AlpacaMarketFeedService:
                         cutoff = time.time() - span
                         bars = [b for b in fallback[0] if b.time >= cutoff] or fallback[0]
             if bars:
+                bars = self._reconcile_volume(sym, tf, bars)
                 # NOTE: never write last_trade_prices here — a historical close
                 # must not overwrite a fresher live trade price.
                 self._cache_put(sym, tf, bars)
@@ -497,6 +614,10 @@ class AlpacaMarketFeedService:
                 period1 = oldest_allowed
             bars = YahooFinanceAdapter.fetch_bars(sym, timeframe=tf, period1=period1, period2=before)
             bars = [b for b in bars if b.time < before]
+            # Reconcile before the page trim: a day split across the page
+            # boundary would sum to less than its real total and could slip
+            # past the threshold.
+            bars = self._reconcile_volume(sym, tf, bars)
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:
