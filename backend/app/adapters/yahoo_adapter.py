@@ -12,7 +12,11 @@ from typing import List, Optional, Tuple, Dict
 from zoneinfo import ZoneInfo
 import httpx
 from app.models.trading import Bar
-from app.core.timeframes import TIMEFRAME_SECONDS, YAHOO_TIMEFRAME_MAP
+from app.core.timeframes import (
+    FRESH_WINDOW_SPAN_SECONDS,
+    TIMEFRAME_SECONDS,
+    YAHOO_TIMEFRAME_MAP,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +191,14 @@ class YahooFinanceAdapter:
             # explicit epoch window keeps true monthly), so whole-history keys
             # pass explicit bounds instead.
             params["period1"] = 0
+            params["period2"] = int(time.time())
+        elif tf_key in FRESH_WINDOW_SPAN_SECONDS:
+            # The range enum undershoots this timeframe's real coverage
+            # (15m/5m: "1mo" ≈ 31d vs a measured 59d ceiling, "3mo" 422s), so
+            # the fresh window is an explicit epoch window spanning the whole
+            # available history — one request, no truncated seed to page back.
+            span = FRESH_WINDOW_SPAN_SECONDS[tf_key]
+            params["period1"] = int(time.time()) - span
             params["period2"] = int(time.time())
         else:
             params["range"] = range_param

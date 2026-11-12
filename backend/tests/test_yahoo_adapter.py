@@ -8,6 +8,7 @@ import pytest
 import time
 from app.models.trading import Bar
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
+from app.core.timeframes import FRESH_WINDOW_SPAN_SECONDS, TIMEFRAME_SPAN_DAYS
 from app.engine.alpaca_market_feed import AlpacaMarketFeedService, MAX_CACHE_ENTRIES
 
 ET = ZoneInfo("America/New_York")
@@ -306,3 +307,42 @@ def test_whole_history_timeframes_fetch_via_explicit_periods():
     captured.clear()
     YahooFinanceAdapter.fetch_bars("SPY", "1wk", client=_CaptureClient())
     assert captured.get("range") == "10y" and "period1" not in captured
+
+
+def test_intraday_seed_windows_fetch_the_full_ceiling_span():
+    """Yahoo's range enum undershoots the 15m/5m coverage ceiling ("1mo" ≈
+    31d, "3mo" 422s, measured 59d works — 2026-11-13), so those fresh windows
+    must be explicit epoch windows spanning the whole available history. The
+    chart's first paint then covers ~2 months with no truncated seed."""
+    captured = {}
+
+    class _CaptureClient:
+        status_code = 200
+        def get(self, url, params=None, **k):
+            captured.update(params or {})
+            return self
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return _OkChartClient().json()
+
+    bars = YahooFinanceAdapter.fetch_bars("SPY", "15m", client=_CaptureClient())
+    assert len(bars) == 1
+    assert "range" not in captured
+    span = captured["period2"] - captured["period1"]
+    assert span == FRESH_WINDOW_SPAN_SECONDS["15m"]
+    assert captured["period2"] > time.time() - 60
+
+    # Other range keys are untouched.
+    captured.clear()
+    YahooFinanceAdapter.fetch_bars("SPY", "1h", client=_CaptureClient())
+    assert captured.get("range") == "6mo" and "period1" not in captured
+
+
+def test_span_days_match_the_measured_yahoo_ceiling():
+    # The segment clamp (oldest_allowed) must sit at the real upstream
+    # ceiling: 60 whole days is rejected with HTTP 422, 59 is the largest
+    # accepted span. A 60d clamp would 422 any segment whose page reaches
+    # near "now".
+    assert TIMEFRAME_SPAN_DAYS["15m"] == 59
+    assert TIMEFRAME_SPAN_DAYS["5m"] == 59

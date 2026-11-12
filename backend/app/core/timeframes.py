@@ -41,12 +41,14 @@ TIMEFRAME_TTLS: Dict[str, float] = {
 # Historical span ceiling per timeframe, in days. These are Yahoo's hard
 # limits, not preferences: past them the upstream API has no data, and the
 # chart shows a "data begins here" edge instead of pretending otherwise.
+# (5m/15m: 60 whole days is rejected with HTTP 422; 59 is the largest
+# accepted span — see FRESH_WINDOW_SPAN_SECONDS.)
 # None = cursor paging is not offered for that timeframe (daily and coarser
 # buckets are fetched whole already; paging them would only multiply keys).
 TIMEFRAME_SPAN_DAYS: Dict[str, Optional[int]] = {
     "1m": 7,
-    "5m": 60,
-    "15m": 60,
+    "5m": 59,
+    "15m": 59,
     "1h": 730,
     "4h": 730,
     "1d": None,
@@ -100,6 +102,18 @@ YAHOO_TIMEFRAME_MAP: Dict[str, Tuple[str, Optional[str]]] = {
     # far back as it goes" chart asks.
     "1wk": ("1wk", "10y"),
     "1mo": ("1mo", None),
+}
+
+# Fresh-window span for intraday keys whose Yahoo "range" enum undershoots
+# the timeframe's real coverage. Yahoo's 15m/5m ceiling is 59 days — measured
+# 2026-11-13: period1=now-60d is rejected outright (HTTP 422) while 59d
+# returns the full span (15m 1116 bars, 5m 3344 bars) — but the "range" enum
+# has no such value ("1mo" ≈ 31d, "3mo" 422s), so these keys fetch via an
+# explicit epoch window instead of a trailing range. One request then serves
+# the whole available history and the chart never shows a truncated seed.
+FRESH_WINDOW_SPAN_SECONDS: Dict[str, int] = {
+    "5m": 59 * 86400,
+    "15m": 59 * 86400,
 }
 
 # Whole-window span in seconds per bucket, mirroring the ranges above — the
