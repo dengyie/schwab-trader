@@ -355,7 +355,10 @@ export function PriceChart() {
       // page_size 显式进 URL：段响应的 CF 缓存键是完整 URL（auth 头不在键
       // 内），历史空响应（假边界时代）会以 s-maxage=7d 存活——带参 URL 与
       // 旧键不同，天然绕开毒缓存；同时把分段契约显式化。
-      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000`;
+      // v=2：浏览器本地 HTTP 缓存（max-age=86400）也存了 bug 时期的空 200，
+      // CF purge 管不到它——换键让旧键整体作废（2026-11-14，cursor
+      // 1622714400 的空 [] 在本地缓存存活到次日）。
+      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000&v=2`;
       // 冷段首次拉取要跑整条上游档案链（15-20s），远超 apiFetch 的 10s
       // 超时——服务端预跑若还没走到该段，请求会 AbortError。段是不可变
       // 的，重试命中的是同一份将来必在的数据：静默重试 3 次（递增退避），
