@@ -431,11 +431,12 @@ export function PriceChart() {
   const prefillHintTimerRef = useRef<number | null>(null);
   const prefillTokenRef = useRef(0);
   // 各周期预取页预算：后端有深史预跑（15m/5m 全档案逐段落盘），prefill
-  // 只是把已落盘的段增量画上（段命中 ~300ms），预算上限兜底防上游契约
-  // 意外。15m 全史 ~120 页（IEX 底实测 2017），1h ≈ 1/9 的段数 → 页数同
-  // 比例缩。1m/日级三键不补载（Yahoo 7d / 整段供给）。
+  // 只是把已落盘的段增量画上（段命中 ~300ms；个别未落盘段走重试）。
+  // 预算=该周期全档案页数上限（实测 2026-11-14：QQQ 15m 40 页到 2021-09、
+  // 全档案到 2016-01 需 ~110 页），预算上限同时兜底防上游契约意外。
+  // 1m/日级三键不补载（Yahoo 7d / 整段供给）。
   const PREFILL_PAGE_BUDGETS: Record<string, number> = {
-    '5m': 40, '15m': 40, '1h': 20, '4h': 20,
+    '5m': 120, '15m': 120, '1h': 20, '4h': 20,
   };
   const prefillBudget = PREFILL_PAGE_BUDGETS[tfForHistory(timeRange)] ?? 0;
   prefillRef.current = async () => {
