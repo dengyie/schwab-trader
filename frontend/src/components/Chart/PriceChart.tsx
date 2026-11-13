@@ -352,7 +352,10 @@ export function PriceChart() {
 
     loadingMoreRef.current = true;
     try {
-      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}`;
+      // page_size 显式进 URL：段响应的 CF 缓存键是完整 URL（auth 头不在键
+      // 内），历史空响应（假边界时代）会以 s-maxage=7d 存活——带参 URL 与
+      // 旧键不同，天然绕开毒缓存；同时把分段契约显式化。
+      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000`;
       const response = await apiFetch(url);
       if (!response.ok) throw response;
       // 竞态保护：请求期间用户切走了标的或周期，丢弃过期响应
