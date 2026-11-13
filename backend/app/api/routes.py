@@ -327,6 +327,20 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             # Historical segment: immutable data strictly older than the
             # cursor. Never refreshed on the hot path; failure == empty.
             bars, fetched_at, has_more = actual_feed.get_historical_segment(sym, timeframe=tf, before=cursor)
+            if not bars and not has_more and not fetched_at:
+                # ``fetched_at == 0.0`` means the feed had nothing at all for
+                # this key: an upstream failure, a cooldown window, or an
+                # in-flight single-flight the waiter did not land. This is a
+                # *temporary* nothing — never cache it: CF pins 200s for
+                # s-maxage=7d, so a cached empty answer would block the
+                # segment for a week (measured 2026-11-14: the walker's
+                # 429 cooldown raced a prefill page and the edge cached the
+                # empty for the rest of the day). A 503 keeps the edge
+                # uncertain, and CF retries through to the origin.
+                return Response(
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "10"},
+                )
             records = ModelFeatureExporter.to_records(bars or [])
             etag = f'W/"{sym}-{tf}-h{cursor}-{int(fetched_at)}"'
             # History does not age: browsers keep the segment for a day and

@@ -374,9 +374,10 @@ def _segment_client(seg_bars, has_more=True, fetched_at=None):
             close=100.5 + i, volume=10.0)
         for i in range(3)
     ]
+    fresh_at = time.time() if fetched_at is None else fetched_at
     stub = FastAPI()
     stub.include_router(create_api_router(
-        ledger, _StubSegmentFeed(bars, fetched_at or time.time(), seg_bars, has_more)))
+        ledger, _StubSegmentFeed(bars, fresh_at, seg_bars, has_more)))
     return TestClient(stub)
 
 
@@ -496,6 +497,36 @@ def test_hist_segment_conditional_request_returns_304():
     assert second.headers["X-Bars-Has-More"] == "0"
     assert second.headers["ETag"] == etag
     assert second.headers["Cache-Control"].startswith("public, max-age=")
+
+
+def test_hist_segment_temporary_empty_returns_503():
+    """``([], 0.0, False)`` is "couldn't get it right now" (upstream failure,
+    cooldown, single-flight miss) — a 200 here would be pinned by CF for
+    s-maxage=7d and brick the segment. It must 503 with no-store so the edge
+    stays uncertain and retries through to the origin."""
+    client = _segment_client([], has_more=False, fetched_at=0.0)
+    resp = client.get(
+        f"/api/market/bars?symbol=SPY&timeframe=15m&before={int(time.time())}",
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 503
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert int(resp.headers["Retry-After"]) > 0
+    assert "ETag" not in resp.headers
+
+
+def test_hist_segment_cached_terminal_empty_stays_200():
+    """A real terminal empty (young symbol, fetched_at > 0) is a fact worth
+    caching — it must stay a cacheable 200, not trip the 503 path."""
+    cursor = int(time.time())
+    client = _segment_client([], has_more=False, fetched_at=time.time())
+    resp = client.get(f"/api/market/bars?symbol=SPY&timeframe=15m&before={cursor}", headers=AUTH)
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+    assert resp.headers["X-Bars-Has-More"] == "0"
+    assert resp.headers["Cache-Control"].startswith("public, max-age=")
 
 
 def test_hist_segment_rejects_non_positive_cursor():
