@@ -47,6 +47,17 @@ FAILURE_COOLDOWN_SECONDS = 30.0
 # split on ":" still see the original timeframe as the second field.
 HIST_SEGMENT_MARK = "#"
 
+# Disk payload format version. Bumped whenever the *semantics* of a stored
+# window change, so files written by the old code cannot survive a deploy as
+# a "cached" answer written under different rules. Measured 2026-11-14: the
+# 15m/5m fresh window moved from Yahoo's range=1mo (~31d, 599 bars) to the
+# 59d epoch window (1115 bars), and every default symbol not prewarmed
+# (MSFT/AMD/GOOGL/... ) served its old 31d file for days because stale-while-
+# revalidate returned it before the first background refresh landed. v2 = the
+# 59d fresh-window contract; a file without this marker is a v1 leftover and
+# is ignored (re-fetched synchronously on first read).
+DISK_FORMAT_VERSION = 2
+
 
 @dataclass(frozen=True)
 class CacheEntry:
@@ -245,6 +256,10 @@ class BarCache:
         if path is None:
             return
         payload = {
+            # Format marker: see DISK_FORMAT_VERSION. Readers ignore files
+            # written under an older contract instead of serving their stale
+            # window shape after a deploy.
+            "v": DISK_FORMAT_VERSION,
             "symbol": symbol,
             "timeframe": timeframe,
             "fetched_at": ts,
@@ -273,6 +288,21 @@ class BarCache:
         try:
             raw = path.read_text(encoding="utf-8")
             payload = json.loads(raw)
+            # A file from an older format contract describes a window written
+            # under different rules (e.g. the pre-59d 31d fresh window). It is
+            # not a cache hit — ignore it so the first read re-fetches under
+            # the current semantics. Set aside like a corrupt file so it is
+            # not re-read on every request.
+            if int(payload.get("v", 1)) != DISK_FORMAT_VERSION:
+                logger.info(
+                    "Bar cache file %s is format v%s (current v%s); ignored",
+                    path, payload.get("v", 1), DISK_FORMAT_VERSION,
+                )
+                try:
+                    path.replace(path.with_suffix(".oldformat"))
+                except OSError:
+                    pass
+                return None
             ts = float(payload["fetched_at"])
             bars = [
                 Bar(time=int(row[0]), open=float(row[1]), high=float(row[2]),

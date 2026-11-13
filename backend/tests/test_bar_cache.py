@@ -19,7 +19,7 @@ from app.adapters.alpaca_adapter import AlpacaDataAdapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.timeframes import WHOLE_WINDOW_SPAN_SECONDS
 from app.engine.alpaca_market_feed import MAX_CACHE_ENTRIES, AlpacaMarketFeedService
-from app.engine.bar_cache import BarCache
+from app.engine.bar_cache import DISK_FORMAT_VERSION, BarCache
 from app.models.trading import Bar
 
 
@@ -236,6 +236,37 @@ def test_corrupt_cache_file_is_ignored_and_set_aside(tmp_path):
     assert cache.get("SPY", "1m") is None
     assert not path.exists()
     assert (tmp_path / "bars" / "SPY_1m.corrupt").exists()
+
+
+def test_old_format_cache_file_is_ignored_and_set_aside(tmp_path):
+    """A disk file written under an older window contract must not survive a
+    deploy as a cache hit.
+
+    Measured production failure (2026-11-14): the 15m fresh window moved from
+    Yahoo's range=1mo (~31d, 599 bars) to the 59d epoch window, and the nine
+    default symbols that the prewarm loop does not cover served their old
+    31d file for days — stale-while-revalidate handed it to the first read
+    after every restart, and nobody else hit those keys to trigger the
+    refresh. A format marker turns such files into a miss.
+    """
+    bars_dir = tmp_path / "bars"
+    old = bars_dir / "MSFT_15m.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    # A v1-shaped payload: right schema, no "v" marker.
+    old.write_text(json.dumps({
+        "symbol": "MSFT", "timeframe": "15m", "fetched_at": time.time() - 120,
+        "bars": [[1000 + i * 900, 1.0, 2.0, 0.5, 1.5, 10.0] for i in range(3)],
+    }), encoding="utf-8")
+
+    cache = BarCache(str(tmp_path))
+    assert cache.get("MSFT", "15m") is None  # not served from the stale shape
+    assert not old.exists()
+    assert (bars_dir / "MSFT_15m.oldformat").exists()
+
+    # And the first real write re-seals the file under the current version.
+    cache.put("MSFT", "15m", _bars(), fetched_at=time.time())
+    payload = json.loads((bars_dir / "MSFT_15m.json").read_text(encoding="utf-8"))
+    assert payload["v"] == DISK_FORMAT_VERSION
 
 
 def test_ancient_cache_files_are_pruned(tmp_path):
