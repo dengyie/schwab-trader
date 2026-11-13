@@ -356,7 +356,23 @@ export function PriceChart() {
       // 内），历史空响应（假边界时代）会以 s-maxage=7d 存活——带参 URL 与
       // 旧键不同，天然绕开毒缓存；同时把分段契约显式化。
       const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000`;
-      const response = await apiFetch(url);
+      // 冷段首次拉取要跑整条上游档案链（15-20s），远超 apiFetch 的 10s
+      // 超时——服务端预跑若还没走到该段，请求会 AbortError。段是不可变
+      // 的，重试命中的是同一份将来必在的数据：静默重试 3 次（递增退避），
+      // 服务端预跑每页 1s，三次重试足以等到 walker 把该段写盘。
+      let response: Response | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await apiFetch(url);
+          if (r.ok) { response = r; break; }
+          if (r.status >= 500 && attempt < 2) { await new Promise(res => setTimeout(res, 3000 * (attempt + 1))); continue; }
+          response = r; break;  // 4xx 等：不重试，走统一错误路径
+        } catch (err) {
+          if (attempt >= 2) throw err;   // 末次失败交给 catch 静默
+          await new Promise(res => setTimeout(res, 3000 * (attempt + 1)));
+        }
+      }
+      if (!response) throw new Error('segment fetch exhausted');
       if (!response.ok) throw response;
       // 竞态保护：请求期间用户切走了标的或周期，丢弃过期响应
       // （在途 15m 段绝不许落进已切到 1h 的序列）
