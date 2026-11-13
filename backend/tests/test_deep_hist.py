@@ -124,6 +124,32 @@ def test_alpaca_page_keeps_has_more_contract(feed):
     assert feed._has_more(out, 2000, before, "15m", "QQQ") is True
 
 
+def test_sliding_edge_cursor_falls_through_to_archive(feed):
+    """The client's first prefill page uses the fresh window's oldest bar as
+    its cursor — ABOVE Yahoo's ceiling, where the sliding edge answers empty
+    (measured 2026-11-14: cursor 09-16 13:30, Yahoo's oldest slid past it).
+    Yahoo empty at such a cursor must fall through to the IEX archive (which
+    serves it fine) instead of cooling down and stranding the client's
+    prefill at page one."""
+    before = NOW - 40 * 86400  # above the ceiling, below nothing
+    with patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]), \
+         patch.object(feed, "_fetch_alpaca_hist",
+                      return_value=_bars([before - 900 * i for i in range(1, 2100)])) as alpaca, \
+         patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]):
+        out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
+    assert len(out) == 2000, "archive page trimmed to the contract"
+    assert alpaca.call_args.args[2:4] == (before - 366 * 86400, before)
+    assert feed._bar_cache.get("QQQ", "15m<h%d" % before) is not None
+    # And a young symbol (archive empty too) is a real terminal edge: cached
+    # emptiness, not a cooldown.
+    with patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]), \
+         patch.object(feed, "_fetch_alpaca_hist", return_value=[]):
+        out2 = feed._fetch_hist_segment("COIN", "15m", "15m<h%d" % before, before)
+    assert out2 == []
+    assert feed._bar_cache.get("COIN", "15m<h%d" % before) is not None
+    assert feed._bar_cache.get("COIN", "15m<h%d" % before).bars == []
+
+
 def test_first_short_page_above_floor_still_has_more(feed):
     """The FIRST page's window is clamped to Yahoo's 59d span (~1119 bars for
     15m), so a length-only has_more could never fire there — the chart
@@ -324,19 +350,20 @@ def test_deep_hist_walk_symbol_gives_up_after_three_empty_pages(feed, monkeypatc
 
 def test_yahoo_segment_empty_window_is_not_cached_as_boundary(feed, monkeypatch):
     """A Yahoo-path page that answers empty at a cursor INSIDE the 59d
-    ceiling is the sliding edge, not a terminal boundary: it must cool down
-    (retryable) instead of caching an empty segment that strands the chart
-    at the seed edge forever. Measured 2026-11-14: cursor 09-16 13:30 asked
-    Yahoo for bars it had already slid past; the cached empty answer then
-    stopped both the prewalk and the client prefill."""
-    import time as _time
+    ceiling is the sliding edge, not a terminal boundary: it falls through to
+    the archive, and if that fetch FAILS (HTTP error) the key cool downs
+    (retryable) instead of caching an empty segment that strands the chart at
+    the seed edge. Measured 2026-11-14: cursor 09-16 13:30 asked Yahoo for
+    bars it had already slid past."""
     before = NOW - 40 * 86400  # fully inside Yahoo coverage
-    with patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]):
+    with patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]), \
+         patch.object(feed, "_fetch_alpaca_hist",
+                      side_effect=RuntimeError("HTTP 429")):
         out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
-    assert out == []
+    assert out is None, "archive failure surfaces as None (retryable), not an empty"
     seg_tf = "15m<h%d" % before
     # No fake boundary: the empty segment is NOT a cached entry, and the key
-    # is cooling so a retry waits instead of hammering Yahoo.
+    # is cooling so a retry waits instead of hammering upstream.
     assert feed._bar_cache.get("QQQ", seg_tf) is None
     assert feed._bar_cache.is_cooling("QQQ", seg_tf) is True
 

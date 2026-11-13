@@ -656,6 +656,11 @@ class AlpacaMarketFeedService:
         # client (it halts on an empty merge) and the walker (failure count).
         if len(bars) >= page_size:
             return True
+        if not bars:
+            # An empty page never promises more: the client halts on an empty
+            # merge and the walker counts it as a failure — has_more=1 here
+            # would only fake a retry loop.
+            return False
         return (
             tf in ALPACA_DEEP_HIST_TIMEFRAMES
             and market_of(sym).code == "US"
@@ -691,6 +696,27 @@ class AlpacaMarketFeedService:
             bars = self._reconcile_volume(sym, tf, bars)
             if len(bars) > page_size:
                 bars = bars[-page_size:]
+            if not bars and not alpaca_deep and span_days and tf in ALPACA_DEEP_HIST_TIMEFRAMES \
+                    and market_of(sym).code == "US" and before > DEEP_HIST_FLOOR:
+                # The sliding-edge gap: a cursor ABOVE the ceiling can also
+                # answer empty (measured 2026-11-14: the fresh window's oldest
+                # bar 09-16 13:30 sits above Yahoo's oldest, which slid past
+                # it with "now"). The archive serves this cursor fine — fall
+                # through to it instead of cooling down, so the client's
+                # first prefill page (which always uses this cursor) lands in
+                # the archive instead of stopping the walk at the seed edge.
+                deep = self._fetch_alpaca_hist(sym, tf, max(0, before - HIST_PAGE_SPAN_SECONDS), before)
+                deep = self._reconcile_volume(sym, tf, deep)
+                if len(deep) > page_size:
+                    deep = deep[-page_size:]
+                if deep:
+                    self._bar_cache.put(sym, seg_tf, deep)
+                    return deep
+                # Both sources empty above the floor: the symbol is younger
+                # than the archive (e.g. COIN, IPO 2021) — a real terminal
+                # edge. Cache the emptiness.
+                self._bar_cache.put(sym, seg_tf, [], time.time())
+                return []
             if not bars:
                 # An empty page is only a *terminal* edge when it comes from
                 # the physical archive (alpaca_deep: the IEX floor is fixed).

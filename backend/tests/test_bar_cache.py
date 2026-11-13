@@ -447,35 +447,25 @@ def test_hist_segment_full_page_reports_has_more(make_feed, monkeypatch):
 
 
 def test_hist_segment_empty_window_is_a_cached_terminal_state(make_feed, monkeypatch):
-    """A US deep-tf page that answers empty ABOVE the archive floor is a
-    transient answer (Yahoo's sliding edge), not a terminal one: it cool
-    downs instead of caching a fake boundary, and has_more stays True so the
-    client continues into the archive below."""
+    """Yahoo-path empty ABOVE the floor falls through to the archive; when
+    the archive also answers empty (both sources exhausted — a symbol
+    younger than the window) the emptiness IS the real terminal edge: cached,
+    has_more=0. An archive *failure* instead cool downs without caching
+    (covered in test_deep_hist)."""
     feed = make_feed()
     cursor = 1_800_000_000
-    calls = []
 
-    def fetch(sym, *a, **k):
-        calls.append(sym)
-        return []
-
-    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", fetch)
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", lambda *a, **k: [])
+    monkeypatch.setattr(feed, "_fetch_alpaca_hist", lambda *a, **k: [])
 
     bars, fetched_at, has_more = feed.get_historical_segment("SPY", "15m", before=cursor)
-    assert bars == [] and has_more is True
+    assert bars == [] and has_more is False
     seg_tf = BarCache.hist_timeframe("15m", cursor)
-    assert feed._bar_cache.get("SPY", seg_tf) is None, "no fake boundary cached"
-    assert feed._bar_cache.is_cooling("SPY", seg_tf), "retry waits out the cooldown"
-
-    # Below the floor the empty page IS terminal: the archive route answers
-    # empty, the emptiness is cached, and has_more=0 stops the client.
-    deep_cursor = 1_400_000_000  # 2014, below DEEP_HIST_FLOOR (2016)
-    monkeypatch.setattr(feed, "_fetch_alpaca_hist", lambda *a, **k: [])
-    bars3, _, has_more3 = feed.get_historical_segment("SPY", "15m", before=deep_cursor)
-    assert bars3 == [] and has_more3 is False
-    deep_seg_tf = BarCache.hist_timeframe("15m", deep_cursor)
-    assert feed._bar_cache.get("SPY", deep_seg_tf) is not None
-    assert feed._bar_cache.get("SPY", deep_seg_tf).bars == []
+    cached = feed._bar_cache.get("SPY", seg_tf)
+    assert cached is not None and cached.bars == []
+    # Cached: a second request must not hit upstream again.
+    bars2, _, has_more2 = feed.get_historical_segment("SPY", "15m", before=cursor)
+    assert bars2 == [] and has_more2 is False
 
 
 def test_hist_segment_failure_fails_quietly(make_feed, monkeypatch):
