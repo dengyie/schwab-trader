@@ -19,6 +19,7 @@ from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.engine.alpaca_market_feed import (
     ALPACA_DEEP_HIST_TIMEFRAMES,
     AlpacaMarketFeedService,
+    DEEP_HIST_FLOOR,
 )
 from app.models.trading import Bar
 
@@ -120,7 +121,25 @@ def test_alpaca_page_keeps_has_more_contract(feed):
     with patch.object(feed, "_fetch_alpaca_hist", return_value=many):
         out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
     assert len(out) == 2000
-    assert feed._has_more(out, 2000) is True
+    assert feed._has_more(out, 2000, before, "15m", "QQQ") is True
+
+
+def test_first_short_page_above_floor_still_has_more(feed):
+    """The FIRST page's window is clamped to Yahoo's 59d span (~1119 bars for
+    15m), so a length-only has_more could never fire there — the chart
+    stranded at the seed edge (measured 2026-11-14). A short page at a cursor
+    above the IEX floor must still report more below; at/below the floor it
+    must not."""
+    before = NOW - 40 * 86400  # first-page cursor inside Yahoo's span
+    short = _bars([before - 900 * i for i in range(1, 1119)])
+    assert len(short) < 2000
+    assert feed._has_more(short, 2000, before, "15m", "QQQ") is True
+    # At the floor: terminal.
+    floor_page = _bars([DEEP_HIST_FLOOR + 900 * i for i in range(1, 1119)])
+    assert feed._has_more(floor_page, 2000, DEEP_HIST_FLOOR, "15m", "QQQ") is False
+    # Non-deep timeframe / intl symbol keep the length-only contract.
+    assert feed._has_more(short, 2000, before, "1h", "QQQ") is False
+    assert feed._has_more(short, 2000, before, "15m", "0700.HK") is False
 
 
 def test_fetch_alpaca_hist_pages_to_window_end(feed, monkeypatch):

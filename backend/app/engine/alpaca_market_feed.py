@@ -114,6 +114,13 @@ INTRADAY_VOLUME_OVERSIZED = 2.0
 # under-reporting the reconciliation never rewrites.
 ALPACA_DEEP_HIST_TIMEFRAMES = frozenset({"5m", "15m"})
 
+# The measured physical floor of the IEX archive (2026-11-14: the QQQ 15m
+# page chain ends at 2016-01-01; every symbol listed before then shares it).
+# A cursor above this epoch always has more archive below it — the anchor for
+# ``_has_more`` where a page-full can never happen (first page is clamped to
+# Yahoo's 59d span).
+DEEP_HIST_FLOOR = 1451606400  # 2016-01-01 00:00 UTC
+
 
 def reconcile_intraday_volume(
     bars: List[Bar],
@@ -618,7 +625,7 @@ class AlpacaMarketFeedService:
         if entry:
             if not self._bar_cache.is_fresh(entry, seg_tf):
                 self._schedule_hist_refresh(sym, tf, seg_tf, before)
-            return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+            return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size, before, tf, sym)
 
         if self._bar_cache.is_cooling(sym, seg_tf):
             return [], 0.0, False
@@ -626,7 +633,7 @@ class AlpacaMarketFeedService:
             self._bar_cache.wait_for_refresh(sym, seg_tf)
             entry = self._bar_cache.get(sym, seg_tf)
             if entry:
-                return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size)
+                return entry.bars, entry.fetched_at, self._has_more(entry.bars, page_size, before, tf, sym)
             return [], 0.0, False
         try:
             bars = self._fetch_hist_segment(sym, tf, seg_tf, before)
@@ -634,11 +641,26 @@ class AlpacaMarketFeedService:
             self._bar_cache.end_refresh(sym, seg_tf)
         if bars is None:
             return [], 0.0, False
-        return bars, self._bar_cache.fetched_at_of(sym, seg_tf), self._has_more(bars, page_size)
+        return bars, self._bar_cache.fetched_at_of(sym, seg_tf), self._has_more(bars, page_size, before, tf, sym)
 
     @staticmethod
-    def _has_more(bars: List[Bar], page_size: int) -> bool:
-        return len(bars) >= page_size
+    def _has_more(bars: List[Bar], page_size: int, before: int, tf: str, sym: str) -> bool:
+        # A page-full is the normal "more below" signal, but it can never fire
+        # for the FIRST page: its 366d window is clamped to Yahoo's 59d span
+        # (15m ≈ 1119 bars < 2000), so a length-only check strands the client
+        # at the seed edge forever (measured 2026-11-14: QQQ 15m page 1 =
+        # 1119 bars, has_more=0, chart stuck at 09-16 while the prewalk sat
+        # unrequested on disk). For the US deep timeframes the real floor is
+        # the IEX archive's, not Yahoo's sliding edge: any cursor above it
+        # definitionally has more history below. Empty pages still stop the
+        # client (it halts on an empty merge) and the walker (failure count).
+        if len(bars) >= page_size:
+            return True
+        return (
+            tf in ALPACA_DEEP_HIST_TIMEFRAMES
+            and market_of(sym).code == "US"
+            and before > DEEP_HIST_FLOOR
+        )
 
     def _fetch_hist_segment(self, sym: str, tf: str, seg_tf: str, before: int) -> Optional[List[Bar]]:
         try:
