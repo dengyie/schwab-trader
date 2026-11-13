@@ -209,6 +209,16 @@ class AlpacaMarketFeedService:
     # no client connected there is nothing to prewarm for, so the loop sleeps
     # instead of re-fetching multi-thousand-bar candle payloads forever.
     IDLE_PREWARM_SECONDS = 30.0
+    # Deep-history pre-run paces one segment page every DEEP_HIST_PREWARM_PAUSE
+    # seconds (measured 2026-11-14: a 15m IEX page takes ~15-20s upstream, and
+    # Alpaca's free tier allows 200 req/min — the pause keeps the runner far
+    # under it while it walks a symbol's full archive, ~100 pages / ~30min for
+    # 15m back to 2019). Unlike the fresh-window prewarm this is NOT gated on
+    # chart subscribers: the point is to have decades of immutable history on
+    # disk *before* anyone asks for it, so the first chart paint shows the
+    # full span instead of a 59d seed.
+    DEEP_HIST_PREWARM_PAUSE = 1.0
+    DEEP_HIST_PREWARM_TFS = ("15m", "5m")
 
     def __init__(
         self,
@@ -1046,11 +1056,12 @@ class AlpacaMarketFeedService:
         self._ws_task = asyncio.create_task(self._websocket_listener_loop())
         self._sync_task = asyncio.create_task(self._periodic_quote_sync_loop())
         self._prewarm_task = asyncio.create_task(self._prewarm_cache_loop())
+        self._deep_hist_task = asyncio.create_task(self._deep_hist_prewarm_loop())
 
     async def stop(self) -> None:
         self._running = False
         self._record_stream_event("stopped")
-        for task in (self._ws_task, self._sync_task, self._prewarm_task):
+        for task in (self._ws_task, self._sync_task, self._prewarm_task, self._deep_hist_task):
             if task:
                 task.cancel()
                 try:
@@ -1346,4 +1357,77 @@ class AlpacaMarketFeedService:
             except Exception as e:
                 logger.warning("Error in prewarm cache loop: %s", e)
                 await asyncio.sleep(10.0)
+
+    async def _deep_hist_prewarm_loop(self) -> None:
+        """Walk every US symbol's 15m/5m archive to its floor, once per boot.
+
+        The chart's "show me all the data" ask is answered by the segment
+        chain, but a chain of ~100 IEX pages at ~15-20s each is ~30 minutes of
+        wall time no user should spend watching a badge. The archive is
+        immutable, so the whole walk is a *server-side* concern: this runner
+        pages each (symbol, timeframe) via ``get_historical_segment`` — the
+        exact path a chart request takes — until ``X-Bars-Has-More`` reports
+        the floor. Every page lands in the same RAM+disk cache with its
+        7-day TTL, so once a span has been walked the client's prefill is a
+        sequence of cache hits (measured ~300ms per page from CF/edge).
+
+        Restart-safe by construction: pages already on disk short-circuit in
+        the cache, so a re-boot resumes near where the last process left off.
+        Ordering walks one timeframe per symbol fully before the next
+        timeframe: the chart's default (15m) completes first. Failures raise
+        inside ``_fetch_hist_segment`` already; one symbol's failure must not
+        stall the walk, but an Alpaca-wide outage should — so consecutive
+        failures park the loop for a minute instead of burning quota.
+        """
+        await asyncio.sleep(5.0)
+        tfs = list(self.DEEP_HIST_PREWARM_TFS)
+        while self._running:
+            for tf in tfs:
+                for sym in self.symbols:
+                    if not self._running:
+                        return
+                    if market_of(sym).code != "US":
+                        continue
+                    try:
+                        await self._deep_hist_walk_symbol(sym, tf)
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as exc:
+                        logger.warning("Deep-hist prewalk %s %s failed: %s", sym, tf, exc)
+                        # An upstream-wide failure (429s, auth) would repeat
+                        # for every remaining symbol; park briefly instead.
+                        await asyncio.sleep(60.0)
+                        break
+            # The archive extends only by the passage of time (a new session
+            # appends nothing at the old end), so a completed walk never needs
+            # re-running within this process. Sleep long; wake only to exit.
+            await asyncio.sleep(3600.0)
+
+    async def _deep_hist_walk_symbol(self, sym: str, tf: str) -> None:
+        """One symbol/timeframe: page to the floor via the public segment API."""
+        # The fresh window's oldest bar is the natural first cursor.
+        entry = self._bar_cache.get(sym, tf)
+        oldest = int(entry.bars[0].time) if entry and entry.bars else int(time.time())
+        failures = 0
+        while self._running:
+            bars, _fetched, has_more = await asyncio.to_thread(
+                self.get_historical_segment, sym, tf, oldest
+            )
+            if not bars:
+                failures += 1
+                if failures >= 3 or not has_more:
+                    # Three consecutive empty pages with the cursor unmoved:
+                    # the floor (or an upstream outage). Either way, stop.
+                    return
+                await asyncio.sleep(5.0)
+                continue
+            failures = 0
+            next_oldest = int(bars[0].time)
+            if next_oldest >= oldest:
+                # Cursor did not move backwards: no more data below.
+                return
+            oldest = next_oldest
+            if not has_more:
+                return
+            await asyncio.sleep(self.DEEP_HIST_PREWARM_PAUSE)
 

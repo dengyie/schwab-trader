@@ -411,7 +411,14 @@ export function PriceChart() {
   const [prefillVisible, setPrefillVisible] = useState(false);
   const prefillHintTimerRef = useRef<number | null>(null);
   const prefillTokenRef = useRef(0);
-  const PREFILL_PAGE_BUDGET = 6;
+  // 各周期预取页预算：后端有深史预跑（15m/5m 全档案逐段落盘），prefill
+  // 只是把已落盘的段增量画上（段命中 ~300ms），预算上限兜底防上游契约
+  // 意外。15m 全史 ~120 页（IEX 底实测 2017），1h ≈ 1/9 的段数 → 页数同
+  // 比例缩。1m/日级三键不补载（Yahoo 7d / 整段供给）。
+  const PREFILL_PAGE_BUDGETS: Record<string, number> = {
+    '5m': 40, '15m': 40, '1h': 20, '4h': 20,
+  };
+  const prefillBudget = PREFILL_PAGE_BUDGETS[tfForHistory(timeRange)] ?? 0;
   prefillRef.current = async () => {
     if (!hasMoreRef.current) return;
     let lastOldest = klinesRef.current[0]?.time ?? 0;
@@ -422,7 +429,7 @@ export function PriceChart() {
       if (prefillTokenRef.current === token) setPrefillVisible(true);
     }, 500);
     try {
-      for (let page = 0; page < PREFILL_PAGE_BUDGET && hasMoreRef.current; page++) {
+      for (let page = 0; page < prefillBudget && hasMoreRef.current; page++) {
         await loadOlderRef.current?.();
         const oldest = klinesRef.current[0]?.time ?? 0;
         if (oldest === lastOldest) break; // 到边（或重复页）：停止翻页，但已补的段仍要重适配

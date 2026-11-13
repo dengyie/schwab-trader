@@ -245,3 +245,48 @@ def test_deep_hist_success_resets_consecutive(feed, monkeypatch):
     feed._fetch_alpaca_hist("QQQ", "15m", before - 86400, before)
     stats = AlpacaMarketFeedService.deep_hist_error_stats()
     assert stats["count"] == 2 and stats["consecutive"] == 0
+
+
+def test_deep_hist_walk_symbol_stops_at_floor(feed, monkeypatch):
+    """The pre-run walks pages via get_historical_segment until the cursor
+    stops moving backwards or has_more turns 0 — never a fixed page count."""
+    import time as _time
+    feed._running = True
+
+    calls = []
+    pages = [
+        # cursor 1000 -> oldest 800 (has_more), then floor at 800.
+        ([_bars([800, 900]), _bars([800, 900])], True),
+        ([_bars([700, 750]), _bars([700, 750])], False),
+    ]
+
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        bars, has_more = pages[len(calls) - 1]
+        return bars, _time.time(), has_more
+
+    pages = [
+        (_bars([800, 900]), True),   # oldest 800, more below
+        (_bars([700, 750]), False),  # floor at 700
+    ]
+
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+    import asyncio
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
+    assert calls == [calls[0], 800]  # first cursor is the init value (cache empty)
+
+
+def test_deep_hist_walk_symbol_gives_up_after_three_empty_pages(feed, monkeypatch):
+    """An upstream outage answers empties: after 3 the walk stops instead of
+    spinning forever."""
+    import asyncio
+    import time as _time
+    feed._running = True
+
+    calls = []
+    monkeypatch.setattr(
+        feed, "get_historical_segment",
+        lambda sym, tf, before: (calls.append(before) or ([], _time.time(), True)),
+    )
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
+    assert len(calls) == 3  # three empties then give-up
