@@ -670,7 +670,19 @@ class AlpacaMarketFeedService:
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:
-                self._bar_cache.put(sym, seg_tf, [], time.time())
+                # An empty page is only a *terminal* edge when it comes from
+                # the physical archive (alpaca_deep: the IEX floor is fixed).
+                # On the Yahoo path the upstream edge MOVES with the 59d
+                # window: a cursor just inside the ceiling can legitimately
+                # answer empty today (measured 2026-11-14: cursor 09-16 13:30,
+                # Yahoo's oldest bar had slid past it) and non-empty tomorrow.
+                # Caching that as a "boundary" strands the chart at the seed
+                # edge forever — cool down instead so the next request
+                # retries.
+                if not alpaca_deep:
+                    self._bar_cache.cool_down(sym, seg_tf)
+                else:
+                    self._bar_cache.put(sym, seg_tf, [], time.time())
                 return []
             self._bar_cache.put(sym, seg_tf, bars)
             return bars
@@ -1415,6 +1427,19 @@ class AlpacaMarketFeedService:
             )
             if not bars:
                 failures += 1
+                # An empty page at a cursor still inside Yahoo's 59d window
+                # is the sliding-edge artifact, not the floor: Yahoo's oldest
+                # bar moves with "now", so the page can answer empty today
+                # and non-empty tomorrow. Jump the cursor past the ceiling so
+                # the next page routes to the IEX archive instead of
+                # stranding the walk at the seed edge.
+                span_days = TIMEFRAME_SPAN_DAYS.get(tf)
+                ceiling = int(time.time()) - span_days * 86400 if span_days else 0
+                if oldest >= ceiling:
+                    oldest = ceiling - 86400
+                    failures = 0
+                    await asyncio.sleep(self.DEEP_HIST_PREWARM_PAUSE)
+                    continue
                 if failures >= 3 or not has_more:
                     # Three consecutive empty pages with the cursor unmoved:
                     # the floor (or an upstream outage). Either way, stop.

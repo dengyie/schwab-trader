@@ -278,15 +278,80 @@ def test_deep_hist_walk_symbol_stops_at_floor(feed, monkeypatch):
 
 def test_deep_hist_walk_symbol_gives_up_after_three_empty_pages(feed, monkeypatch):
     """An upstream outage answers empties: after 3 the walk stops instead of
-    spinning forever."""
+    spinning forever. The cursor sits BELOW the 59d ceiling (already in IEX
+    territory), so the sliding-edge jump does not apply."""
     import asyncio
     import time as _time
     feed._running = True
 
     calls = []
-    monkeypatch.setattr(
-        feed, "get_historical_segment",
-        lambda sym, tf, before: (calls.append(before) or ([], _time.time(), True)),
-    )
+    deep_cursor = int(_time.time()) - 90 * 86400
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        return [], _time.time(), True
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+    # Speed through the outage backoff (capture the real sleep first).
+    real_sleep = asyncio.sleep
+    async def fast_sleep(_s):
+        await real_sleep(0)
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fast_sleep)
+    # Start the walk already below the ceiling: the init cursor is the
+    # fresh-window oldest bar, so seed one deep bar in the cache.
+    feed._bar_cache.put("QQQ", "15m", _bars([deep_cursor]), _time.time())
     asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
     assert len(calls) == 3  # three empties then give-up
+    assert all(c <= deep_cursor for c in calls)
+
+
+def test_yahoo_segment_empty_window_is_not_cached_as_boundary(feed, monkeypatch):
+    """A Yahoo-path page that answers empty at a cursor INSIDE the 59d
+    ceiling is the sliding edge, not a terminal boundary: it must cool down
+    (retryable) instead of caching an empty segment that strands the chart
+    at the seed edge forever. Measured 2026-11-14: cursor 09-16 13:30 asked
+    Yahoo for bars it had already slid past; the cached empty answer then
+    stopped both the prewalk and the client prefill."""
+    import time as _time
+    before = NOW - 40 * 86400  # fully inside Yahoo coverage
+    with patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]):
+        out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
+    assert out == []
+    seg_tf = "15m<h%d" % before
+    # No fake boundary: the empty segment is NOT a cached entry, and the key
+    # is cooling so a retry waits instead of hammering Yahoo.
+    assert feed._bar_cache.get("QQQ", seg_tf) is None
+    assert feed._bar_cache.is_cooling("QQQ", seg_tf) is True
+
+
+def test_deep_hist_walk_jumps_past_yahoo_ceiling_on_empty_page(feed, monkeypatch):
+    """When the walker's first cursor sits inside the ceiling and answers
+    empty, the walk jumps the cursor a day past the ceiling (routing the
+    next page to Alpaca) instead of declaring the floor."""
+    import asyncio
+    import time as _time
+
+    feed._running = True
+    now = int(_time.time())
+    calls = []
+
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        if len(calls) == 1:
+            return [], _time.time(), False  # empty inside the ceiling
+        # Second page (routed to the archive past the ceiling): a floor.
+        return _bars([now - 100 * 86400]), _time.time(), False
+
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+
+    real_sleep = asyncio.sleep
+    async def fast_sleep(_s):
+        await real_sleep(0)
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fast_sleep)
+
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
+
+    ceiling = now - 59 * 86400
+    # First call at the init cursor (now, cache empty); second call jumped a
+    # day past the ceiling.
+    assert len(calls) == 2
+    assert calls[0] >= ceiling
+    assert calls[1] == ceiling - 86400
