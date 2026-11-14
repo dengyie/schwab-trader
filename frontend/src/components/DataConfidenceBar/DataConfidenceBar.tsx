@@ -26,17 +26,33 @@ export function DataConfidenceBar() {
     ? (orderBook?.quoteTime ?? 0)
     : connectionStatus.lastMessageTime;
 
+  // 时效标签的刷新节奏分档：前 60 秒秒针在跳，1s 跟得上；进入分钟档
+  // 后 5s 足够；更旧 30s 只是兜底。后台标签页完全停止——回前台时
+  // visibilitychange 立即补刷一次再恢复节奏。
   useEffect(() => {
-    if (displayTimestamp > 0) {
-      const updateTime = () => {
-        setLastUpdateTime(formatLastUpdateTime(displayTimestamp));
-      };
-      updateTime();
-      const interval = setInterval(updateTime, 1000);
-      return () => clearInterval(interval);
-    } else {
+    if (displayTimestamp <= 0) {
       setLastUpdateTime('—');
+      return;
     }
+    const refresh = () => setLastUpdateTime(formatLastUpdateTime(displayTimestamp));
+    refresh();
+    const age = () => Date.now() - displayTimestamp;
+    const pace = () => (age() < 60_000 ? 1000 : age() < 3600_000 ? 5000 : 30000);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const start = () => {
+      clearInterval(timer);
+      timer = setInterval(refresh, pace());
+    };
+    start();
+    const onVisibility = () => {
+      if (document.hidden) clearInterval(timer);
+      else { refresh(); start(); }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [displayTimestamp]);
 
   const getStatusText = () => {
