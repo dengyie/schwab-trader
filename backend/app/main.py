@@ -251,7 +251,10 @@ async def lifespan(app: FastAPI):
         loop because the trim lock is held only by glibc.
         """
         import ctypes
-        libc = ctypes.CDLL("libc.so.6")
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            return  # not glibc (macOS dev, musl): no trim, no loop
         while not trim_stop.is_set():
             try:
                 await asyncio.to_thread(libc.malloc_trim, 0)
@@ -269,6 +272,12 @@ async def lifespan(app: FastAPI):
     # Shutdown: Stop feed loop
     trim_stop.set()
     trim_task.cancel()
+    # A trim may be mid-to_thread; reap it so shutdown logs no "destroyed but
+    # pending" noise. Bounded so a stuck trim never delays feed.stop().
+    try:
+        await asyncio.wait_for(asyncio.shield(trim_task), timeout=2.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
     await feed.stop()
 
 

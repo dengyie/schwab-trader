@@ -121,9 +121,10 @@ jobs:
       # BEFORE the Activate script's rollback trap exists (the trap only
       # lives inside that SSH script), the box would sit with the service
       # stopped until the next deploy. A failure-path restart closes that
-      # window: a dead deploy must never leave a dead service.
+      # window: a dead deploy must never leave a dead service. cancelled()
+      # too — a human cancel mid-rsync is the same dead-service outcome.
       - name: Restart service on deploy failure
-        if: failure()
+        if: failure() || cancelled()
         run: |
           ssh -F "$HOME/.ssh/config" deploy-target \
             "sudo -n /usr/bin/systemctl start schwab-trader.service || true"
@@ -155,11 +156,14 @@ jobs:
               # with "Permission denied" (exit 23, 2026-11-11) and kills the
               # rollback itself. Stale bytecode is harmless — Python
               # revalidates against source mtime — so no sweep ever needs it.
+              # Same reason for the || true on both rsyncs: set -eu would
+              # otherwise abort the rollback BEFORE the restart below,
+              # leaving the service stopped on a failed rollback.
               rsync -a --delete --exclude '.venv' --exclude 'data' \
                 --exclude '__pycache__' --exclude '.pytest_cache' \
-                "$backup/backend/" "$live_backend/"
+                "$backup/backend/" "$live_backend/" || true
               if [ -d "$backup/dist" ]; then
-                rsync -a --delete "$backup/dist/" "$live_dist/"
+                rsync -a --delete "$backup/dist/" "$live_dist/" || true
               fi
               sudo -n /usr/bin/systemctl restart schwab-trader.service || true
               echo "Rollback finished; verify manually." >&2
