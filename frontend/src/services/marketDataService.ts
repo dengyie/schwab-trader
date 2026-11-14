@@ -162,6 +162,18 @@ export async function calculateIndicators(symbol: string): Promise<MarketIndicat
   }
 }
 
+/** 从一份收盘价序列客户端推导指标（与 calculateIndicators 的 bars 回退
+ *  路径同一算法）。行情页用它把每标的 2 个请求（bars + model-context）
+ *  砍成 1 个：model-context 在后端还要打 quote + broker.get_position。 */
+export function deriveIndicators(symbol: string, closes: number[]): MarketIndicators | null {
+  const rsi = calculateRSI(closes, 14);
+  if (rsi === null) return null;
+  let momentum: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+  if (rsi > 60) momentum = 'bullish';
+  else if (rsi < 40) momentum = 'bearish';
+  return { symbol, rsi14: rsi, momentum, volatility: calculateVolatility(closes) };
+}
+
 function calculateRSI(closes: number[], period: number): number | null {
   if (closes.length < period + 1) return null;
   let gains = 0, losses = 0;

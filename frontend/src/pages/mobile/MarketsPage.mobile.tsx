@@ -87,8 +87,14 @@ export function MobileMarketsPage() {
 
   useEffect(() => {
     loadData(true);
-    const timer = setInterval(() => loadData(false), 60000);
-    return () => clearInterval(timer);
+    // 后台标签页不轮询；回到前台立即刷一次再恢复 60s 节奏。
+    const timer = setInterval(() => { if (!document.hidden) void loadData(false); }, 60000);
+    const onVisible = () => { if (!document.hidden) void loadData(false); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [loadData]);
 
   const filteredMarkets = useMemo(() => {

@@ -9,7 +9,7 @@ import { MobileMarketsPage } from './mobile';
 import {
   fetchAllMarketsTickers,
   fetchSparkline,
-  calculateIndicators,
+  deriveIndicators,
   formatVolume,
   formatPrice,
   parseSymbol,
@@ -81,12 +81,13 @@ export function MarketsPage() {
           
           const symbol = ticker.symbol;
           // Add small delay between requests to spread load
+          // 指标从同一份 sparkline bars 客户端推导，省掉每标的第二个
+          // 请求（model-context 在后端还要打 quote + broker.get_position）。
           setTimeout(() => {
             fetchSparkline(symbol).then(s => {
-              setMarkets(prev => prev.map(m => m.symbol === symbol ? { ...m, sparkline: s } : m));
-            });
-            calculateIndicators(symbol).then(ind => {
-              setMarkets(prev => prev.map(m => m.symbol === symbol ? { ...m, indicators: ind } : m));
+              setMarkets(prev => prev.map(m => m.symbol === symbol
+                ? { ...m, sparkline: s, indicators: s ? deriveIndicators(symbol, s.prices) : m.indicators }
+                : m));
             });
           }, i * 100); // 100ms delay between each request
         }
@@ -98,9 +99,15 @@ export function MarketsPage() {
 
   useEffect(() => {
     loadData(true);
-    // Increase interval from 10s to 60s to avoid Binance rate limits [[memory:12434456]]
-    const timer = setInterval(() => loadData(false), 60000);
-    return () => clearInterval(timer);
+    // 后台标签页不轮询：行情页离开视线后 60s 一次的四市场聚合纯属空转，
+    // 回到前台立即刷一次再恢复节奏。
+    const timer = setInterval(() => { if (!document.hidden) void loadData(false); }, 60000);
+    const onVisible = () => { if (!document.hidden) void loadData(false); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [loadData]);
 
   const filteredMarkets = useMemo(() => {
