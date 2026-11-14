@@ -258,9 +258,13 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
     [displaySymbols, catalogTickers],
   );
 
-  // 拉取当前市场全部标的价格（对接多市场后端行情）
+  // 拉取当前市场全部标的价格（对接多市场后端行情）。
+  // 节奏跟随该市场的交易时钟：开盘中 15s；收盘/午休 60s —— 收盘后
+  // 每行是昨天的定格价，15s 轮询只是空转打后端（/api/markets 的
+  // clock 随 markets payload 一起返回）。
   useEffect(() => {
     let isSubscribed = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     // 条件请求：行情未变时 304 免下载；etag 随组件生命周期保存在 ref 里。
     const etagRef = { current: undefined as string | undefined };
@@ -293,14 +297,24 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
       }
     };
 
-    fetchPrices();
-    const interval = setInterval(fetchPrices, 15000);
+    const marketDef = markets.find((m) => m.code === activeMarket);
+    const tickPace = () => (marketDef?.clock?.is_open === true ? 15000 : 60000);
+
+    const schedule = () => {
+      if (!isSubscribed) return;
+      timer = setTimeout(async () => {
+        await fetchPrices();
+        schedule();
+      }, tickPace());
+    };
+
+    fetchPrices().then(schedule);
 
     return () => {
       isSubscribed = false;
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
     };
-  }, [activeMarket, updateSymbolPrice]);
+  }, [activeMarket, updateSymbolPrice, markets]);
 
   const getPosition = useCallback((symbol: string) => {
     if (positions instanceof Map) {

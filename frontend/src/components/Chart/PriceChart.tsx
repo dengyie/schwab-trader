@@ -524,6 +524,43 @@ export function PriceChart() {
       prefillFitPendingRef.current = true;
       setPrefillFitTick(t => t + 1);
     }
+    // 右缘空闲预取：prefill 只往左爬，用户往右滚（回到"现在"之后的段，
+    // 5m/15m 的 fresh 窗口右边界外仍有归档段）时才第一次付网络。窗口
+    // 就绪后空闲取一段 newer 段进段缓存，滚动即命中。只取一段：这是
+    // 概率性方向的保险，不是预算消费方。
+    if (hasMoreRef.current) {
+      const symbol = selectedSymbolRef.current;
+      const tf = tfForHistory(timeRangeRef.current);
+      const list = klinesRef.current;
+      const newest = list[list.length - 1]?.time;
+      if (symbol && newest && document.visibilityState !== 'hidden') {
+        const lead = 2000 * 60 * (tf === '5m' ? 5 : tf === '15m' ? 15 : tf === '1h' ? 60 : 240);
+        const cursor = newest + lead;
+        const key = `${symbol}-${tf}-h${cursor}`;
+        if (!segmentsCacheRef.current.has(key)) {
+          void (async () => {
+            try {
+              const r = await apiFetch(`/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${cursor}&page_size=2000&v=${SEGMENT_URL_CACHE_KEY_VERSION}`);
+              if (!r.ok) return;
+              if (selectedSymbolRef.current !== symbol || tfForHistory(timeRangeRef.current) !== tf) return;
+              const data = await r.json();
+              const more: KlineData[] = data.map((k: any) => ({
+                time: (typeof k.time === 'number' ? k.time : Math.floor(new Date(k.time).getTime() / 1000)) as UTCTimestamp,
+                open: parseFloat(k.open), high: parseFloat(k.high),
+                low: parseFloat(k.low), close: parseFloat(k.close),
+                volume: parseFloat(k.volume || 0),
+              }));
+              if (!more.length) return;
+              if (segmentsCacheRef.current.size >= MAX_SEGMENT_ENTRIES) {
+                const oldestSeg = segmentsCacheRef.current.keys().next().value;
+                if (oldestSeg) segmentsCacheRef.current.delete(oldestSeg);
+              }
+              segmentsCacheRef.current.set(key, { data: more, hasMore: r.headers.get('X-Bars-Has-More') === '1' });
+            } catch { /* 空闲预取失败静默：真滚动时 loadOlder 会正常拉 */ }
+          })();
+        }
+      }
+    }
   };
 
   // 合并更早的段到当前序列：按 time 去重、只增不减（纯函数在 klineMerge.ts，测试钉住）。
