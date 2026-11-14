@@ -287,10 +287,20 @@ class BarCache:
         Used for disk-only historical segments: the index entry costs a few
         bytes, so it gets a much larger budget than the bar LRU — enough to
         cover every segment the walker ever wrote (capped on disk anyway).
+        Only index-only keys are candidates: popping a fresh-window key here
+        would drop its fetched_at while its bars stay resident, and a
+        0.0-freshness hit sends every reader into a pointless background
+        refresh (the entry is right there in ``bars``). Fresh keys age out
+        through ``_evict_locked`` at the bar budget instead.
         """
         cap = self.max_entries * 8
-        while len(self._order) > cap:
-            old_key, _ = self._order.popitem(last=False)
+        candidates = [
+            k for k in self._order
+            if self.is_hist_timeframe(k.split(":", 1)[1])
+        ]
+        while len(candidates) > cap:
+            old_key = candidates.pop(0)
+            self._order.pop(old_key, None)
             old_sym, old_tf = old_key.split(":", 1)
             self.fetched_at.get(old_sym, {}).pop(old_tf, None)
 

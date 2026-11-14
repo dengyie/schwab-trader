@@ -117,6 +117,17 @@ jobs:
             backend/ "deploy-target:$stage/backend/"
           rsync -az --delete -e "ssh -F $HOME/.ssh/config" dist/ "deploy-target:$stage/dist/"
 
+      # The Upload step stopped the service; if anything below it fails
+      # BEFORE the Activate script's rollback trap exists (the trap only
+      # lives inside that SSH script), the box would sit with the service
+      # stopped until the next deploy. A failure-path restart closes that
+      # window: a dead deploy must never leave a dead service.
+      - name: Restart service on deploy failure
+        if: failure()
+        run: |
+          ssh -F "$HOME/.ssh/config" deploy-target \
+            "sudo -n /usr/bin/systemctl start schwab-trader.service || true"
+
       - name: Activate release (atomic swap, health gate, rollback)
         run: |
           ssh -F "$HOME/.ssh/config" deploy-target sh -s -- "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" <<'REMOTE'

@@ -884,3 +884,23 @@ def test_hist_segment_disk_cache_evicts_oldest_files_when_over_cap(tmp_path, mon
     # The newest two survive.
     assert "SPY_15m_h1800000000.json" not in files, "oldest cursor evicted"
     assert "SPY_15m_h1796400000.json" in files and "SPY_15m_h1794600000.json" in files
+
+
+def test_index_eviction_never_drops_a_fresh_window_ts(tmp_path):
+    """P2 pin (2026-11-14 review): fresh windows share one _order with
+    hist index keys. The index evictor used to pop from the LRU head
+    blindly — dropping a fresh window's fetched_at while its bars stayed
+    resident, turning every reader into a pointless background refresh.
+    Only index-only (hist) keys are evictable there.
+    """
+    cache = BarCache(directory=str(tmp_path), max_entries=2)
+    fresh = _bars()
+    cache.put("SPY", "15m", fresh)
+    # A walker burst big enough to blow the index cap (2*8=16).
+    for i in range(20):
+        cache.put("QQQ", BarCache.hist_timeframe("15m", 1000 + i), [])
+    entry = cache.get("SPY", "15m")
+    assert entry is not None and len(entry.bars) == len(fresh)
+    assert entry.fetched_at > 0, (
+        "index eviction must not strip a resident fresh window's ts"
+    )
