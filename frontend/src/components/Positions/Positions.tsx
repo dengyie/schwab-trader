@@ -131,8 +131,20 @@ export function Positions() {
       const unrealizedPnl = hasRealTimePrice ? qty.times(currentPrice.minus(avgEntry)) : new Decimal(0);
       const pnlPercent = hasRealTimePrice && avgEntry.gt(0) ? currentPrice.minus(avgEntry).div(avgEntry).times(100) : new Decimal(0);
 
+      // Cross-currency totals must sum USD-converted figures: adding the
+      // native amounts (HKD 100 + JPY 5000 + USD 50) treats 5150 as dollars.
+      // The broker snapshot carries unrealized_pnl_usd for exactly this; a
+      // USD position's native PnL is itself the USD figure.
+      const currency = pos.currency || 'USD';
+      const pnlUsd = new Decimal(
+        hasRealTimePrice
+          ? (currency === 'USD'
+              ? unrealizedPnl
+              : new Decimal(pos.unrealizedPnlUsd ?? 0))
+          : 0,
+      );
       if (hasRealTimePrice) {
-        totalUnrealizedPnl = totalUnrealizedPnl.plus(unrealizedPnl);
+        totalUnrealizedPnl = totalUnrealizedPnl.plus(pnlUsd);
       }
 
       return {
@@ -140,9 +152,10 @@ export function Positions() {
         currentPrice: currentPrice.toNumber(),
         value: value.toNumber(),
         unrealizedPnl: unrealizedPnl.toNumber(),
+        unrealizedPnlUsd: pnlUsd.toNumber(),
         pnlPercent: pnlPercent.toNumber(),
         hasRealTimePrice,
-        currency: pos.currency || 'USD',
+        currency,
       };
     });
 
@@ -247,6 +260,11 @@ export function Positions() {
                       {pos.hasRealTimePrice ? (
                         <>
                           {pos.unrealizedPnl >= 0 ? '+' : '-'}{currencySymbol(pos.currency)}{Math.abs(pos.unrealizedPnl).toFixed(2)}
+                          {pos.currency !== 'USD' && (
+                            <span style={{ opacity: 0.7, marginLeft: 4, fontSize: 9 }}>
+                              (${(pos.unrealizedPnlUsd ?? 0) >= 0 ? '+' : '-'}{Math.abs(pos.unrealizedPnlUsd ?? 0).toFixed(2)})
+                            </span>
+                          )}
                           <span style={{ opacity: 0.7, marginLeft: 4, fontSize: 9 }}>
                             ({pos.pnlPercent >= 0 ? '+' : ''}{pos.pnlPercent.toFixed(1)}%)
                           </span>
