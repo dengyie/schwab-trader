@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 import pytest
+import time
 
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.engine.alpaca_market_feed import (
@@ -25,7 +26,15 @@ from app.models.trading import Bar
 
 ET = ZoneInfo("America/New_York")
 
+# Anchor for cursors ("40d back") — any stable recent epoch works. It must
+# NOT be used to assert clamp boundaries: `_fetch_hist_segment` clamps
+# against time.time(), and this ET-noon anchor drifts ±hours from it
+# depending on when the suite runs (the 2026-11-14 CI red was exactly that:
+# real time had passed the day's ET noon, so NOW-59d exceeded
+# time.time()-59d and a `>=` clamp assertion blew up). Boundary asserts use
+# _NOW_RT below — same source as the implementation.
 NOW = int(datetime.now(ET).replace(hour=12, minute=0, second=0, microsecond=0).timestamp())
+_NOW_RT = int(time.time())
 CEILING = 59 * 86400
 
 
@@ -73,8 +82,9 @@ def test_window_within_ceiling_stays_on_yahoo(feed):
         out = feed._fetch_hist_segment("QQQ", "15m", "15m<h%d" % before, before)
     alpaca.assert_not_called()
     assert yahoo.call_args.kwargs["period2"] == before
-    # Clamped to the ceiling: period1 may not precede now-59d.
-    assert yahoo.call_args.kwargs["period1"] >= NOW - CEILING
+    # Clamped to the ceiling: period1 may not precede the live 59d edge
+    # (clamped against time.time(), not the ET-noon anchor).
+    assert yahoo.call_args.kwargs["period1"] >= _NOW_RT - CEILING
     assert [b.time for b in out] == [b.time for b in ybars]
 
 
@@ -98,7 +108,7 @@ def test_1m_never_routes_to_alpaca(feed):
          patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]) as yahoo:
         feed._fetch_hist_segment("QQQ", "1m", "1m<h%d" % before, before)
     alpaca.assert_not_called()
-    assert yahoo.call_args.kwargs["period1"] >= NOW - 7 * 86400
+    assert yahoo.call_args.kwargs["period1"] >= _NOW_RT - 7 * 86400
 
 
 def test_intl_symbol_never_routes_to_alpaca(feed):
@@ -109,7 +119,7 @@ def test_intl_symbol_never_routes_to_alpaca(feed):
          patch.object(YahooFinanceAdapter, "fetch_bars", return_value=[]) as yahoo:
         feed._fetch_hist_segment("0700.HK", "15m", "15m<h%d" % before, before)
     alpaca.assert_not_called()
-    assert yahoo.call_args.kwargs["period1"] >= NOW - CEILING
+    assert yahoo.call_args.kwargs["period1"] >= _NOW_RT - CEILING
 
 
 def test_alpaca_page_keeps_has_more_contract(feed):
