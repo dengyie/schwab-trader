@@ -7,7 +7,7 @@ import { useWatchlistStore } from '../store/watchlistStore';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import { MobileMarketsPage } from './mobile';
 import {
-  fetchAllTickers,
+  fetchAllMarketsTickers,
   fetchSparkline,
   calculateIndicators,
   formatVolume,
@@ -35,6 +35,8 @@ export function MarketsPage() {
   const [_loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [category, setCategory] = useState('All');
+  // 全市场聚合页：'ALL' = 四市场混排；其余值 = 单市场页签（US/HK/JP/CN）。
+  const [marketScope, setMarketScope] = useState<'ALL' | string>('ALL');
   const [viewMode, setViewMode] = useState<'table' | 'grid'>('table');
   const [sortField, setSortField] = useState<keyof MarketTicker>('quoteVolume24h');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -46,7 +48,7 @@ export function MarketsPage() {
 
   const loadData = useCallback(async (isInitial = false) => {
     try {
-      const tickers = await fetchAllTickers();
+      const tickers = await fetchAllMarketsTickers();
       const initialMarkets: MarketData[] = tickers.map(t => ({
         symbol: t.symbol,
         ticker: t,
@@ -102,8 +104,11 @@ export function MarketsPage() {
   }, [loadData]);
 
   const filteredMarkets = useMemo(() => {
-    // First filter by search term
-    let filtered = markets.filter(m => {
+    // Market scope first: 'ALL' keeps the aggregation, otherwise single market.
+    let filtered = markets.filter(m => marketScope === 'ALL' || m.ticker?.market === marketScope);
+
+    // Then filter by search term
+    filtered = filtered.filter(m => {
       const matchesSearch = m.symbol.toLowerCase().includes(searchTerm.toLowerCase());
       return matchesSearch && m.ticker;
     });
@@ -144,7 +149,7 @@ export function MarketsPage() {
       const vB = b.ticker[sortField] as number;
       return sortOrder === 'desc' ? vB - vA : vA - vB;
     });
-  }, [markets, searchTerm, category, favorites, sortField, sortOrder]);
+  }, [markets, searchTerm, category, favorites, sortField, sortOrder, marketScope]);
 
   const stats = useMemo(() => {
     const active = markets.filter(m => m.ticker);
@@ -316,6 +321,26 @@ export function MarketsPage() {
 
       <div className={`card ${styles.mainCard}`}>
         <div className={styles.toolbar}>
+          <div className={styles.tabs}>
+            {[
+              { id: 'ALL', label: 'All Markets' },
+              { id: 'US', label: 'US' },
+              { id: 'HK', label: 'HK' },
+              { id: 'JP', label: 'JP' },
+              { id: 'CN', label: 'A-share' },
+            ].map(tab => (
+              <button
+                key={tab.id}
+                className={`${styles.tab} ${marketScope === tab.id ? styles.activeTab : ''}`}
+                onClick={() => setMarketScope(tab.id)}
+              >
+                <span>{tab.label}</span>
+                <span className={styles.tabCount}>
+                  {tab.id === 'ALL' ? markets.length : markets.filter(m => m.ticker?.market === tab.id).length}
+                </span>
+              </button>
+            ))}
+          </div>
           <div className={styles.tabs}>
             {[
               { id: 'All', label: 'All', icon: null, count: stats.totalPairs },

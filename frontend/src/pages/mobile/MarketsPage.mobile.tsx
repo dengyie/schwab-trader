@@ -7,7 +7,7 @@ import { MobileSegmentedControl, MobileActionSheet, PullToRefresh } from '../../
 import { MobileHeader } from '../../components/Layout';
 import { useWatchlistStore } from '../../store/watchlistStore';
 import {
-  fetchAllTickers,
+  fetchAllMarketsTickers,
   fetchSparkline,
   formatVolume,
   formatPrice,
@@ -32,6 +32,8 @@ export function MobileMarketsPage() {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [category, setCategory] = useState<Category>('all');
+  // 全市场聚合：'ALL' 混排，US/HK/JP/CN 单市场过滤。
+  const [marketScope, setMarketScope] = useState<'ALL' | string>('ALL');
   const [showSearch, setShowSearch] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<MarketData | null>(null);
   const [showActionSheet, setShowActionSheet] = useState(false);
@@ -46,7 +48,7 @@ export function MobileMarketsPage() {
 
   const loadData = useCallback(async (isInitial = false) => {
     try {
-      const tickers = await fetchAllTickers();
+      const tickers = await fetchAllMarketsTickers();
       const initialMarkets: MarketData[] = tickers.map(t => ({
         symbol: t.symbol,
         ticker: t,
@@ -90,7 +92,9 @@ export function MobileMarketsPage() {
   }, [loadData]);
 
   const filteredMarkets = useMemo(() => {
-    let filtered = markets.filter(m => {
+    // Market scope first, then search — both before the category switch.
+    let filtered = markets.filter(m => marketScope === 'ALL' || m.ticker?.market === marketScope);
+    filtered = filtered.filter(m => {
       const matchesSearch = m.symbol.toLowerCase().includes(searchTerm.toLowerCase());
       return matchesSearch && m.ticker;
     });
@@ -115,7 +119,7 @@ export function MobileMarketsPage() {
     }
 
     return filtered;
-  }, [markets, searchTerm, category, favorites]);
+  }, [markets, searchTerm, category, favorites, marketScope]);
 
   const stats = useMemo(() => {
     const active = markets.filter(m => m.ticker);
@@ -179,6 +183,14 @@ export function MobileMarketsPage() {
     swipingItem.current = null;
   };
 
+  const marketSegments = [
+    { id: 'ALL' as const, label: t.markets?.all || 'All' },
+    { id: 'US' as const, label: 'US' },
+    { id: 'HK' as const, label: 'HK' },
+    { id: 'JP' as const, label: 'JP' },
+    { id: 'CN' as const, label: 'A股' },
+  ];
+
   const categorySegments = [
     { 
       id: 'favorites' as const, 
@@ -223,6 +235,17 @@ export function MobileMarketsPage() {
           )}
         </div>
       )}
+
+      {/* Market Scope */}
+      <div className={styles.categoryNav}>
+        <MobileSegmentedControl
+          segments={marketSegments}
+          activeId={marketScope as never}
+          onChange={(id) => setMarketScope(id as string)}
+          variant="underline"
+          scrollable
+        />
+      </div>
 
       {/* Category Tabs */}
       <div className={styles.categoryNav}>

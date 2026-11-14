@@ -95,6 +95,24 @@ export async function fetchAllTickers(market?: string | null): Promise<MarketTic
   }
 }
 
+/** 全部市场并发聚合：行情页/移动端行情页的全市场视图数据源。
+ *  每市场仍走各自的条件请求缓存；单市场失败不拖垮整页（回退该市场缓存，
+ *  再不行就空数组——别的市场照常渲染）。 */
+export async function fetchAllMarketsTickers(
+  markets: readonly string[] = ['US', 'HK', 'JP', 'CN'],
+): Promise<MarketTicker[]> {
+  const results = await Promise.all(
+    markets.map(async (m) => {
+      try {
+        return await fetchAllTickers(m);
+      } catch {
+        return [];
+      }
+    }),
+  );
+  return results.flat().sort((a, b) => b.quoteVolume24h - a.quoteVolume24h);
+}
+
 export async function fetchSparkline(symbol: string): Promise<MarketSparkline | null> {
   try {
     const response = await apiFetch(`/market/bars?symbol=${encodeURIComponent(symbol)}`);
