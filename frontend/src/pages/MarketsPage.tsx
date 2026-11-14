@@ -4,6 +4,7 @@ import { useI18n } from '../i18n';
 import { Sparkline } from '../components/Chart';
 import { Icon, IconName } from '../components/Icon';
 import { useWatchlistStore } from '../store/watchlistStore';
+import { useInViewOnce } from '../hooks/useInViewOnce';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import { MobileMarketsPage } from './mobile';
 import {
@@ -26,6 +27,33 @@ interface MarketData {
   indicators: MarketIndicators | null;
 }
 
+/** 行级迷你图：进入视口才拉数据（useInViewOnce），拉过的行不再请求。 */
+function LazySparkline({
+  symbol,
+  loaded,
+  onEnrich,
+  height,
+  width,
+  color,
+  placeholderClass,
+}: {
+  symbol: string;
+  loaded: MarketSparkline | null;
+  onEnrich: (symbol: string) => void;
+  height: number;
+  width: number;
+  color: string;
+  placeholderClass: string;
+}) {
+  const ref = useInViewOnce<HTMLDivElement>(() => { if (!loaded) onEnrich(symbol); });
+  if (loaded) {
+    return (
+      <Sparkline data={loaded.prices} height={height} width={width} lineWidth={1.5} color={color} />
+    );
+  }
+  return <div ref={ref} className={placeholderClass} />;
+}
+
 export function MarketsPage() {
   const isMobile = useIsMobile();
 
@@ -43,9 +71,6 @@ export function MarketsPage() {
 
   const { favorites, toggleFavorite, addSymbol, setSelectedSymbol } = useWatchlistStore();
 
-  // Track if we've already loaded sparklines to avoid re-fetching
-  const [sparklinesLoaded, setSparklinesLoaded] = useState(false);
-
   const loadData = useCallback(async (isInitial = false) => {
     try {
       const tickers = await fetchAllMarketsTickers();
@@ -55,7 +80,7 @@ export function MarketsPage() {
         sparkline: null,
         indicators: null,
       }));
-      
+
       // Preserve existing sparklines and indicators when refreshing
       setMarkets(prev => {
         if (prev.length === 0) return initialMarkets;
@@ -69,33 +94,20 @@ export function MarketsPage() {
         });
       });
       setLoading(false);
-
-      // Only fetch sparklines and indicators on initial load to avoid rate limiting
-      if (isInitial && !sparklinesLoaded) {
-        setSparklinesLoaded(true);
-        // Fetch sparklines in batches with delay to avoid rate limits
-        const topSymbols = tickers.slice(0, 30); // Reduced from 50 to 30
-        for (let i = 0; i < topSymbols.length; i++) {
-          const ticker = topSymbols[i];
-          if (!ticker) continue;
-          
-          const symbol = ticker.symbol;
-          // Add small delay between requests to spread load
-          // 指标从同一份 sparkline bars 客户端推导，省掉每标的第二个
-          // 请求（model-context 在后端还要打 quote + broker.get_position）。
-          setTimeout(() => {
-            fetchSparkline(symbol).then(s => {
-              setMarkets(prev => prev.map(m => m.symbol === symbol
-                ? { ...m, sparkline: s, indicators: s ? deriveIndicators(symbol, s.prices) : m.indicators }
-                : m));
-            });
-          }, i * 100); // 100ms delay between each request
-        }
-      }
     } catch (err) {
       console.error('Market load error:', err);
     }
-  }, [sparklinesLoaded]);
+  }, []);
+
+  // 迷你图/指标按需富化：行进入视口才拉 /market/bars（30 个盲拉改成
+  // 只拉看得见的行），指标从同一份 bars 客户端推导。
+  const enrichRow = useCallback((symbol: string) => {
+    fetchSparkline(symbol).then(s => {
+      setMarkets(prev => prev.map(m => m.symbol === symbol
+        ? { ...m, sparkline: s, indicators: s ? deriveIndicators(symbol, s.prices) : m.indicators }
+        : m));
+    });
+  }, []);
 
   useEffect(() => {
     loadData(true);
@@ -456,15 +468,15 @@ export function MarketsPage() {
                       </div>
                     </td>
                     <td>
-                      {m.sparkline ? (
-                        <Sparkline 
-                          data={m.sparkline.prices} 
-                          height={24} 
-                          width={100} 
-                          lineWidth={1.5}
-                          color={(m.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
-                        />
-                      ) : <div className={styles.skeletonWide} />}
+                      <LazySparkline
+                        symbol={m.symbol}
+                        loaded={m.sparkline}
+                        onEnrich={enrichRow}
+                        height={24}
+                        width={100}
+                        color={(m.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
+                        placeholderClass={styles.skeletonWide}
+                      />
                     </td>
                     <td>
                       <button className={styles.tradeBtn}>Execute</button>
@@ -485,15 +497,15 @@ export function MarketsPage() {
                   </div>
                   <div className={styles.cardPrice}>{m.ticker ? formatPrice(m.ticker.price) : '---'}</div>
                   <div className={styles.cardChart}>
-                    {m.sparkline && (
-                      <Sparkline 
-                        data={m.sparkline.prices} 
-                        height={60} 
-                        width={180} 
-                        lineWidth={1.5}
-                        color={(m.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
-                      />
-                    )}
+                    <LazySparkline
+                      symbol={m.symbol}
+                      loaded={m.sparkline}
+                      onEnrich={enrichRow}
+                      height={60}
+                      width={180}
+                      color={(m.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
+                      placeholderClass=""
+                    />
                   </div>
                   <div className={styles.cardFooter}>
                     <span className="text-secondary">Vol: ${formatVolume(m.ticker?.quoteVolume24h ?? 0)}</span>

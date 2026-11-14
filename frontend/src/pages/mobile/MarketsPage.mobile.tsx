@@ -6,6 +6,7 @@ import { Icon } from '../../components/Icon';
 import { MobileSegmentedControl, MobileActionSheet, PullToRefresh } from '../../components/mobile';
 import { MobileHeader } from '../../components/Layout';
 import { useWatchlistStore } from '../../store/watchlistStore';
+import { useInViewOnce } from '../../hooks/useInViewOnce';
 import {
   fetchAllMarketsTickers,
   fetchSparkline,
@@ -23,6 +24,25 @@ interface MarketData {
   sparkline: MarketSparkline | null;
 }
 
+/** 行级迷你图：进入视口才拉数据，拉过的行不再请求。 */
+function LazySparkline({
+  symbol,
+  loaded,
+  onEnrich,
+  color,
+}: {
+  symbol: string;
+  loaded: MarketSparkline | null;
+  onEnrich: (symbol: string) => void;
+  color: string;
+}) {
+  const ref = useInViewOnce<HTMLDivElement>(() => { if (!loaded) onEnrich(symbol); });
+  if (loaded) {
+    return <Sparkline data={loaded.prices} height={60} width={200} lineWidth={1.5} color={color} />;
+  }
+  return <div ref={ref} className={styles.sparklinePlaceholder} />;
+}
+
 type Category = 'favorites' | 'all' | 'gainers' | 'losers' | 'volume';
 
 export function MobileMarketsPage() {
@@ -37,7 +57,6 @@ export function MobileMarketsPage() {
   const [showSearch, setShowSearch] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<MarketData | null>(null);
   const [showActionSheet, setShowActionSheet] = useState(false);
-  const [sparklinesLoaded, setSparklinesLoaded] = useState(false);
 
   const { favorites, toggleFavorite, addSymbol, setSelectedSymbol } = useWatchlistStore();
 
@@ -63,27 +82,17 @@ export function MobileMarketsPage() {
         });
       });
       setLoading(false);
-
-      // Load sparklines for top assets
-      if (isInitial && !sparklinesLoaded) {
-        setSparklinesLoaded(true);
-        const topSymbols = tickers.slice(0, 20);
-        for (let i = 0; i < topSymbols.length; i++) {
-          const ticker = topSymbols[i];
-          if (!ticker) continue;
-          
-          const symbol = ticker.symbol;
-          setTimeout(() => {
-            fetchSparkline(symbol).then(s => {
-              setMarkets(prev => prev.map(m => m.symbol === symbol ? { ...m, sparkline: s } : m));
-            });
-          }, i * 150);
-        }
-      }
     } catch (err) {
       console.error('Market load error:', err);
     }
-  }, [sparklinesLoaded]);
+  }, []);
+
+  // 迷你图按需富化：行进入视口才拉 /market/bars，拉过的行不再请求。
+  const enrichRow = useCallback((symbol: string) => {
+    fetchSparkline(symbol).then(s => {
+      setMarkets(prev => prev.map(m => m.symbol === symbol ? { ...m, sparkline: s } : m));
+    });
+  }, []);
 
   useEffect(() => {
     loadData(true);
@@ -310,15 +319,12 @@ export function MobileMarketsPage() {
 
               {/* Sparkline Column */}
               <div className={styles.sparklineCol}>
-                {market.sparkline && (
-                  <Sparkline
-                    data={market.sparkline.prices}
-                    height={60}
-                    width={200}
-                    lineWidth={1.5}
-                    color={(market.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
-                  />
-                )}
+                <LazySparkline
+                  symbol={market.symbol}
+                  loaded={market.sparkline}
+                  onEnrich={enrichRow}
+                  color={(market.ticker?.priceChangePercent ?? 0) >= 0 ? 'var(--color-positive)' : 'var(--color-negative)'}
+                />
               </div>
 
               {/* Watermark Logo/Text */}

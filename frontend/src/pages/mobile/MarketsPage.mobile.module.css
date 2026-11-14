@@ -369,3 +369,9 @@
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
+
+/* LazySparkline 占位：不渲染图时也占住 200×60，避免滚动插入时行高跳动。 */
+.sparklinePlaceholder {
+  width: 200px;
+  height: 60px;
+}
