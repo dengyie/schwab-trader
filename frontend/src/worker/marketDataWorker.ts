@@ -69,6 +69,12 @@ let connectionId = 0; // 连接 ID，用于处理竞态条件
 let pendingConnectTimer: ReturnType<typeof setTimeout> | null = null; // 延迟连接定时器
 let lastReconnectAttemptTime = 0; // 上次重连尝试时间
 
+// 后台标签页降载：页面隐藏时宿主发 PAUSE（断开 WS，记着订阅的符号），
+// 回到前台发 RESUME（原符号原 token 重连）。后台 tab 里的 WS 心跳、
+// 250ms 指标批、stale 快照刷新全是无人看的空转。
+let paused = false;
+let pausedSymbol: string | null = null;
+
 // 消息速率计算：滑动窗口方式
 const MESSAGE_RATE_WINDOW_MS = 1000; // 1秒窗口
 let messageTimestamps: number[] = [];
@@ -994,11 +1000,33 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
     case 'SUBSCRIBE': {
       const { symbol, token } = payload as SubscribePayload;
       authToken = token ?? null;
+      pausedSymbol = symbol;
+      if (paused) {
+        // 暂停期间切换符号：只记目标，等 RESUME 再连。
+        log('info', 'ws', 'ws.paused_subscribe_deferred', { symbol });
+        break;
+      }
       connect(symbol);
       break;
     }
     case 'UNSUBSCRIBE': {
+      pausedSymbol = null;
       disconnect();
+      break;
+    }
+    case 'PAUSE': {
+      if (paused) break;
+      paused = true;
+      // 只掐连接，不忘记号：RESUME 靠 pausedSymbol 原样恢复。
+      disconnect();
+      log('info', 'ws', 'ws.paused', { symbol: pausedSymbol });
+      break;
+    }
+    case 'RESUME': {
+      if (!paused) break;
+      paused = false;
+      if (pausedSymbol) connect(pausedSymbol);
+      log('info', 'ws', 'ws.resumed', { symbol: pausedSymbol });
       break;
     }
     default:

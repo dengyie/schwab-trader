@@ -62,6 +62,9 @@ interface MarketState {
   // Actions
   subscribe: (symbol: string) => void;
   unsubscribe: () => void;
+  /** 后台标签页降载：断开 WS 但记住订阅，回前台 resume 原样恢复。 */
+  pauseFeed: () => void;
+  resumeFeed: () => void;
   clearLogs: () => void;
   fetchMarketClock: () => Promise<void>;
 }
@@ -499,6 +502,22 @@ export const useMarketStore = create<MarketState>()(
         dataConfidence: getInitialDataConfidence(),
         networkHealth: null,
       });
+    },
+
+    // 后台标签页降载：连接掐掉但 activeSymbol 保留（UI 仍显示当前标的），
+    // 置信度标 closed——这是"用户不在看"，不是"喂流坏了"。
+    pauseFeed: () => {
+      const { worker } = get();
+      if (worker && get().activeSymbol) {
+        worker.postMessage({ type: 'PAUSE', payload: {}, timestamp: performance.now() });
+      }
+    },
+
+    resumeFeed: () => {
+      const { worker, activeSymbol } = get();
+      if (worker && activeSymbol) {
+        worker.postMessage({ type: 'RESUME', payload: {}, timestamp: performance.now() });
+      }
     },
 
     // Clear logs

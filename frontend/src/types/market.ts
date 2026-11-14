@@ -180,6 +180,8 @@ export const CONFIDENCE_THRESHOLDS = {
 export type WorkerMessageType =
   | 'SUBSCRIBE'
   | 'UNSUBSCRIBE'
+  | 'PAUSE'
+  | 'RESUME'
   | 'ORDERBOOK_UPDATE'
   | 'TRADE_UPDATE'
   | 'BAR_UPDATE'
