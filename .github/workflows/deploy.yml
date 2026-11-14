@@ -190,7 +190,8 @@ jobs:
           echo "Release $1-$2 activated."
           REMOTE
 
-      - name: Verify public production route        run: |
+      - name: Verify public production route
+        run: |
           body=""
           for i in $(seq 1 10); do
             body=$(curl -fsS --connect-timeout 5 --max-time 8 https://trader.mangoqwq.com/api/health || true)
