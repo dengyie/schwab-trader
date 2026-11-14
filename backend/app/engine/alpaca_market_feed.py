@@ -21,6 +21,7 @@ from app.adapters import defeatbeta_adapter
 from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.config import settings
 from app.core.markets import (
+    MARKETS,
     freshness_updates,
     is_market_open,
     market_of,
@@ -1437,7 +1438,7 @@ class AlpacaMarketFeedService:
                 await asyncio.sleep(10.0)
 
     async def _deep_hist_prewarm_loop(self) -> None:
-        """Walk every US symbol's 15m/5m archive to its floor, once per boot.
+        """Walk every catalog symbol's archive toward its floor, once per boot.
 
         The chart's "show me all the data" ask is answered by the segment
         chain, but a chain of ~100 IEX pages at ~15-20s each is ~30 minutes of
@@ -1448,6 +1449,16 @@ class AlpacaMarketFeedService:
         the floor. Every page lands in the same RAM+disk cache with its
         7-day TTL, so once a span has been walked the client's prefill is a
         sequence of cache hits (measured ~300ms per page from CF/edge).
+
+        Every market walks, not just the US list (2026-11-15: HK/JP/CN
+        charts were first-touch crawls). The floors differ by source: US
+        15m/5m page past Yahoo's 59d edge into the IEX archive; other
+        markets stop at Yahoo's ceiling — their walk is a handful of pages,
+        then the walker's floor detection ends it. 1h/4h/1d Yahoo spans
+        (730d / unlimited) are market-independent and walk everywhere.
+        Prewarm timeframes stay 15m/5m: the deep 1h/4h/1d walk is a
+        separate decision (110 pages × 3 more tfs would triple the boot
+        IO for spans users rarely page).
 
         Restart-safe by construction: pages already on disk short-circuit in
         the cache, so a re-boot resumes near where the last process left off.
@@ -1462,11 +1473,9 @@ class AlpacaMarketFeedService:
         tfs = list(self.DEEP_HIST_PREWARM_TFS)
         while self._running:
             for tf in tfs:
-                for sym in self.symbols:
+                for sym in self._deep_hist_symbols():
                     if not self._running:
                         return
-                    if market_of(sym).code != "US":
-                        continue
                     try:
                         await self._deep_hist_walk_symbol(sym, tf)
                     except asyncio.CancelledError:
@@ -1483,6 +1492,25 @@ class AlpacaMarketFeedService:
             # happens where the 7d segment TTL has expired, re-priming those
             # pages in the background for the next client.
             await asyncio.sleep(3600.0)
+
+    def _deep_hist_symbols(self) -> List[str]:
+        """Every market's catalog, US first, one walk slot per symbol.
+
+        The walk serves whatever a chart could open: the tracked US list
+        plus each market's curated catalog (HK/JP/CN were skipped outright
+        and left first-touch crawls). US leads so the busiest charts warm
+        first; interleaving markets mid-pass would only reorder cache hits,
+        and the page pace (DEEP_HIST_PAGE_PACE) already caps the write rate
+        for the whole sequence — the 1GB box's protection is the pace, not
+        the symbol list.
+        """
+        seen: Dict[str, str] = {}
+        for sym in sorted(self.symbols):
+            seen[sym.upper()] = sym.upper()
+        for market in MARKETS.all():
+            for sym in market.catalog:
+                seen.setdefault(sym.upper(), sym.upper())
+        return list(seen.values())
 
     async def _deep_hist_walk_symbol(self, sym: str, tf: str) -> None:
         """One symbol/timeframe: page to the floor via the public segment API."""

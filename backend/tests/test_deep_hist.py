@@ -488,3 +488,42 @@ def test_deep_hist_prewarm_loop_waits_out_the_boot_grace(feed, monkeypatch):
     asyncio.run(feed._deep_hist_prewarm_loop())
     assert slept[:2] == [feed.DEEP_HIST_BOOT_GRACE, 3600.0] or \
         feed.DEEP_HIST_BOOT_GRACE in slept[:1]
+
+
+def test_deep_hist_symbols_covers_every_market_catalog(feed):
+    """The prewarm walk must reach every market's chart, not just the US
+    list (2026-11-15: HK/JP/CN charts were first-touch crawls — the walker
+    skipped any symbol whose market wasn't US). US tracked symbols lead;
+    each market's catalog follows; duplicates collapse; the page pace, not
+    a shorter list, is what protects the 1GB box's IO.
+    """
+    syms = feed._deep_hist_symbols()
+    assert "QQQ" in syms                       # tracked US symbol
+    assert syms.index("QQQ") < syms.index("0700.HK")  # US leads
+    for expected in ("0700.HK", "7203.T", "600519.SS"):
+        assert expected in syms, f"{expected} (HK/JP/CN catalog) must be walked"
+    assert len(syms) == len(set(syms))         # no duplicate walk slots
+
+
+def test_deep_hist_prewarm_loop_walks_non_us_symbols(feed, monkeypatch):
+    """The loop body must not re-add the US-only skip it used to have:
+    a HK catalog symbol passed to the walker is walked, not filtered."""
+    import asyncio
+    feed._running = True
+
+    walked = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(s):
+        # Pace sleeps yield immediately; the loop is stopped from the walker
+        # itself (a boot-grace stop here would exit before the first walk).
+        await real_sleep(0)
+
+    async def fake_walk(sym, tf):
+        walked.append(sym)
+        if sym == "0700.HK":
+            feed._running = False  # stop once a non-US symbol has been reached
+
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(feed, "_deep_hist_walk_symbol", fake_walk)
+    asyncio.run(feed._deep_hist_prewarm_loop())
+    assert "0700.HK" in walked, "HK catalog symbol must reach the walker"
