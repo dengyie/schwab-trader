@@ -527,10 +527,12 @@ export const enUS: Locale = {
   // Watchlist
   watchlist: {
     title: 'Watchlist',
-    searchPlaceholder: 'Search symbols...',
+    searchPlaceholder: 'Search symbols... (any code + Enter)',
     showAll: 'Show All',
     showFavorites: 'Favorites Only',
     noResults: 'No matching symbols',
+    noSuchSymbol: 'Unknown symbol — check the code, e.g. BRK-B / 9984.T / 002415',
+    probing: 'Looking up…',
     empty: 'Watchlist is empty',
     stalePrice: 'Market open, but no recent trade',
     symbols: 'symbols',

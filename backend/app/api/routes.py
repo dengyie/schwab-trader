@@ -22,6 +22,7 @@ from app.models.trading import (
 )
 from app.engine.base_broker import BaseBroker
 from app.adapters.model_exporter import ModelFeatureExporter
+from app.adapters.yahoo_adapter import YahooFinanceAdapter
 from app.core.auth import require_auth
 from app.core.config import settings
 from app.core.markets import (
@@ -303,6 +304,33 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 {**market_payload(market), "clock": market_clock(market)}
                 for market in MARKETS.all()
             ],
+        }
+
+    @router.get("/market/symbol-lookup", dependencies=[Depends(require_auth)])
+    def lookup_symbol(symbol: str, market: Optional[str] = None) -> Dict[str, Any]:
+        """Probe ANY ticker shape, not just the curated catalog.
+
+        The watchlist search box only filters the fixed catalog, so a valid
+        but unlisted code (BRK-B, 9984.T, 002415.SZ typed bare as 002415)
+        looked like a miss. This resolves the input through the same
+        ``resolve_symbol`` rules the trading endpoints use, then asks Yahoo's
+        chart meta whether the code actually answers — no price is invented,
+        an unknown symbol stays a 404.
+        """
+        ref = resolve_symbol(symbol, market)
+        if ref is None:
+            raise HTTPException(status_code=400, detail=f"Invalid symbol: {symbol!r}")
+        meta = YahooFinanceAdapter.fetch_meta(ref.symbol)
+        if not meta:
+            raise HTTPException(status_code=404, detail=f"No data for {ref.symbol}")
+        return {
+            "symbol": ref.symbol,
+            "market": ref.market.code,
+            "currency": meta.get("currency") or ref.market.currency,
+            "exchange": meta.get("exchangeName") or ref.market.exchange,
+            "price": meta.get("regularMarketPrice"),
+            "previous_close": meta.get("chartPreviousClose") or meta.get("previousClose"),
+            "timezone": meta.get("timezone") or ref.market.timezone,
         }
 
     # Market Data Endpoints ----------------------------------------------

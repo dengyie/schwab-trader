@@ -319,6 +319,7 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
     setShowFavoritesOnly,
     toggleFavorite,
     togglePinned,
+    addSymbol,
   } = useWatchlistStore();
 
   // 选中当前市场的第一个标的，确保切市场后图表/下单不会指向空符号。
@@ -347,12 +348,53 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
     inputRef.current?.focus();
   }, [setSearchQuery]);
 
+  // 任一代码直达：query 不在当前目录时，走后端 resolve+Yahoo 探测。
+  // 命中即加入列表并选中；未命中保持 "No matching symbols" 原状。
+  const [lookupState, setLookupState] = useState<'idle' | 'probing' | 'miss'>('idle');
+  const handleLookupOpen = useCallback(async (raw: string) => {
+    setLookupState('probing');
+    try {
+      const response = await apiFetch(
+        `/market/symbol-lookup?symbol=${encodeURIComponent(raw)}&market=${encodeURIComponent(activeMarket)}`,
+      );
+      if (!response.ok) {
+        setLookupState('miss');
+        return;
+      }
+      const found = (await response.json()) as { symbol: string; currency?: string };
+      addSymbol({ symbol: found.symbol, baseAsset: found.symbol, quoteAsset: found.currency || '' });
+      setSelectedSymbol(found.symbol);
+      onSymbolChange?.(found.symbol);
+      setSearchQuery('');
+      setLookupState('idle');
+    } catch {
+      setLookupState('miss');
+    }
+  }, [activeMarket, addSymbol, setSelectedSymbol, onSymbolChange, setSearchQuery]);
+  const currentIndexRef = useRef(-1);
+  currentIndexRef.current = displaySymbols.findIndex((s) => s.symbol === selectedSymbol);
+
   // 键盘导航
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      // Enter on a non-catalog query probes the symbol-lookup endpoint:
+      // any valid Yahoo code (BRK-B, 9984.T, bare 002415 under a CN hint)
+      // opens directly instead of dying in "No matching symbols".
+      const query = searchQuery.trim();
+      const exact = displaySymbols.find((s) => s.symbol.toLowerCase() === query.toLowerCase());
+      if (query && !exact) {
+        e.preventDefault();
+        void handleLookupOpen(query);
+      } else if (currentIndexRef.current >= 0) {
+        e.preventDefault();
+        onSymbolChange?.(selectedSymbol);
+      }
+      return;
+    }
     if (displaySymbols.length === 0) return;
-    
+
     const currentIndex = displaySymbols.findIndex(s => s.symbol === selectedSymbol);
-    
+
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       const nextIndex = currentIndex < displaySymbols.length - 1 ? currentIndex + 1 : 0;
@@ -363,11 +405,8 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
       const prevIndex = currentIndex > 0 ? currentIndex - 1 : displaySymbols.length - 1;
       const prevSymbol = displaySymbols[prevIndex];
       if (prevSymbol) handleSymbolSelect(prevSymbol.symbol);
-    } else if (e.key === 'Enter' && currentIndex >= 0) {
-      // Enter 确认当前选中
-      onSymbolChange?.(selectedSymbol);
     }
-  }, [displaySymbols, selectedSymbol, handleSymbolSelect, onSymbolChange]);
+  }, [displaySymbols, selectedSymbol, handleSymbolSelect, onSymbolChange, searchQuery, handleLookupOpen]);
 
   return (
     <div className={`card ${styles.container} ${isCollapsed ? styles.collapsed : ''}`}>
@@ -449,9 +488,13 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
           ))
         ) : (
           <div className={styles.empty}>
-            {isCollapsed ? <Icon name="search" size="sm" /> : (searchQuery 
-              ? (t.watchlist?.noResults || 'No matching symbols')
-              : (t.watchlist?.empty || 'No symbols in watchlist'))}
+            {isCollapsed ? <Icon name="search" size="sm" /> : (lookupState === 'probing'
+              ? (t.watchlist?.probing || 'Looking up…')
+              : lookupState === 'miss' && searchQuery
+                ? (t.watchlist?.noSuchSymbol || 'Unknown symbol — check the code, e.g. BRK-B / 9984.T / 002415')
+                : (searchQuery
+                  ? (t.watchlist?.noResults || 'No matching symbols')
+                  : (t.watchlist?.empty || 'No symbols in watchlist')))}
           </div>
         )}
       </div>

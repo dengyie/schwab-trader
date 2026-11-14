@@ -526,10 +526,12 @@ export const zhCN = {
   // 自选列表
   watchlist: {
     title: '自选列表',
-    searchPlaceholder: '搜索股票代码...',
+    searchPlaceholder: '搜索股票代码...（任意代码 + 回车直达）',
     showAll: '显示全部',
     showFavorites: '只显示收藏',
     noResults: '未找到匹配的交易对',
+    noSuchSymbol: '未知代码 — 检查写法，如 BRK-B / 9984.T / 002415',
+    probing: '正在查询…',
     empty: '自选列表为空',
     stalePrice: '该市场已开盘，但最近没有新的成交',
     symbols: '个标的',

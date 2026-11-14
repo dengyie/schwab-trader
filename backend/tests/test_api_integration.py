@@ -647,3 +647,72 @@ def test_portfolio_history_endpoint(monkeypatch):
     client2 = TestClient(app2)
     assert client2.get("/api/portfolio/history", headers=AUTH).status_code == 404
     assert client2.get("/api/portfolio/history").status_code == 401
+
+
+def test_symbol_lookup_resolves_any_valid_shape():
+    """/api/market/symbol-lookup must probe beyond the curated catalog.
+
+    The watchlist search box filters a fixed catalog; a valid unlisted code
+    (9984.T typed bare, 002415.SZ, BRK-B) looked like a miss. The endpoint
+    resolves through resolve_symbol then asks Yahoo's meta for the truth.
+    """
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+
+    from app.api.routes import create_api_router
+
+    app = FastAPI(); app.include_router(create_api_router(ledger, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+
+    with patch("app.api.routes.YahooFinanceAdapter.fetch_meta") as meta:
+        meta.return_value = {
+            "regularMarketPrice": 7320.0,
+            "chartPreviousClose": 7300.0,
+            "currency": "JPY",
+            "exchangeName": "JPX",
+            "timezone": "Asia/Tokyo",
+        }
+        resp = client.get("/api/market/symbol-lookup",
+                          params={"symbol": "9984", "market": "JP"}, headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    # Bare numeric under the JP hint pads to the 4-digit Yahoo code.
+    assert body["symbol"] == "9984.T"
+    assert body["currency"] == "JPY"
+    assert body["price"] == 7320.0
+
+    with patch("app.api.routes.YahooFinanceAdapter.fetch_meta") as meta:
+        meta.return_value = {"regularMarketPrice": 12.5, "currency": "CNY"}
+        resp = client.get("/api/market/symbol-lookup",
+                          params={"symbol": "002415", "market": "CN"}, headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["symbol"] == "002415.SZ"
+
+
+def test_symbol_lookup_unknown_symbol_is_404():
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+
+    from app.api.routes import create_api_router
+
+    app = FastAPI(); app.include_router(create_api_router(ledger, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+    with patch("app.api.routes.YahooFinanceAdapter.fetch_meta", return_value=None):
+        resp = client.get("/api/market/symbol-lookup", params={"symbol": "ZZZZZ"}, headers=AUTH)
+    assert resp.status_code == 404
+
+
+def test_symbol_lookup_rejects_bad_shapes_and_requires_auth():
+    from fastapi import FastAPI
+
+    from app.api.routes import create_api_router
+
+    app = FastAPI(); app.include_router(create_api_router(ledger, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+    assert client.get("/api/market/symbol-lookup", params={"symbol": "../../etc"}).status_code == 401
+    resp = client.get("/api/market/symbol-lookup", params={"symbol": "../../etc"}, headers=AUTH)
+    assert resp.status_code == 400
+    resp = client.get("/api/market/symbol-lookup", params={"symbol": "0700.XX"}, headers=AUTH)
+    assert resp.status_code == 400
