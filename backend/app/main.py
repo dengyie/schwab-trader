@@ -237,10 +237,38 @@ async def lifespan(app: FastAPI):
     global _main_loop
     _configure_logging()
     _main_loop = asyncio.get_running_loop()
+    trim_stop = asyncio.Event()
+
+    async def _malloc_trim_loop() -> None:
+        """Return freed heap to the OS every 10 minutes.
+
+        glibc's allocator holds freed Python-object pages inside thread
+        arenas: after the deep-hist walk and prefill bursts, RSS stayed at
+        its peak indefinitely (observed ~137MB where ~80MB was arena
+        residue). malloc_trim releases those pages; on the 1GB e2 instance
+        that headroom is the difference between comfortable and swap-thrash.
+        ctypes on the running interpreter, libc only — safe from the event
+        loop because the trim lock is held only by glibc.
+        """
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        while not trim_stop.is_set():
+            try:
+                await asyncio.to_thread(libc.malloc_trim, 0)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(trim_stop.wait(), timeout=600.0)
+            except asyncio.TimeoutError:
+                pass
+
+    trim_task = asyncio.create_task(_malloc_trim_loop(), name="malloc-trim")
     # Startup: Launch market feed loop
     await feed.start()
     yield
     # Shutdown: Stop feed loop
+    trim_stop.set()
+    trim_task.cancel()
     await feed.stop()
 
 
