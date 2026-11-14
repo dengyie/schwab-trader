@@ -716,6 +716,12 @@ html, body {
     animation: fadeIn 0.2s ease-out;
   }
 
+  /* 路由懒加载的 chunk 拉取占位：占满视口高，避免布局塌陷闪屏。 */
+  .page-loading {
+    min-height: 100vh;
+    background: var(--bg-primary);
+  }
+
   @keyframes slideUp {
     from { transform: translateY(100%); opacity: 0; }
     to { transform: translateY(0); opacity: 1; }

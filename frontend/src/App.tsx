@@ -1,28 +1,39 @@
-import { useEffect } from 'react';
+import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AdaptiveLayout } from './components/Layout';
 import { ToastContainer } from './components/Toast';
-import { TradePage } from './pages/TradePage';
-import { MarketsPage } from './pages/MarketsPage';
-import { WalletPage } from './pages/WalletPage';
-import { AssetDetailPage } from './pages/AssetDetailPage';
-import { OrdersPage } from './pages/OrdersPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { AuthPage } from './pages/AuthPage';
 import { useAuthStore } from './store/authStore';
 import { useMarketsStore } from './store/marketsStore';
+
+// 路由级代码拆分：主 bundle 不再携带全部页面。页面全部 lazy——首次进入
+// 时按需拉 chunk（CF 边缘 <300ms），登录页用户不再下载钱包/订单/行情页
+// 的代码，/trade 常客也不会为不用的页面付下载和解析成本。
+const TradePage = lazy(() => import('./pages/TradePage').then(m => ({ default: m.TradePage })));
+const MarketsPage = lazy(() => import('./pages/MarketsPage').then(m => ({ default: m.MarketsPage })));
+const WalletPage = lazy(() => import('./pages/WalletPage').then(m => ({ default: m.WalletPage })));
+const AssetDetailPage = lazy(() => import('./pages/AssetDetailPage').then(m => ({ default: m.AssetDetailPage })));
+const OrdersPage = lazy(() => import('./pages/OrdersPage').then(m => ({ default: m.OrdersPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
+const AuthPage = lazy(() => import('./pages/AuthPage').then(m => ({ default: m.AuthPage })));
+
+function PageFallback() {
+  // 极简加载态：chunk 拉取通常 <300ms，不值得上骨架屏。
+  return <div className="page-loading" aria-busy="true" />;
+}
 
 // Private Route Component
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated } = useAuthStore();
-  return isAuthenticated ? <>{children}</> : <Navigate to="/auth" replace />;
+  return isAuthenticated ? <Suspense fallback={<PageFallback />}>{children}</Suspense> : <Navigate to="/auth" replace />;
 };
 
 // Auth page wrapper - standalone without layout
 function AuthPageWrapper() {
   return (
     <div className="app-container">
-      <AuthPage />
+      <Suspense fallback={<PageFallback />}>
+        <AuthPage />
+      </Suspense>
       <ToastContainer />
     </div>
   );
@@ -49,7 +60,7 @@ export function App() {
     window.addEventListener('schwab:unauthorized', onUnauthorized);
     return () => window.removeEventListener('schwab:unauthorized', onUnauthorized);
   }, []);
-  
+
   // Auth page is rendered standalone without the adaptive layout
   if (location.pathname === '/auth') {
     return <AuthPageWrapper />;
