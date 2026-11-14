@@ -49,7 +49,8 @@ export function BottomTabs({ onPriceClick }: BottomTabsProps) {
   const [leftTab, setLeftTab] = useState<LeftTab>('positions');
   const [rightTab, setRightTab] = useState<RightTab>('radar');
   const [modelContext, setModelContext] = useState<any>(null);
-  
+  const [radarOpened, setRadarOpened] = useState(false);
+
   const openOrdersCount = useTradingStore((state) => state.getOpenOrders().length);
   const positionsCount = Array.from(useTradingStore((state) => state.positions.entries())).filter(([_, pos]) => parseFloat(pos.quantity) > 0).length;
   const triggersCount = useAutomationStore((state) => state.triggers.filter(t => t.enabled).length);
@@ -60,13 +61,16 @@ export function BottomTabs({ onPriceClick }: BottomTabsProps) {
     fetchOrders();
   }, [fetchOrders]);
 
+  // model-context 只在雷达页签打开过才拉：后端这条要跑 quote + bars +
+  // broker.get_position 全链，不看的页签白打一次是纯空转。切换标的时
+  // 若雷达已开过，重新拉取让推荐跟当前符号走。
   useEffect(() => {
-    if (!selectedSymbol) return;
+    if (!radarOpened || !selectedSymbol) return;
     apiFetch(`/market/model-context?symbol=${encodeURIComponent(selectedSymbol)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => d && setModelContext(d))
       .catch(() => {});
-  }, [selectedSymbol]);
+  }, [radarOpened, selectedSymbol]);
 
   const handlePriceClick = useCallback((price: string, side?: 'buy' | 'sell') => {
     onPriceClick?.(price, side);
@@ -116,9 +120,9 @@ export function BottomTabs({ onPriceClick }: BottomTabsProps) {
         <div className={styles.rightColumn}>
           <div className={styles.columnHeader}>
             <div className={styles.tabs}>
-              <button 
+              <button
                 className={`${styles.tab} ${rightTab === 'radar' ? styles.active : ''}`}
-                onClick={() => setRightTab('radar')}
+                onClick={() => { setRightTab('radar'); setRadarOpened(true); }}
               >
                 <Icon name="cpu" size="xs" />
                 <span>AI Radar</span>
