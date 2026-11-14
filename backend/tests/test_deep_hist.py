@@ -299,11 +299,6 @@ def test_deep_hist_walk_symbol_stops_at_floor(feed, monkeypatch):
     feed._running = True
 
     calls = []
-    pages = [
-        # cursor 1000 -> oldest 800 (has_more), then floor at 800.
-        ([_bars([800, 900]), _bars([800, 900])], True),
-        ([_bars([700, 750]), _bars([700, 750])], False),
-    ]
 
     def fake_seg(sym, tf, before):
         calls.append(before)
@@ -401,3 +396,59 @@ def test_deep_hist_walk_jumps_past_yahoo_ceiling_on_empty_page(feed, monkeypatch
     assert len(calls) == 2
     assert calls[0] >= ceiling
     assert calls[1] == ceiling - 86400
+
+
+def test_deep_hist_walk_parks_on_temporary_empty_then_fills(feed, monkeypatch):
+    """F2 (2026-11-14): `([], 0.0, False)` is "couldn't get it right now" —
+    _fetch_hist_segment converts upstream failures to exactly this tuple, so
+    the old code's 3-failure give-up stranded a hole mid-archive (and its
+    except-park branch was unreachable). The walker must park (25s) and
+    retry, and resume the walk on the first real answer. The cursor must
+    never move during a park."""
+    import asyncio
+    import time as _time
+    feed._running = True
+
+    calls = []
+    pause = feed.DEEP_HIST_RETRY_PAUSE
+    slept = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(s):
+        slept.append(s)
+        await real_sleep(0)
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fake_sleep)
+
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        if len(calls) <= 2:
+            return [], 0.0, False  # upstream outage (cooldown / failure tuple)
+        return _bars([before - 900, before - 1800]), _time.time(), False
+
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
+
+    assert len(calls) == 3
+    assert slept == [pause, pause], "each miss parks exactly one retry pause"
+    assert all(c == calls[0] for c in calls), "cursor must not move on a miss"
+
+
+def test_deep_hist_walk_gives_up_after_five_temporary_misses(feed, monkeypatch):
+    """Persistent upstream trouble is not a race: after 5 consecutive
+    fetched_at==0.0 misses the walk stops for this symbol (disk resume and
+    the next hourly pass pick it up), instead of spinning forever."""
+    import asyncio
+    import time as _time
+    feed._running = True
+
+    calls = []
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        return [], 0.0, False
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+    real_sleep = asyncio.sleep
+    async def fast_sleep(_s):
+        await real_sleep(0)
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fast_sleep)
+
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
+    assert len(calls) == 5  # five misses then give-up

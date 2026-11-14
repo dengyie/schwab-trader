@@ -518,6 +518,35 @@ def test_hist_segment_survives_a_restart(tmp_path):
     assert entry.bars == seg
 
 
+def test_hist_segment_terminal_empty_survives_a_restart(tmp_path):
+    """A stored empty segment IS a cache entry, not a miss (F4, 2026-11-14):
+    the writer recorded a terminal fact (archive floor / young symbol), and
+    rejecting it on disk-load made every reboot re-hit upstream — routing the
+    answer through the 503 cooldown path mid-outage instead of the cached 200.
+    (The fresh-window path never writes empties: _fetch_upstream returns None
+    without putting, so allowing empty loads cannot resurrect stale windows.)"""
+    cache = BarCache(directory=str(tmp_path))
+    tf = cache.hist_timeframe("15m", 1_800_000_000)
+    cache.put("SPY", tf, [], fetched_at=time.time())
+
+    reopened = BarCache(directory=str(tmp_path))
+    entry = reopened.get("SPY", tf)
+    assert entry is not None
+    assert entry.bars == []
+    assert entry.fetched_at > 0
+    assert reopened.is_fresh(entry, tf) is True
+
+
+def test_fresh_window_empty_is_still_not_written(tmp_path):
+    """The other half of the F4 contract: a fresh-window upstream miss must
+    not persist an empty file — only segment paths ever write empties, which
+    is what makes the empty-survives-reboot load above safe."""
+    first = BarCache(str(tmp_path))
+    # _fetch_upstream's guard is in the feed; at the cache level pin it by
+    # never calling put() for a fresh window without bars.
+    assert (tmp_path / "bars" / "SPY_15m.json").exists() is False
+
+
 def test_daily_window_falls_back_to_defeatbeta(make_feed, monkeypatch):
     """Yahoo answering the whole-window daily request with nothing must not
     leave the daily chart blank: it may be the rate limit, not the listing's

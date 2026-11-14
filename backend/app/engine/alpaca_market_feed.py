@@ -225,6 +225,9 @@ class AlpacaMarketFeedService:
     # disk *before* anyone asks for it, so the first chart paint shows the
     # full span instead of a 59d seed.
     DEEP_HIST_PREWARM_PAUSE = 1.0
+    # Backoff between "temporary nothing" answers while walking (cooldown
+    # windows last 30s; five misses over ~2min then give the symbol up).
+    DEEP_HIST_RETRY_PAUSE = 25.0
     DEEP_HIST_PREWARM_TFS = ("15m", "5m")
 
     def __init__(
@@ -1434,10 +1437,11 @@ class AlpacaMarketFeedService:
         Restart-safe by construction: pages already on disk short-circuit in
         the cache, so a re-boot resumes near where the last process left off.
         Ordering walks one timeframe per symbol fully before the next
-        timeframe: the chart's default (15m) completes first. Failures raise
-        inside ``_fetch_hist_segment`` already; one symbol's failure must not
-        stall the walk, but an Alpaca-wide outage should — so consecutive
-        failures park the loop for a minute instead of burning quota.
+        timeframe: the chart's default (15m) completes first. Upstream
+        trouble surfaces inside ``get_historical_segment`` as a
+        ``([], 0.0, False)`` tuple (failure == empty), which the walker
+        treats as retryable rather than terminal — the except below is only
+        a safety net for escapes that bypass that contract.
         """
         await asyncio.sleep(5.0)
         tfs = list(self.DEEP_HIST_PREWARM_TFS)
@@ -1454,13 +1458,15 @@ class AlpacaMarketFeedService:
                         return
                     except Exception as exc:
                         logger.warning("Deep-hist prewalk %s %s failed: %s", sym, tf, exc)
-                        # An upstream-wide failure (429s, auth) would repeat
-                        # for every remaining symbol; park briefly instead.
-                        await asyncio.sleep(60.0)
+                        # Safety net (the walk itself already parks on
+                        # temporary empties): something escaped the
+                        # failure==empty contract — brief park, next symbol.
+                        await asyncio.sleep(10.0)
                         break
-            # The archive extends only by the passage of time (a new session
-            # appends nothing at the old end), so a completed walk never needs
-            # re-running within this process. Sleep long; wake only to exit.
+            # Each full pass re-walks every symbol, but every page is then a
+            # cache hit (the walk itself costs ~nothing) — the only real work
+            # happens where the 7d segment TTL has expired, re-priming those
+            # pages in the background for the next client.
             await asyncio.sleep(3600.0)
 
     async def _deep_hist_walk_symbol(self, sym: str, tf: str) -> None:
@@ -1469,11 +1475,33 @@ class AlpacaMarketFeedService:
         entry = self._bar_cache.get(sym, tf)
         oldest = int(entry.bars[0].time) if entry and entry.bars else int(time.time())
         failures = 0
+        empty_misses = 0  # consecutive "temporary nothing" answers (fetched_at == 0.0)
         while self._running:
-            bars, _fetched, has_more = await asyncio.to_thread(
+            bars, fetched, has_more = await asyncio.to_thread(
                 self.get_historical_segment, sym, tf, oldest
             )
             if not bars:
+                # Two kinds of empty, per the 503 contract (routes.py):
+                # fetched_at == 0.0 is "couldn't get it right now" — upstream
+                # failure, cooldown window, single-flight the waiter did not
+                # land. The old code counted it as a floor failure and gave
+                # up after 3, leaving a hole mid-archive for hours (and the
+                # outer except never fired because _fetch_hist_segment
+                # converts upstream errors to this empty tuple — measured
+                # 2026-11-14: an Alpaca 429 storm never reached the
+                # "upstream-wide outage" park). A fetched_at > 0 empty IS the
+                # terminal fact (floor or young symbol) and stops the walk.
+                if not fetched:
+                    empty_misses += 1
+                    failures = 0
+                    if empty_misses >= 5:
+                        # Persistent upstream trouble, not a race: stop
+                        # walking this symbol; the caller's outer loop and
+                        # the next boot's disk resume will pick it up.
+                        return
+                    await asyncio.sleep(self.DEEP_HIST_RETRY_PAUSE)
+                    continue
+                empty_misses = 0
                 failures += 1
                 # An empty page at a cursor still inside Yahoo's 59d window
                 # is the sliding-edge artifact, not the floor: Yahoo's oldest
@@ -1489,11 +1517,12 @@ class AlpacaMarketFeedService:
                     await asyncio.sleep(self.DEEP_HIST_PREWARM_PAUSE)
                     continue
                 if failures >= 3 or not has_more:
-                    # Three consecutive empty pages with the cursor unmoved:
-                    # the floor (or an upstream outage). Either way, stop.
+                    # Three consecutive terminal empties with the cursor
+                    # unmoved: the floor. Stop.
                     return
                 await asyncio.sleep(5.0)
                 continue
+            empty_misses = 0
             failures = 0
             next_oldest = int(bars[0].time)
             if next_oldest >= oldest:

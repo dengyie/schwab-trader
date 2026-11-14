@@ -36,8 +36,12 @@ logger = logging.getLogger(__name__)
 # Disk entries older than this are pruned: a week-old candle series is not a
 # cache hit worth keeping. Runtime staleness is unbounded by design.
 MAX_DISK_AGE_SECONDS = 30 * 24 * 3600
-# Files kept on disk; the RAM cache is bounded separately.
-MAX_DISK_FILES = 400
+# Files kept on disk; the RAM cache is bounded separately. The deep-history
+# pre-run writes ~110 segment files per (symbol, timeframe) — 14 US symbols
+# x 2 timeframes ≈ 3,000 files (measured 2026-11-14: 857 files / 80MB at
+# ~60% coverage). A 400 cap would let the next boot's prune delete exactly
+# the oldest — i.e. the hardest-to-refetch deep archive pages.
+MAX_DISK_FILES = 4000
 # After a failed fetch, do not retry that key for this long. Without it an
 # upstream outage turns every request (and every tab) into another attempt.
 FAILURE_COOLDOWN_SECONDS = 30.0
@@ -319,7 +323,14 @@ class BarCache:
                 pass
             return None
         if not bars:
-            return None
+            # A stored empty IS a real entry when it carries a fresh
+            # timestamp: the writer recorded a terminal fact (the archive
+            # floor, or a symbol younger than the window). Rejecting it here
+            # would make every reboot re-hit upstream for that answer
+            # (measured 2026-11-14: young symbols' floor pages were refetched
+            # after every deploy) — and mid-outage that empty answer would
+            # route through the 503 path instead of the cacheable 200.
+            return CacheEntry(bars=[], fetched_at=ts)
         if time.time() - ts > MAX_DISK_AGE_SECONDS:
             return None
         with self._lock:

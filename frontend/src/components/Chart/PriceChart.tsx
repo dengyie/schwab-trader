@@ -91,6 +91,16 @@ function tfForHistory(range: TimeRange): string {
   return INTERVAL_MAP[range] || range;
 }
 
+// 段 URL 缓存键版本：段响应被 CF 边缘（s-maxage=7d）和浏览器本地缓存
+// （max-age=86400）双重缓存，缓存键是完整 URL。缓存语义出过事故时（假边界
+// 时代把空 200 钉了 7 天，2026-11-14）把这里 +1 即可整体作废所有旧条目——
+// 边缘 purge 清不了浏览器本地缓存，换键是唯一零手动操作的逃生门。
+const SEGMENT_URL_CACHE_KEY_VERSION = 2;
+
+// SWR 标的缓存单条上限（根数）：窗口快照远小于补载后的完整序列，全量驻留
+// 50 个标的 ≈ 数百 MB。只存窗口尾，恢复时的合并规则见 fetchKlines。
+const MAX_CACHED_BARS = 4000;
+
 function calculateMA(data: KlineData[], period: number) {
   const result = [];
   for (let i = period - 1; i < data.length; i++) {
@@ -288,7 +298,14 @@ export function PriceChart() {
         if (oldestKey) klinesCacheRef.current.delete(oldestKey);
       }
       const etag = response.headers.get('etag') || undefined;
-      klinesCacheRef.current.set(cacheKey, { data: finalData, timestamp: now, etag });
+      // SWR 缓存只存窗口尾（窗口 + 少量余量）：prefill 后的序列可达 166k 根，
+      // 全量驻留 × 50 个标的 ≈ 数百 MB（2026-11-14 review 实测风险）。被裁掉
+      // 的历史由两层兜底：同序列恢复时 keepHistoryAheadOfWindow 从 klinesRef
+      // 取回完整历史；跨标的/刷新后由 segmentsCacheRef 的段缓存重建。
+      const dataForCache = finalData.length > MAX_CACHED_BARS
+        ? finalData.slice(-MAX_CACHED_BARS)
+        : finalData;
+      klinesCacheRef.current.set(cacheKey, { data: dataForCache, timestamp: now, etag });
 
       klinesRef.current = finalData;
       setKlines(finalData);
@@ -298,10 +315,13 @@ export function PriceChart() {
       const appError = handleApiError(err);
       logError(appError);
       
-      // 有缓存数据时使用旧缓存
+      // 有缓存数据时使用旧缓存兜底。缓存里只存了窗口尾（MAX_CACHED_BARS
+      // 上限），所以必须按同序列规则从 klinesRef 取回已补载的历史——直接
+      // `klinesRef.current = cached.data` 会把窗口前的历史静默裁掉。
       if (cached) {
-        klinesRef.current = cached.data;
-        setKlines(cached.data);
+        const restored = keepHistoryAheadOfWindow(klinesRef.current, cached.data);
+        klinesRef.current = restored;
+        setKlines(restored);
         setError(null);
         setLoading(false);
         return;
@@ -355,20 +375,28 @@ export function PriceChart() {
       // page_size 显式进 URL：段响应的 CF 缓存键是完整 URL（auth 头不在键
       // 内），历史空响应（假边界时代）会以 s-maxage=7d 存活——带参 URL 与
       // 旧键不同，天然绕开毒缓存；同时把分段契约显式化。
-      // v=2：浏览器本地 HTTP 缓存（max-age=86400）也存了 bug 时期的空 200，
-      // CF purge 管不到它——换键让旧键整体作废（2026-11-14，cursor
-      // 1622714400 的空 [] 在本地缓存存活到次日）。
-      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000&v=2`;
+      // v=SEGMENT_URL_CACHE_KEY_VERSION：浏览器本地 HTTP 缓存（max-age=86400）
+      // 也存了 bug 时期的空 200，CF purge 管不到它——换键让旧键整体作废。
+      const url = `/market/bars?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&before=${oldest}&page_size=2000&v=${SEGMENT_URL_CACHE_KEY_VERSION}`;
       // 冷段首次拉取要跑整条上游档案链（15-20s），远超 apiFetch 的 10s
       // 超时——服务端预跑若还没走到该段，请求会 AbortError。段是不可变
-      // 的，重试命中的是同一份将来必在的数据：静默重试 3 次（递增退避），
-      // 服务端预跑每页 1s，三次重试足以等到 walker 把该段写盘。
+      // 的，重试命中的是同一份将来必在的数据：静默重试 3 次（退避），服务
+      // 端预跑每页 1s，三次重试足以等到 walker 把该段写盘。
+      // 503 带源站的 Retry-After（冷却窗口 30s，源站建议 10s）：按它退避
+      // 而不是固定 3s——3s 重试大概率再吃一个 503，白耗重试预算。
       let response: Response | null = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const r = await apiFetch(url);
           if (r.ok) { response = r; break; }
-          if (r.status >= 500 && attempt < 2) { await new Promise(res => setTimeout(res, 3000 * (attempt + 1))); continue; }
+          if (r.status >= 500 && attempt < 2) {
+            const retryAfter = parseInt(r.headers.get('Retry-After') || '', 10);
+            const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+              ? Math.min(retryAfter * 1000, 15000)
+              : 3000 * (attempt + 1);
+            await new Promise(res => setTimeout(res, waitMs));
+            continue;
+          }
           response = r; break;  // 4xx 等：不重试，走统一错误路径
         } catch (err) {
           if (attempt >= 2) throw err;   // 末次失败交给 catch 静默
@@ -442,6 +470,13 @@ export function PriceChart() {
     '5m': 120, '15m': 120, '1h': 20, '4h': 20,
   };
   const prefillBudget = PREFILL_PAGE_BUDGETS[tfForHistory(timeRange)] ?? 0;
+  // prefill 批量刷帧：prefill 循环内 defer 开关打开，mergeOlderSegment 只
+  // 更新 klinesRef（序列真相源），每 PREFILL_FLUSH_EVERY 页才 setKlines 一次——
+  // 每页一次全量 setData（166k 根 × ~110 页 ≈ 900 万根推给图表）是 prefill
+  // 期间的主卡顿源（2026-11-14 review）。手动翻页路径不 defer，仍逐段即时上屏。
+  const deferChartFlushRef = useRef(false);
+  const deferredSetKlinesRef = useRef(false);
+  const PREFILL_FLUSH_EVERY = 10;
   prefillRef.current = async () => {
     if (!hasMoreRef.current) return;
     let lastOldest = klinesRef.current[0]?.time ?? 0;
@@ -451,15 +486,32 @@ export function PriceChart() {
     prefillHintTimerRef.current = window.setTimeout(() => {
       if (prefillTokenRef.current === token) setPrefillVisible(true);
     }, 500);
+    deferChartFlushRef.current = true;
     try {
+      let sinceFlush = 0;
       for (let page = 0; page < prefillBudget && hasMoreRef.current; page++) {
         await loadOlderRef.current?.();
+        sinceFlush++;
+        // 批量刷帧：每 PREFILL_FLUSH_EVERY 页把 klinesRef 的最新长度推给
+        // 图表一次（用户能看到进度），而不是每页全量 setData。
+        if (sinceFlush >= PREFILL_FLUSH_EVERY) {
+          sinceFlush = 0;
+          deferredSetKlinesRef.current = false;
+          setKlines(klinesRef.current);
+        }
         const oldest = klinesRef.current[0]?.time ?? 0;
         if (oldest === lastOldest) break; // 到边（或重复页）：停止翻页，但已补的段仍要重适配
         lastOldest = oldest;
         grew = true;
       }
     } finally {
+      deferChartFlushRef.current = false;
+      // 终帧兜底：循环结束/中断时把最后未刷的页推上去（含预算耗尽、
+      // 到边提前 break、loadOlder 抛错中断三种路径）。
+      if (deferredSetKlinesRef.current) {
+        deferredSetKlinesRef.current = false;
+        setKlines(klinesRef.current);
+      }
       if (prefillTokenRef.current === token) {
         if (prefillHintTimerRef.current !== null) {
           window.clearTimeout(prefillHintTimerRef.current);
@@ -484,7 +536,11 @@ export function PriceChart() {
     const merged = prependOlderSegment(klinesRef.current, older);
     if (merged === klinesRef.current) return; // 无新增（全部重复）
     klinesRef.current = merged;
-    setKlines(merged);
+    if (deferChartFlushRef.current) {
+      deferredSetKlinesRef.current = true;
+    } else {
+      setKlines(merged);
+    }
     // 常驻轻量诊断：线上核对"历史是否真的进了序列"用（/trade 控制台读
     // window.__mergeLog）。不可变段合并频率极低，日志开销可忽略。
     if (typeof window !== 'undefined') {
