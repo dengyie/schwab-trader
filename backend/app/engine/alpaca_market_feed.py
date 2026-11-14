@@ -224,10 +224,25 @@ class AlpacaMarketFeedService:
     # chart subscribers: the point is to have decades of immutable history on
     # disk *before* anyone asks for it, so the first chart paint shows the
     # full span instead of a 59d seed.
+    # Kept for the sliding-edge jump inside the walk (a ceiling hop is one
+    # page like any other now, paced by DEEP_HIST_PAGE_PACE); the walk's own
+    # page cadence moved to DEEP_HIST_PAGE_PACE below.
     DEEP_HIST_PREWARM_PAUSE = 1.0
     # Backoff between "temporary nothing" answers while walking (cooldown
     # windows last 30s; five misses over ~2min then give the symbol up).
     DEEP_HIST_RETRY_PAUSE = 25.0
+    # Post-boot delay before the walk begins, and the pace once running. The
+    # 2026-11-14 outage: two restarts in 3 minutes (deploy + ops verify) put
+    # the walk's fetch+write loop on top of the boot preload while swap was
+    # already warm — load 10.6 on 2 cores, agent dead, box wedged for 40+
+    # minutes. The walk serves no live user: 15 minutes of grace lets the
+    # preload settle and the fresh windows land, and a 4s/page pace caps the
+    # write rate well under what a standard PD + swap can absorb. A full
+    # archive pass (~110 pages/symbol/tf) takes ~7h at this pace, but pages
+    # on disk are cache hits, so steady state after the first complete pass
+    # is nearly free.
+    DEEP_HIST_BOOT_GRACE = 900.0
+    DEEP_HIST_PAGE_PACE = 4.0
     DEEP_HIST_PREWARM_TFS = ("15m", "5m")
 
     def __init__(
@@ -1443,7 +1458,7 @@ class AlpacaMarketFeedService:
         treats as retryable rather than terminal — the except below is only
         a safety net for escapes that bypass that contract.
         """
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(self.DEEP_HIST_BOOT_GRACE)
         tfs = list(self.DEEP_HIST_PREWARM_TFS)
         while self._running:
             for tf in tfs:
@@ -1514,7 +1529,7 @@ class AlpacaMarketFeedService:
                 if oldest >= ceiling:
                     oldest = ceiling - 86400
                     failures = 0
-                    await asyncio.sleep(self.DEEP_HIST_PREWARM_PAUSE)
+                    await asyncio.sleep(self.DEEP_HIST_PAGE_PACE)
                     continue
                 if failures >= 3 or not has_more:
                     # Three consecutive terminal empties with the cursor
@@ -1531,5 +1546,5 @@ class AlpacaMarketFeedService:
             oldest = next_oldest
             if not has_more:
                 return
-            await asyncio.sleep(self.DEEP_HIST_PREWARM_PAUSE)
+            await asyncio.sleep(self.DEEP_HIST_PAGE_PACE)
 

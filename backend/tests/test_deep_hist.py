@@ -452,3 +452,29 @@ def test_deep_hist_walk_gives_up_after_five_temporary_misses(feed, monkeypatch):
 
     asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m"))
     assert len(calls) == 5  # five misses then give-up
+
+
+def test_deep_hist_prewarm_loop_waits_out_the_boot_grace(feed, monkeypatch):
+    """2026-11-14 outage regression pin: the walk's fetch+write loop landing
+    on top of the boot preload while swap was warm wedged the 1GB e2 box
+    (load 10.6 on 2 cores, agent dead 40+ min). The loop must sleep out
+    DEEP_HIST_BOOT_GRACE before its first page."""
+    import asyncio
+    feed._running = True
+
+    slept = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(s):
+        slept.append(s)
+        if s >= feed.DEEP_HIST_BOOT_GRACE:
+            feed._running = False  # stop the loop after the grace sleep
+        await real_sleep(0)
+
+    async def never_walk(sym, tf):
+        raise AssertionError("walk must not start before the boot grace")
+
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(feed, "_deep_hist_walk_symbol", never_walk)
+    asyncio.run(feed._deep_hist_prewarm_loop())
+    assert slept[:2] == [feed.DEEP_HIST_BOOT_GRACE, 3600.0] or \
+        feed.DEEP_HIST_BOOT_GRACE in slept[:1]

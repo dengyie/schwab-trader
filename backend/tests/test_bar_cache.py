@@ -8,6 +8,7 @@ matter how many callers ask, and a restart does not start cold.
 """
 import json
 import os
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -279,6 +280,52 @@ def test_ancient_cache_files_are_pruned(tmp_path):
 
     BarCache(str(tmp_path))
     assert not old.exists()
+
+
+def test_disk_write_is_fsync_free(tmp_path, monkeypatch):
+    """2026-11-14 outage regression pin: the deep-hist walk wrote one fsynced
+    page a second on top of a warm swap — load 10.6 on 2 cores with 3% CPU
+    (pure D-state), box wedged 40+ minutes. These payloads are a cache; the
+    same-filesystem rename is atomic and a lost tail of immutable history
+    just re-fetches. fsync must therefore never appear on the write path."""
+    cache = BarCache(str(tmp_path))
+    calls = []
+    real_fsync = os.fsync
+    def spy_fsync(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+    monkeypatch.setattr("app.engine.bar_cache.os.fsync", spy_fsync)
+
+    cache.put("SPY", "15m", _bars(), fetched_at=time.time())
+    assert calls == [], "cache writes must not fsync"
+
+
+def test_prune_cap_scales_down_on_small_disk(tmp_path, monkeypatch):
+    """The 4000 cap assumes a big disk; on the 1GB-RAM GCP e2 with a 30GB
+    standard PD the rebuild cost of a huge archive is what wedged the box.
+    The cap must taper with free disk instead of being a hard constant."""
+    import app.engine.bar_cache as bc
+
+    from collections import namedtuple
+    disk_usage_result = namedtuple("usage", "total used free")
+    # 1GB free: 15% ≈ 160MB ≈ ~1,800 files — above the floor, tapered.
+    fake = lambda _: disk_usage_result(
+        total=30 * 2**30, used=29 * 2**30, free=1 * 2**30)
+    monkeypatch.setattr(bc.shutil, "disk_usage", fake)
+    resolved = bc._resolve_max_disk_files()
+    assert resolved == max(bc.MAX_DISK_FILES_FLOOR, int((1 * 2**30 * 0.15) / 90_000))
+    assert resolved < bc.MAX_DISK_FILES_CEILING, "1GB free must taper below the ceiling"
+
+    # A starved disk tapers all the way to the floor.
+    fake_tiny = lambda _: disk_usage_result(
+        total=30 * 2**30, used=30 * 2**30 - 200 * 2**20, free=200 * 2**20)
+    monkeypatch.setattr(bc.shutil, "disk_usage", fake_tiny)
+    assert bc._resolve_max_disk_files() == bc.MAX_DISK_FILES_FLOOR
+
+    fake_big = lambda _: disk_usage_result(
+        total=400 * 2**30, used=100 * 2**30, free=300 * 2**30)
+    monkeypatch.setattr(bc.shutil, "disk_usage", fake_big)
+    assert bc._resolve_max_disk_files() == bc.MAX_DISK_FILES_CEILING
 
 
 def test_ram_cache_is_still_bounded(make_feed):

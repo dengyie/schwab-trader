@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -41,7 +42,35 @@ MAX_DISK_AGE_SECONDS = 30 * 24 * 3600
 # x 2 timeframes ≈ 3,000 files (measured 2026-11-14: 857 files / 80MB at
 # ~60% coverage). A 400 cap would let the next boot's prune delete exactly
 # the oldest — i.e. the hardest-to-refetch deep archive pages.
-MAX_DISK_FILES = 4000
+# Measured ceiling, not a constant: the deep-hist walk writes one fsynced
+# file per page, and on the 2-core/1GB e2 instance (standard PD, ~100
+# IOPS) that write pace colliding with the boot preload is what wedged the
+# box in swap thrash on 2026-11-14 (load 10.6 on 2 cores, agent dead). The
+# cap now yields to however much disk the instance actually has, so a
+# small VM keeps a smaller archive instead of trading RAM+IO for history
+# it cannot afford to hold.
+MAX_DISK_FILES_CEILING = 4000
+MAX_DISK_FILES_FLOOR = 600  # what the pre-F1 cap protected, as a minimum
+
+
+def _resolve_max_disk_files() -> int:
+    """Scale the disk-file budget to the filesystem holding the cache.
+
+    ~90KB per segment file, write-side. On the 30GB boot disk of the small
+    GCP instance, 4,000 files ≈ 360MB of JSON — fine for the disk, but the
+    *rebuild* cost (walker re-writing every page through fsync) and the boot
+    prune scan are what a 1GB-RAM box chokes on when swap is already warm.
+    A generous budget is also self-defeating there: pages beyond what the
+    RAM LRU (300 keys) can hold get re-parsed from a slow disk on demand.
+    Keep the ceiling for big disks; taper to the floor on small ones.
+    """
+    free = shutil.disk_usage(".").free if os.path.exists(".") else 0
+    if free <= 0:
+        return MAX_DISK_FILES_FLOOR
+    # ~90KB/file write-side; keep the archive under ~15% of free disk.
+    by_disk = int((free * 0.15) / 90_000)
+    return max(MAX_DISK_FILES_FLOOR, min(MAX_DISK_FILES_CEILING, by_disk))
+
 # After a failed fetch, do not retry that key for this long. Without it an
 # upstream outage turns every request (and every tab) into another attempt.
 FAILURE_COOLDOWN_SECONDS = 30.0
@@ -276,8 +305,18 @@ class BarCache:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, separators=(",", ":"))
                 fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
+                # fsync per write was the wedge on the small GCP instance:
+                # the deep-hist walk emits a page a second, each fsync is a
+                # ~10ms flush on a standard PD, and swap-in of the displaced
+                # pages turns every flush into several — the 2026-11-14
+                # outage had load 10.6 on 2 cores with 3% CPU (pure D-state).
+                # These payloads are a *cache*: durability beyond the OS
+                # flush interval buys nothing that matters. Rename without
+                # fsync — the file is complete the instant the rename lands
+                # (same-filesystem rename is atomic), and a machine crash
+                # that loses the last few seconds of segment writes just
+                # re-fetches immutable history later.
+                os.replace(tmp, path)
         except OSError as exc:
             logger.warning("Bar cache write failed at %s: %s", path, exc)
             try:
@@ -363,8 +402,9 @@ class BarCache:
                 except OSError:
                     continue
             files.sort(reverse=True)
+            cap = _resolve_max_disk_files()
             for index, (mtime, path) in enumerate(files):
-                if mtime < cutoff or index >= MAX_DISK_FILES:
+                if mtime < cutoff or index >= cap:
                     path.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Bar cache prune failed: %s", exc)
