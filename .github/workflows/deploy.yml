@@ -104,6 +104,13 @@ jobs:
       - name: Upload release to staging
         run: |
           stage="/opt/schwab-trader/.staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Stop the service BEFORE the ~3min rsync window. On the 1GB e2-micro
+          # an old-code boot storm (walker + fsync writes) wedges the box mid-
+          # rsync and kills the deploy (2026-11-14, two CI runs lost the race).
+          # With the service down there is no storm source to race against;
+          # start/stop sudo grants match restart in /etc/sudoers.d/schwab-deploy.
+          ssh -F "$HOME/.ssh/config" deploy-target \
+            "sudo -n /usr/bin/systemctl stop schwab-trader.service || true"
           ssh -F "$HOME/.ssh/config" deploy-target "rm -rf '$stage' && mkdir -p '$stage/backend' '$stage/dist'"
           rsync -az --delete -e "ssh -F $HOME/.ssh/config" \
             --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' \
@@ -161,7 +168,7 @@ jobs:
 
           "$live_backend/.venv/bin/pip" install -q --disable-pip-version-check \
             -r "$live_backend/requirements.txt"
-          sudo -n /usr/bin/systemctl restart schwab-trader.service
+          sudo -n /usr/bin/systemctl start schwab-trader.service
 
           healthy=0
           for i in $(seq 1 20); do
@@ -183,8 +190,7 @@ jobs:
           echo "Release $1-$2 activated."
           REMOTE
 
-      - name: Verify public production route
-        run: |
+      - name: Verify public production route        run: |
           body=""
           for i in $(seq 1 10); do
             body=$(curl -fsS --connect-timeout 5 --max-time 8 https://trader.mangoqwq.com/api/health || true)
