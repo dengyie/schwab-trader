@@ -5,6 +5,7 @@ import { apiFetch } from '../../services/apiClient';
 import { computeSessionStats, marketTimezoneFor } from '../../utils/sessionStats';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useMarketStore } from '../../store/marketStore';
+import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
 import { useAutomationStore } from '../../store/automationStore';
 import { useTradingStore } from '../../store/tradingStore';
 import { useIsMobile } from '../../hooks/useMediaQuery';
@@ -179,6 +180,12 @@ export function PriceChart() {
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
   const selectedSymbolRef = useRef<string | null>(null);
   selectedSymbolRef.current = selectedSymbol;
+  // 收盘降频依据：/markets payload 每市场自带 clock（Watchlist 轮询同一依据）。
+  const markets = useMarketsStore((s) => s.markets);
+  const marketOpen = useMemo(() => {
+    const def = markets.find((m) => m.code === marketCodeOfSymbol(selectedSymbol || '', markets));
+    return def?.clock?.is_open !== false; // 时钟缺失保守按开盘（多轮询好过漏更新）
+  }, [markets, selectedSymbol]);
   const triggers = useAutomationStore((state) => state.triggers);
   const openOrders = useTradingStore((state) => state.orders.filter(o => o.status === 'open'));
   
@@ -590,12 +597,23 @@ export function PriceChart() {
     }
   }, []);
 
-  // 定时刷新（60秒间隔，避免速率限制）
+  // 定时刷新：后台标签页不刷（visibilitychange 回前台立即补一次）；收盘后
+  // 降频到 180s——K 线是定格数据，60s 一次的整窗拉取纯属空转。实时跳动
+  // 由 WS 的 TRADE/BAR 推送承担，不受此节奏影响。
   useEffect(() => {
     if (!selectedSymbol) return;
-    const interval = setInterval(() => fetchKlines(selectedSymbol, INTERVAL_MAP[timeRange]), 60000);
-    return () => clearInterval(interval);
-  }, [selectedSymbol, timeRange, fetchKlines]);
+    const refresh = () => {
+      if (document.hidden) return;
+      void fetchKlines(selectedSymbol, INTERVAL_MAP[timeRange]);
+    };
+    const interval = setInterval(refresh, marketOpen ? 60000 : 180000);
+    const onVisible = () => { if (!document.hidden) refresh(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [selectedSymbol, timeRange, fetchKlines, marketOpen]);
 
   // 格式化时间
   const formatTime = useCallback((timestamp: number) => {
