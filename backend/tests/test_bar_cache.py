@@ -846,3 +846,41 @@ def test_scan_timeout_arms_cooldown_and_reports_error(monkeypatch):
     t0 = time.time()
     assert db.fetch_daily_history("SPY") is None
     assert time.time() - t0 < 0.5, "cooldown short-circuits before the scan"
+
+
+def test_hist_segment_stays_out_of_ram_when_disk_backed(tmp_path):
+    """Disk-only contract (2026-11-14): the deep-hist prewarm promoted ~110
+    pages per (symbol, tf) into the RAM LRU and pushed the 1GB e2 instance
+    to 596MB RSS mid-walk. With a disk directory, a segment put() records
+    only its index (fetched_at) — the bars themselves must not live in RAM.
+    """
+    cache = BarCache(directory=str(tmp_path))
+    tf = cache.hist_timeframe("15m", 1_800_000_000)
+    seg = _hist_bars(1_800_000_000 - 900, 500)
+    cache.put("SPY", tf, seg)
+
+    assert "SPY" not in cache.bars, "segment bars must not occupy the RAM LRU"
+    assert cache.fetched_at_of("SPY", tf) > 0, "index keeps the freshness ts"
+    # The disk copy is the cache: get() pages it back on demand.
+    entry = cache.get("SPY", tf)
+    assert entry is not None and len(entry.bars) == 500
+    assert entry.bars == seg
+
+
+def test_hist_segment_disk_cache_evicts_oldest_files_when_over_cap(tmp_path, monkeypatch):
+    """With segments disk-only, the global file cap must run on the write
+    path (the walker emits a page a second) — not just at boot. Writing
+    more files than the cap deletes the oldest mtimes.
+    """
+    monkeypatch.setattr("app.engine.bar_cache._resolve_max_disk_files", lambda: 2)
+    cache = BarCache(directory=str(tmp_path))
+    for i in range(4):
+        tf = cache.hist_timeframe("15m", 1_800_000_000 - i * 900 * 2000)
+        cache.put("SPY", tf, _hist_bars(1_800_000_000 - i * 900 * 2000 - 900, 2))
+        time.sleep(0.01)  # distinct mtimes for the eviction order
+
+    files = sorted(p.name for p in (tmp_path / "bars").glob("*.json"))
+    assert len(files) == 2, f"cap=2 must evict down to 2, got {len(files)}"
+    # The newest two survive.
+    assert "SPY_15m_h1800000000.json" not in files, "oldest cursor evicted"
+    assert "SPY_15m_h1796400000.json" in files and "SPY_15m_h1794600000.json" in files

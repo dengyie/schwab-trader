@@ -179,6 +179,18 @@ class BarCache:
                 bars = sym_map[timeframe.lower()]
                 ts = self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
                 return CacheEntry(bars=bars, fetched_at=ts)
+            # A hist-segment put() records only fetched_at (disk-only cache):
+            # a timestamped index hit with no RAM bars means "this segment
+            # exists on disk" — fall through to the disk load below.
+            if (
+                self.is_hist_timeframe(timeframe)
+                and self.fetched_at.get(symbol.upper(), {}).get(timeframe.lower(), 0.0)
+            ):
+                pass  # fall through to _load_from_disk
+            elif timeframe.lower() in self.fetched_at.get(symbol.upper(), {}):
+                # fetched_at with no bars and no disk file: the entry was
+                # evicted from RAM and its disk copy is gone — a real miss.
+                return None
         return self._load_from_disk(symbol, timeframe)
 
     def is_fresh(self, entry: Optional[CacheEntry], timeframe: str) -> bool:
@@ -210,15 +222,35 @@ class BarCache:
         sym = symbol.upper()
         tf = timeframe.lower()
         ts = time.time() if fetched_at is None else fetched_at
-        with self._lock:
-            self.bars.setdefault(sym, {})[tf] = bars
-            self.fetched_at.setdefault(sym, {})[tf] = ts
-            key = self._key(sym, tf)
-            self._order[key] = None
-            self._order.move_to_end(key)
-            if self.is_hist_timeframe(tf):
-                self._evict_oldest_segment_locked(sym, tf)
-            self._evict_locked()
+        # Historical segments are disk-only when a disk exists. The deep-hist
+        # walk writes ~110 pages per (symbol, timeframe); promoting them into
+        # the RAM LRU is what pushed the 1GB e2 instance to 596MB RSS
+        # mid-prewarm (measured 2026-11-14, ~190MB of live Bar objects plus
+        # parse peaks). A segment is immutable and paged back from disk in
+        # ~10ms on demand — the disk copy IS the cache. Fresh windows still
+        # live in RAM (hot, small). With no disk directory (tests, or a
+        # cache-less deployment) the RAM path stays the only storage.
+        disk_backed = self._directory is not None
+        if self.is_hist_timeframe(tf) and disk_backed:
+            with self._lock:
+                # fetched_at still tracks the RAM "index": freshness checks
+                # and ETags read it without a disk round-trip. Bars are not
+                # stored — get() will load them from disk on demand.
+                self.fetched_at.setdefault(sym, {})[tf] = ts
+                key = self._key(sym, tf)
+                self._order[key] = None
+                self._order.move_to_end(key)
+                self._evict_index_locked()
+        else:
+            with self._lock:
+                self.bars.setdefault(sym, {})[tf] = bars
+                self.fetched_at.setdefault(sym, {})[tf] = ts
+                key = self._key(sym, tf)
+                self._order[key] = None
+                self._order.move_to_end(key)
+                if self.is_hist_timeframe(tf) and not disk_backed:
+                    self._evict_oldest_segment_locked(sym, tf)
+                self._evict_locked()
         self._write_to_disk(sym, tf, bars, ts)
 
     def _evict_oldest_segment_locked(self, sym: str, tf: str) -> None:
@@ -248,6 +280,19 @@ class BarCache:
             if not self.bars.get(old_sym):
                 self.bars.pop(old_sym, None)
                 self.fetched_at.pop(old_sym, None)
+
+    def _evict_index_locked(self) -> None:
+        """Evict LRU index entries (fetched_at only, no bars to drop).
+
+        Used for disk-only historical segments: the index entry costs a few
+        bytes, so it gets a much larger budget than the bar LRU — enough to
+        cover every segment the walker ever wrote (capped on disk anyway).
+        """
+        cap = self.max_entries * 8
+        while len(self._order) > cap:
+            old_key, _ = self._order.popitem(last=False)
+            old_sym, old_tf = old_key.split(":", 1)
+            self.fetched_at.get(old_sym, {}).pop(old_tf, None)
 
     # -- single-flight ---------------------------------------------------
     def begin_refresh(self, symbol: str, timeframe: str) -> bool:
@@ -323,6 +368,13 @@ class BarCache:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+            return
+        # The global disk cap now does ALL the eviction for hist segments
+        # (they no longer occupy the RAM LRU), so it must run on the write
+        # path, not just at boot: the walker can emit a page a second and
+        # would otherwise blow past the budget between restarts. mtime
+        # keeps the newest pages, which is the eviction order we want.
+        self._prune_disk_if_over()
 
     def _load_from_disk(self, symbol: str, timeframe: str) -> Optional[CacheEntry]:
         path = self._path(symbol, timeframe)
@@ -372,6 +424,19 @@ class BarCache:
             return CacheEntry(bars=[], fetched_at=ts)
         if time.time() - ts > MAX_DISK_AGE_SECONDS:
             return None
+        if self.is_hist_timeframe(timeframe):
+            # Disk-only contract: never promote a historical segment into the
+            # RAM LRU. The parse cost is per-read (~10ms local disk); the
+            # resident cost of promoting is what pushed RSS to 596MB during
+            # the deep-hist prewarm (2026-11-14). fetched_at is refreshed in
+            # the index so freshness/ETag checks stay cheap.
+            with self._lock:
+                self.fetched_at.setdefault(symbol.upper(), {})[timeframe.lower()] = ts
+                key = self._key(symbol, timeframe)
+                self._order[key] = None
+                self._order.move_to_end(key)
+                self._evict_index_locked()
+            return CacheEntry(bars=bars, fetched_at=ts)
         with self._lock:
             # The disk read happened outside the lock, so a concurrent put()
             # may have stored a newer entry in RAM while we parsed. Promoting
@@ -408,3 +473,20 @@ class BarCache:
                     path.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Bar cache prune failed: %s", exc)
+
+    def _prune_disk_if_over(self) -> None:
+        """Enforce the file cap after a write, but only when actually over.
+
+        The boot-time prune always runs a full scan; on the write path (a
+        page a second during the deep-hist walk) a scan per write is wasted
+        work — a cheap directory count gates it to the rare over-budget
+        moment.
+        """
+        if self._directory is None:
+            return
+        try:
+            count = sum(1 for _ in self._directory.glob("*.json"))
+        except OSError:
+            return
+        if count > _resolve_max_disk_files():
+            self._prune_disk()
