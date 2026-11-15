@@ -340,8 +340,14 @@ class AlpacaDataAdapter:
         type_str = (order_json.get("type") or "market").upper()
         if type_str == "LIMIT":
             order_type = OrderType.LIMIT
-        elif type_str == "STOP":
+        elif type_str in ("STOP", "STOP_LIMIT"):
+            # The domain enum collapses stop_limit into STOP carrying a
+            # limit price — the same shape the submit side sends, so a
+            # venue round-trip keeps its stop_limit identity instead of
+            # degrading to MARKET (2026-11-16 live test caught this).
             order_type = OrderType.STOP
+        elif type_str == "TRAILING_STOP":
+            order_type = OrderType.TRAILING_STOP
         else:
             order_type = OrderType.MARKET
 
