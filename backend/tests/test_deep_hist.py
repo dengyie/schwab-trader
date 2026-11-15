@@ -480,13 +480,13 @@ def test_deep_hist_prewarm_loop_waits_out_the_boot_grace(feed, monkeypatch):
             feed._running = False  # stop the loop after the grace sleep
         await real_sleep(0)
 
-    async def never_walk(sym, tf):
+    async def never_walk(sym, tf, page_budget=None):
         raise AssertionError("walk must not start before the boot grace")
 
     monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fake_sleep)
     monkeypatch.setattr(feed, "_deep_hist_walk_symbol", never_walk)
     asyncio.run(feed._deep_hist_prewarm_loop())
-    assert slept[:2] == [feed.DEEP_HIST_BOOT_GRACE, 3600.0] or \
+    assert slept[:2] == [feed.DEEP_HIST_BOOT_GRACE, feed.DEEP_HIST_REWALK_SECONDS] or \
         feed.DEEP_HIST_BOOT_GRACE in slept[:1]
 
 
@@ -518,7 +518,7 @@ def test_deep_hist_prewarm_loop_walks_non_us_symbols(feed, monkeypatch):
         # itself (a boot-grace stop here would exit before the first walk).
         await real_sleep(0)
 
-    async def fake_walk(sym, tf):
+    async def fake_walk(sym, tf, page_budget=None):
         walked.append(sym)
         if sym == "0700.HK":
             feed._running = False  # stop once a non-US symbol has been reached
@@ -527,3 +527,69 @@ def test_deep_hist_prewarm_loop_walks_non_us_symbols(feed, monkeypatch):
     monkeypatch.setattr(feed, "_deep_hist_walk_symbol", fake_walk)
     asyncio.run(feed._deep_hist_prewarm_loop())
     assert "0700.HK" in walked, "HK catalog symbol must reach the walker"
+
+
+def test_deep_hist_prewarm_loop_idles_while_nobody_is_connected(feed, monkeypatch):
+    """2026-11-15 measured: the walk kept pulling the Alpaca frontier at
+    40-86% of the e2-micro's one core for ~30 min/hour with the market
+    closed and no client connected (the archive never reaches its floor, so
+    'cache-hit rewalk' never becomes free). The loop must idle behind the
+    same subscriber probe the fresh-window prewarm uses, and it must NOT
+    fall into the multi-hour re-walk sleep while idling."""
+    import asyncio
+    feed._running = True
+    feed.subscriber_probe = lambda: False
+
+    walked = []
+    slept = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(s):
+        slept.append(s)
+        if len(slept) >= 2:
+            feed._running = False  # two idle polls are enough to pin the shape
+        await real_sleep(0)
+
+    async def never_walk(sym, tf, page_budget=None):
+        walked.append((sym, tf))
+
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(feed, "_deep_hist_walk_symbol", never_walk)
+    asyncio.run(feed._deep_hist_prewarm_loop())
+    assert walked == [], "no page may be walked while the room is empty"
+    assert slept == [feed.DEEP_HIST_BOOT_GRACE, feed.DEEP_HIST_IDLE_POLL], \
+        "idle polls (not the re-walk cadence) must be the only sleeps after grace"
+
+
+def test_deep_hist_walk_symbol_honors_the_upstream_page_budget(feed, monkeypatch):
+    """The per-pass page budget caps real upstream fetches, not cache hits:
+    pages stamped before the walk (disk hits) are free, pages stamped during
+    it count, and the walk returns once the budget is spent."""
+    import asyncio
+    import time as _time
+    feed._running = True
+
+    now = _time.time()
+    calls = []
+    # Page 1 = a pre-walk disk hit (fetched_at long past), page 2+ = fresh
+    # upstream answers (stamped "during the walk", i.e. later than any
+    # started_at the walk could take), each moving the cursor back.
+    pages = [
+        (_bars([int(now) - 10 * 86400]), now - 3600.0, True),
+        (_bars([int(now) - 20 * 86400]), now + 3600.0, True),
+        (_bars([int(now) - 30 * 86400]), now + 3600.0, True),
+    ]
+
+    def fake_seg(sym, tf, before):
+        calls.append(before)
+        bars, fetched, has_more = pages[min(len(calls) - 1, len(pages) - 1)]
+        return bars, fetched, has_more
+
+    monkeypatch.setattr(feed, "get_historical_segment", fake_seg)
+    real_sleep = asyncio.sleep
+    async def fast_sleep(_s):
+        await real_sleep(0)
+    monkeypatch.setattr("app.engine.alpaca_market_feed.asyncio.sleep", fast_sleep)
+
+    asyncio.run(feed._deep_hist_walk_symbol("QQQ", "15m", page_budget=2))
+    # 1 free hit + 2 budgeted fetches; the third upstream page must not run.
+    assert len(calls) == 3

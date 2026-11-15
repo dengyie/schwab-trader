@@ -221,10 +221,9 @@ class AlpacaMarketFeedService:
     # seconds (measured 2026-11-14: a 15m IEX page takes ~15-20s upstream, and
     # Alpaca's free tier allows 200 req/min — the pause keeps the runner far
     # under it while it walks a symbol's full archive, ~100 pages / ~30min for
-    # 15m back to 2019). Unlike the fresh-window prewarm this is NOT gated on
-    # chart subscribers: the point is to have decades of immutable history on
-    # disk *before* anyone asks for it, so the first chart paint shows the
-    # full span instead of a 59d seed.
+    # 15m back to 2019). Unlike the fresh-window prewarm this walk IS gated
+    # (2026-11-15) on chart subscribers plus a per-pass page budget: see the
+    # constants block below for the measured failure that forced both.
     # Kept for the sliding-edge jump inside the walk (a ceiling hop is one
     # page like any other now, paced by DEEP_HIST_PAGE_PACE); the walk's own
     # page cadence moved to DEEP_HIST_PAGE_PACE below.
@@ -238,12 +237,35 @@ class AlpacaMarketFeedService:
     # already warm — load 10.6 on 2 cores, agent dead, box wedged for 40+
     # minutes. The walk serves no live user: 15 minutes of grace lets the
     # preload settle and the fresh windows land, and a 4s/page pace caps the
-    # write rate well under what a standard PD + swap can absorb. A full
-    # archive pass (~110 pages/symbol/tf) takes ~7h at this pace, but pages
-    # on disk are cache hits, so steady state after the first complete pass
-    # is nearly free.
+    # write rate well under what a standard PD + swap can absorb.
+    #
+    # 2026-11-15 re-measure killed the "steady state is nearly free" claim:
+    # the archive CANNOT be completed. TSLA 5m alone needs ~570 pages to the
+    # 2016 floor (2000 5m bars ≈ 7 days per page over 10.7 years), the full
+    # catalog needs ~9,000 segments, and the disk budget caps at 4,000 files
+    # — so every hourly pass disk-hits its way down the chain and then keeps
+    # *fetching* fresh frontier pages from Alpaca (measured: ~3,700 upstream
+    # calls/hour, ~30 min of JSON parse at 40-86% of the e2-micro's one
+    # core, with the market closed and nobody watching). Two caps fix it:
+    #
+    # * DEEP_HIST_PASS_PAGE_BUDGET bounds how many upstream pages a pass may
+    #   fetch (the disk-hit part of the walk is ~10ms/page and unlimited);
+    #   the pass spends its budget then yields — a bounded background chore
+    #   instead of a 30-minute CPU marathon.
+    # * The idle gate (below) stops passes entirely while no chart client is
+    #   connected: pre-warming a decade of archives for an empty room is the
+    #   exact "pegged worker with the tab closed" failure the fresh-window
+    #   prewarm already learned to avoid.
     DEEP_HIST_BOOT_GRACE = 900.0
     DEEP_HIST_PAGE_PACE = 4.0
+    DEEP_HIST_PASS_PAGE_BUDGET = 50
+    # Idle-server poll while the gate waits (short: a client connecting at
+    # boot-grace end should get its first pass within minutes, not an hour).
+    DEEP_HIST_IDLE_POLL = 300.0
+    # Re-walk cadence: history is immutable and the disk cache holds 30d, so
+    # an hourly pass re-verifies pages that cannot change. Six hours still
+    # re-primes long-TTL expiries well ahead of any client need.
+    DEEP_HIST_REWALK_SECONDS = 6 * 3600.0
     DEEP_HIST_PREWARM_TFS = ("15m", "5m")
 
     def __init__(
@@ -1438,7 +1460,7 @@ class AlpacaMarketFeedService:
                 await asyncio.sleep(10.0)
 
     async def _deep_hist_prewarm_loop(self) -> None:
-        """Walk every catalog symbol's archive toward its floor, once per boot.
+        """Walk every catalog symbol's archive toward its floor.
 
         The chart's "show me all the data" ask is answered by the segment
         chain, but a chain of ~100 IEX pages at ~15-20s each is ~30 minutes of
@@ -1468,16 +1490,31 @@ class AlpacaMarketFeedService:
         ``([], 0.0, False)`` tuple (failure == empty), which the walker
         treats as retryable rather than terminal — the except below is only
         a safety net for escapes that bypass that contract.
+
+        Two throttle gates (2026-11-15, see the constants' history): the
+        whole loop idles while no chart client is connected, and each pass
+        carries a page budget so the frontier extension cannot run away —
+        the archive to the 2016 floor does not fit in the disk budget, so
+        without a cap every pass ends in a long real-fetch tail.
         """
         await asyncio.sleep(self.DEEP_HIST_BOOT_GRACE)
         tfs = list(self.DEEP_HIST_PREWARM_TFS)
         while self._running:
+            if not self._has_chart_subscribers():
+                # Nobody is watching a chart: paging the archive serves
+                # nothing. Re-check every few minutes instead of holding the
+                # pass cadence, so a client that connects gets its first
+                # bounded pass promptly.
+                await asyncio.sleep(self.DEEP_HIST_IDLE_POLL)
+                continue
             for tf in tfs:
                 for sym in self._deep_hist_symbols():
                     if not self._running:
                         return
                     try:
-                        await self._deep_hist_walk_symbol(sym, tf)
+                        await self._deep_hist_walk_symbol(
+                            sym, tf, page_budget=self.DEEP_HIST_PASS_PAGE_BUDGET
+                        )
                     except asyncio.CancelledError:
                         return
                     except Exception as exc:
@@ -1487,11 +1524,10 @@ class AlpacaMarketFeedService:
                         # failure==empty contract — brief park, next symbol.
                         await asyncio.sleep(10.0)
                         break
-            # Each full pass re-walks every symbol, but every page is then a
-            # cache hit (the walk itself costs ~nothing) — the only real work
-            # happens where the 7d segment TTL has expired, re-priming those
-            # pages in the background for the next client.
-            await asyncio.sleep(3600.0)
+            # The full-pass re-walk re-serves every page from cache; the only
+            # upstream work is the frontier extension, now bounded by the
+            # per-symbol page budget above.
+            await asyncio.sleep(self.DEEP_HIST_REWALK_SECONDS)
 
     def _deep_hist_symbols(self) -> List[str]:
         """Every market's catalog, US first, one walk slot per symbol.
@@ -1512,17 +1548,37 @@ class AlpacaMarketFeedService:
                 seen.setdefault(sym.upper(), sym.upper())
         return list(seen.values())
 
-    async def _deep_hist_walk_symbol(self, sym: str, tf: str) -> None:
-        """One symbol/timeframe: page to the floor via the public segment API."""
+    async def _deep_hist_walk_symbol(self, sym: str, tf: str, *, page_budget: Optional[int] = None) -> None:
+        """One symbol/timeframe: page to the floor via the public segment API.
+
+        ``page_budget`` caps how many pages this walk may take from UPSTREAM
+        (a cache hit costs ~10ms of disk parse and is not counted — its
+        ``fetched_at`` predates this walk). The archive to the floor does not
+        fit the disk budget, so an uncapped walk re-extends the frontier
+        every pass (measured 2026-11-15: ~3,700 Alpaca calls/hour at 40-86%
+        of the box's one core); the budget turns each pass into bounded
+        work. ``None`` keeps the old unlimited behavior (tests).
+        """
         # The fresh window's oldest bar is the natural first cursor.
         entry = self._bar_cache.get(sym, tf)
         oldest = int(entry.bars[0].time) if entry and entry.bars else int(time.time())
         failures = 0
         empty_misses = 0  # consecutive "temporary nothing" answers (fetched_at == 0.0)
+        fetches = 0  # pages answered by upstream, not cache (fetched_at newer than walk start)
+        started_at = time.time()
         while self._running:
+            if page_budget is not None and fetches >= page_budget:
+                # Budget spent: yield the pass. The next pass resumes from
+                # the disk chain — pages written so far are hits there.
+                return
             bars, fetched, has_more = await asyncio.to_thread(
                 self.get_historical_segment, sym, tf, oldest
             )
+            if fetched > started_at:
+                # A page stamped during this walk came from upstream (disk
+                # hits carry the writing pass's timestamp). Track it against
+                # the budget; pace only on real fetches.
+                fetches += 1
             if not bars:
                 # Two kinds of empty, per the 503 contract (routes.py):
                 # fetched_at == 0.0 is "couldn't get it right now" — upstream
