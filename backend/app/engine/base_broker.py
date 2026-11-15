@@ -45,6 +45,7 @@ class BaseBroker(ABC):
         stop_price: Optional[float] = None,
         trail_value: Optional[float] = None,
         trail_type: Optional[str] = None,
+        time_in_force: Optional[str] = None,
     ) -> Order:
         """Submits an order to the execution engine.
 

@@ -317,6 +317,8 @@ export const zhCN = {
     invalidTrailingValue: '跟踪值无效',
     insufficientBalance: '余额不足',
     resyncingBlock: '行情同步中，下单暂被阻止，请稍后重试',
+    venueMirrorHint: '已同步至券商委托，7×24 监控（GTC 长期有效）',
+    localMirrorHint: '跟踪止损在本机评估执行',
     // 多市场
     perLot: '每手',
     lotError: '数量必须是每手股数的整数倍',

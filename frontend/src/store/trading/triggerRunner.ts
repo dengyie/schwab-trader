@@ -28,6 +28,7 @@ import { useAutomationStore } from '../automationStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../watchlistStore';
 import { apiJson } from '../../services/apiClient';
 import { useAuthStore } from '../authStore';
+import { isConditionalOrder } from './triggers';
 
 const HEARTBEAT_MS = 5_000;
 // Non-active-symbol evaluation cadence. These symbols have no live book
@@ -67,18 +68,13 @@ function collectLocalRiskSymbols(): Set<string> {
   for (const order of trading.orders) {
     if (order.backendId) continue;
     if (order.status !== 'open' || order.isTriggered) continue;
-    if (isConditionalLike(order.type)) symbols.add(order.symbol);
+    if (isConditionalOrder(order.type)) symbols.add(order.symbol);
     else if (order.isOcoOrder && order.type === 'limit' && order.price) symbols.add(order.symbol);
   }
   for (const [symbol, position] of trading.positions) {
     if (position.takeProfitPrice || position.stopLossPrice) symbols.add(symbol);
   }
   return symbols;
-}
-
-function isConditionalLike(type: string): boolean {
-  return ['stop_limit', 'take_profit_limit', 'stop_market', 'take_profit_market', 'trailing_stop']
-    .includes(type);
 }
 
 let multiSymbolTimer: ReturnType<typeof setInterval> | null = null;

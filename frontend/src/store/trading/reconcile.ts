@@ -40,6 +40,10 @@ export interface BackendOrderRow {
   id?: string;
   /** Echoed idempotency key from POST /orders (the submitting client's UUID). */
   client_order_id?: string;
+  /** Venue trailing-stop callback, round-tripped by the adapter. */
+  trail_value?: number | string | null;
+  trail_type?: string | null;
+  time_in_force?: string | null;
   symbol?: string;
   side?: string;
   order_type?: string;
@@ -208,6 +212,14 @@ export function paperOrderFromBackendRow(row: BackendOrderRow): PaperOrder | nul
     updatedAt: toTimestamp(row.updated_at),
     fills: backendFills(row, backendId),
     triggerPrice,
+    // Venue trailing distance (a mirrored trailing order trails at the
+    // venue; the display shows what it is actually trailing by).
+    trailingValue: row.trail_value != null && Number(row.trail_value) > 0
+      ? String(row.trail_value)
+      : undefined,
+    trailingType: (row.trail_type === 'percent' || row.trail_type === 'absolute')
+      ? row.trail_type
+      : undefined,
   };
 }
 
@@ -315,7 +327,12 @@ export function reconcileOcoGroups(groups: OCOOrder[], orders: PaperOrder[]): OC
     let status: OCOOrder['status'] = group.status;
     if (legs.some((leg) => leg.status === 'filled')) {
       status = 'filled';
-    } else if (knownLegs === 2 && legs.every((leg) => leg.status === 'cancelled')) {
+    } else if (knownLegs === 2 && legs.every((leg) => (
+      ['cancelled', 'rejected', 'expired'].includes(leg.status)
+    ))) {
+      // Both legs reached a terminal non-fill state (both rejected by the
+      // venue, or cancelled/expired): the group must not sit 'active'
+      // forever (2026-11-16 review).
       status = 'cancelled';
     } else if (legs.some((leg) => leg.status === 'partial')) {
       status = 'partially_filled';

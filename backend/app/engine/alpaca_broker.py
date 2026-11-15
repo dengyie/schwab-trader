@@ -205,16 +205,26 @@ class AlpacaPaperBroker(BaseBroker):
         stop_price: Optional[float] = None,
         trail_value: Optional[float] = None,
         trail_type: Optional[str] = None,
+        time_in_force: Optional[str] = None,
     ) -> Order:
         if quantity <= 0:
             raise ValueError("Order quantity must be positive")
+
+        tif = (time_in_force or "day").upper()
+        if tif not in ("DAY", "GTC", "EXT"):
+            # Defense in depth: the request layer validates this too, but a
+            # garbage TIF must never reach the venue from any caller.
+            raise ValueError("time_in_force must be one of DAY/GTC/EXT")
 
         payload = {
             "symbol": symbol.upper(),
             "qty": str(quantity),
             "side": "buy" if side == OrderSide.BUY else "sell",
             "type": order_type.value.lower(),
-            "time_in_force": "day"
+            # Venue-resting conditionals arrive with 'gtc' from the client
+            # (a 'day' stop expired at the session close — 2026-11-16
+            # review P1). Anything else keeps the historical day default.
+            "time_in_force": tif,
         }
         if order_type == OrderType.LIMIT:
             if price is None:

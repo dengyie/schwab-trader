@@ -251,17 +251,20 @@ describe('OCO orders', () => {
   });
 
   it('cascades a venue-filled OCO leg into a sibling cancel', async () => {
+    // 2026-11-16 review P2 pin: a PARTIALLY filled leg must NOT cancel the
+    // sibling — only a full fill does. Both scenarios share the setup.
+    const makeRows = (tpStatus: string) => [
+      { order_id: 'ord_tp', client_order_id: 'leg-tp', symbol: 'SPY', side: 'sell',
+        order_type: 'limit', quantity: 10, price: 110, status: tpStatus },
+      { order_id: 'ord_sl', client_order_id: 'leg-sl', symbol: 'SPY', side: 'sell',
+        order_type: 'stop_limit', quantity: 10, stop_price: 90, status: 'OPEN' },
+    ];
+    const cascadeScenario = { rows: makeRows('FILLED') };
     globalThis.fetch = async (url: any, init?: any) => {
       const method = String(init?.method || 'GET').toUpperCase();
       requested.push({ url: String(url), method, body: init?.body ? JSON.parse(init.body as string) : undefined });
       if (String(url).endsWith('/orders') && method === 'GET') {
-        return json([
-          // The TP leg filled at the venue; the stop leg is still open.
-          { order_id: 'ord_tp', client_order_id: 'leg-tp', symbol: 'SPY', side: 'sell',
-            order_type: 'limit', quantity: 10, price: 110, status: 'FILLED' },
-          { order_id: 'ord_sl', client_order_id: 'leg-sl', symbol: 'SPY', side: 'sell',
-            order_type: 'stop_limit', quantity: 10, stop_price: 90, status: 'OPEN' },
-        ]);
+        return json(cascadeScenario.rows);
       }
       if (method === 'DELETE') return json({ status: 'CANCELED' });
       return json({});
@@ -298,6 +301,31 @@ describe('OCO orders', () => {
     // The group derivation marks a group with a filled leg 'filled'
     // (fill takes priority over the triggered marker).
     expect(useTradingStore.getState().ocoOrders[0].status).toBe('filled');
+
+    // Partial fill: the sibling must stay open (no cancel request at all).
+    requested = [];
+    cascadeScenario.rows = makeRows('PARTIALLY_FILLED');
+    useTradingStore.setState({
+      orders: [
+        { clientOrderId: 'leg-tp', backendId: 'ord_tp', symbol: 'SPY', side: 'sell',
+          type: 'limit', price: '110', quantity: '10', filledQty: '3', avgPrice: '0',
+          status: 'open', createdAt: Date.now(), updatedAt: Date.now(), fills: [],
+          ocoGroupId: 'oco_x', ocoLinkedOrderId: 'leg-sl', isOcoOrder: true },
+        { clientOrderId: 'leg-sl', backendId: 'ord_sl', symbol: 'SPY', side: 'sell',
+          type: 'stop_limit', price: '89', quantity: '10', filledQty: '0', avgPrice: '0',
+          status: 'open', createdAt: Date.now(), updatedAt: Date.now(), fills: [],
+          triggerPrice: '90', ocoGroupId: 'oco_x', ocoLinkedOrderId: 'leg-tp', isOcoOrder: true },
+      ],
+      ocoOrders: [{
+        ocoGroupId: 'oco_x', symbol: 'SPY', side: 'sell', quantity: '10',
+        limitPrice: '110', stopPrice: '90', stopLimitPrice: '89', status: 'active',
+        limitOrderId: 'leg-tp', stopOrderId: 'leg-sl', createdAt: Date.now(), updatedAt: Date.now(),
+      }],
+    });
+    await useTradingStore.getState().fetchOrders();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requested.find((r) => r.method === 'DELETE')).toBeUndefined();
+    expect(useTradingStore.getState().orders.find((o) => o.backendId === 'ord_sl')?.status).toBe('open');
   });
 });
 

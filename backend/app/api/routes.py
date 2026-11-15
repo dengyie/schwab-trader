@@ -93,6 +93,20 @@ class OrderRequest(BaseModel):
     # order); brokers without one ignore it.
     trail_value: Optional[float] = None
     trail_type: Optional[str] = None
+    # 'day' | 'gtc'. Venue-resting conditionals (stops/TPs/OCO legs) ride
+    # 'gtc' from the client — the backend's 'day' default expired a
+    # protective stop at the session close (2026-11-16 review P1).
+    time_in_force: Optional[str] = None
+
+    @field_validator("time_in_force")
+    @classmethod
+    def normalize_tif(cls, v):
+        if v is None:
+            return v
+        v_upper = str(v).upper()
+        if v_upper not in ("DAY", "GTC"):
+            raise ValueError("time_in_force must be 'day' or 'gtc'")
+        return v_upper
 
     @field_validator("side", mode="before")
     @classmethod
@@ -755,6 +769,7 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 stop_price=req.stop_price,
                 trail_value=req.trail_value,
                 trail_type=req.trail_type,
+                time_in_force=req.time_in_force,
             )
             payload = order.model_dump(mode="json")
             if req.client_order_id:

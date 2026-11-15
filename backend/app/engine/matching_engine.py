@@ -222,7 +222,10 @@ class VirtualMatchingEngine(BaseBroker):
         stop_price: Optional[float] = None,
         trail_value: Optional[float] = None,
         trail_type: Optional[str] = None,
+        time_in_force: Optional[str] = None,
     ) -> Order:
+        # The virtual engine has no expiry semantics — time_in_force is
+        # accepted for signature parity and ignored.
         ref = resolve_symbol(symbol)
         if ref is None:
             raise ValueError(f"Invalid symbol: {symbol!r}")
@@ -429,6 +432,20 @@ class VirtualMatchingEngine(BaseBroker):
             self._mark_dirty()
 
         return None
+
+    def resting_order_symbols(self) -> List[str]:
+        """Symbols with orders still waiting to execute.
+
+        The feed-activation loop in ``main`` polls these on the intl venues:
+        a resting stop-limit for a symbol nobody is watching would otherwise
+        sit without quotes and never trigger (2026-11-16 review).
+        """
+        with self._book_lock:
+            return sorted({
+                order.symbol
+                for order in self.orders.values()
+                if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
+            })
 
     def get_market_clock(self, market: Optional[str] = None) -> Optional[dict]:
         from app.core.markets import MARKETS, market_clock

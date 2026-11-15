@@ -318,6 +318,8 @@ export const enUS: Locale = {
     invalidTrailingValue: 'Invalid trailing value',
     insufficientBalance: 'Insufficient balance',
     resyncingBlock: 'Data feed is resyncing — order blocked, try again in a moment',
+    venueMirrorHint: 'Resting at the broker — monitored 24/7 (GTC)',
+    localMirrorHint: 'Trailing stop evaluated on this device',
     // Multi-market
     perLot: 'per lot',
     lotError: 'Quantity must be a multiple of the board lot',

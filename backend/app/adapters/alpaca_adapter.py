@@ -373,6 +373,22 @@ class AlpacaDataAdapter:
         updated_at = _parse_optional_timestamp(order_json.get("updated_at")) or created_at
         filled_at = _parse_optional_timestamp(order_json.get("filled_at"))
 
+        # Venue TIF round-trips (a GTC protective stop must not present
+        # itself as DAY); trail distance lands on the domain model so the
+        # UI can show what the venue is actually trailing by.
+        tif_str = (order_json.get("time_in_force") or "day").upper()
+        tif = TimeInForce.GTC if tif_str == "GTC" else (
+            TimeInForce.EXT if tif_str == "EXT" else TimeInForce.DAY
+        )
+        trail_value: Optional[float] = None
+        trail_type: Optional[str] = None
+        if order_json.get("trail_percent"):
+            trail_value = float(order_json["trail_percent"])
+            trail_type = "percent"
+        elif order_json.get("trail_price"):
+            trail_value = float(order_json["trail_price"])
+            trail_type = "absolute"
+
         return Order(
             order_id=order_json.get("id") or order_json.get("client_order_id") or "ord_unknown",
             symbol=order_json.get("symbol", "").upper(),
@@ -381,7 +397,9 @@ class AlpacaDataAdapter:
             quantity=qty,
             price=price,
             stop_price=stop_price,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
+            trail_value=trail_value,
+            trail_type=trail_type,
             status=status,
             filled_quantity=filled_qty,
             filled_avg_price=filled_avg_price,

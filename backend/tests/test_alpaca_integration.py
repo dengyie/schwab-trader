@@ -656,3 +656,27 @@ def test_stop_limit_and_trailing_payload_shapes(monkeypatch):
     )
     assert sent[-1]["type"] == "stop"
     assert "limit_price" not in sent[-1]
+
+    # 2026-11-16 review P1 pin: a venue-resting protective order rides GTC —
+    # the 'day' default expired it at the session close, leaving the
+    # position unprotected overnight.
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
+        quantity=1, price=89.0, stop_price=90.0, time_in_force="gtc",
+    )
+    assert sent[-1]["time_in_force"] == "GTC"  # broker upper-cases the client value
+
+    # Plain spot orders without an explicit TIF keep the day default.
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=1,
+    )
+    assert sent[-1]["time_in_force"] == "DAY"  # venue payload upper-cases TIF
+
+    # An invalid TIF is refused by the request layer, but the broker must
+    # not silently downgrade an unknown value either.
+    import pytest
+    with pytest.raises(ValueError):
+        broker.submit_order(
+            symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
+            quantity=1, price=89.0, stop_price=90.0, time_in_force="fok",
+        )

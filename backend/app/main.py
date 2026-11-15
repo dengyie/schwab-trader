@@ -274,12 +274,37 @@ async def lifespan(app: FastAPI):
                 pass
 
     trim_task = asyncio.create_task(_malloc_trim_loop(), name="malloc-trim")
+
+    async def _resting_order_activation_loop() -> None:
+        """Keep the intl feed polling symbols with resting virtual orders.
+
+        The Yahoo poller covers catalog symbols plus whatever a client is
+        watching; a stop-limit resting in the virtual engine for a symbol
+        traded via symbol-lookup would otherwise sit without quotes and
+        never trigger (2026-11-16 review). Activation is monotonic on
+        purpose: the set only grows by symbols the user actually traded,
+        and deactivating here would fight the websocket lifecycle.
+        """
+        from app.core.markets import market_of
+        while True:
+            try:
+                await asyncio.sleep(60)
+                for sym in virtual_engine.resting_order_symbols():
+                    if market_of(sym).code != "US":
+                        feed.activate(sym)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+
+    activation_task = asyncio.create_task(_resting_order_activation_loop(), name="resting-order-activation")
     # Startup: Launch market feed loop
     await feed.start()
     yield
     # Shutdown: Stop feed loop
     trim_stop.set()
     trim_task.cancel()
+    activation_task.cancel()
     # A trim may be mid-to_thread; reap it so shutdown logs no "destroyed but
     # pending" noise. Bounded so a stuck trim never delays feed.stop().
     try:

@@ -451,8 +451,12 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
   };
   // Each fill is priced in its venue's currency; account totals are reported in
   // the base currency, so convert per fill instead of adding HKD to USD.
-  const usdValue = (fill: PaperOrder['fills'][0]) =>
-    parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
+  // NaN for an unknown rate propagates into every aggregate and turns the
+  // totals into "NaN" — exclude those fills instead (2026-11-16 review).
+  const usdValue = (fill: PaperOrder['fills'][0]) => {
+    const v = parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
+    return Number.isFinite(v) ? v : null;
+  };
   // 计算各种统计数据
   const filledOrders = orders.filter(o => o.status === 'filled');
   
@@ -463,7 +467,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
       const currency = (fill.feeAsset || order.currency || 'USD').toUpperCase();
       const current = map.get(order.symbol) || { volume: 0, trades: 0, fees: 0, currency, usdVolume: 0 };
       current.volume += parseFloat(fill.price) * parseFloat(fill.quantity);
-      current.usdVolume += usdValue(fill);
+      current.usdVolume += usdValue(fill) ?? 0;
       current.trades += 1;
       current.fees += parseFloat(fill.fee);
       map.set(order.symbol, current);
@@ -477,7 +481,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
     trades.forEach(({ fill }) => {
       const date = new Date(fill.time).toLocaleDateString('en-CA'); // YYYY-MM-DD format
       const current = map.get(date) || { volume: 0, trades: 0 };
-      current.volume += usdValue(fill);
+      current.volume += usdValue(fill) ?? 0;
       current.trades += 1;
       map.set(date, current);
     });
@@ -485,7 +489,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
   }, [trades, fxRates]);
 
   const totalVolume = trades.reduce((sum, { fill }) => 
-    sum + usdValue(fill), 0);
+    sum + (usdValue(fill) ?? 0), 0);
   const totalFees = trades.reduce(
     (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
   const avgOrderSize = trades.length > 0 ? totalVolume / trades.length : 0;
@@ -493,7 +497,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
   // 买卖比例
   const buyVolume = trades
     .filter(({ order }) => order.side === 'buy')
-    .reduce((sum, { fill }) => sum + usdValue(fill), 0);
+    .reduce((sum, { fill }) => sum + (usdValue(fill) ?? 0), 0);
   const sellVolume = totalVolume - buyVolume;
   const buyRatio = totalVolume > 0 ? (buyVolume / totalVolume) * 100 : 50;
 
@@ -702,7 +706,7 @@ export function OrdersPage() {
     const usdValue = (fill: PaperOrder['fills'][0]) =>
       parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
     const totalVolume = allTrades.reduce((sum, { fill }) => 
-      sum + usdValue(fill), 0);
+      sum + (usdValue(fill) ?? 0), 0);
     const totalFees = allTrades.reduce(
       (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
     // Averaging raw venue-currency prices across markets mixed HKD/JPY/CNY
@@ -719,7 +723,7 @@ export function OrdersPage() {
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
     const recentTrades = allTrades.filter(({ fill }) => fill.time > oneHourAgo);
     const recentVolume = recentTrades.reduce((sum, { fill }) => 
-      sum + usdValue(fill), 0);
+      sum + (usdValue(fill) ?? 0), 0);
     
     // 每日交易量趋势
     const dailyVolumes: number[] = [];
@@ -732,7 +736,7 @@ export function OrdersPage() {
       
       const dayVolume = allTrades
         .filter(({ fill }) => fill.time >= dayStart.getTime() && fill.time < dayEnd.getTime())
-        .reduce((sum, { fill }) => sum + usdValue(fill), 0);
+        .reduce((sum, { fill }) => sum + (usdValue(fill) ?? 0), 0);
       dailyVolumes.push(dayVolume);
     }
 

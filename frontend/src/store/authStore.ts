@@ -41,7 +41,6 @@ interface AuthState {
   updateProfile: (updates: Partial<Pick<User, 'displayName' | 'bio' | 'timezone'>>) => void;
   updateAvatar: (dataUrl: string | null) => void;
   updatePreferences: (prefs: Partial<UserPreferences>) => void;
-  markAsInitialized: () => void;
 }
 
 const defaultPreferences: UserPreferences = {
@@ -198,10 +197,6 @@ export const useAuthStore = create<AuthState>()(
           },
         }));
       },
-
-      markAsInitialized: () => {
-        set({ isInitialized: true });
-      },
     }),
     {
       name: 'paper-auth-storage',
@@ -232,6 +227,3 @@ export const selectPreferences = (state: AuthState) => state.preferences;
 export const selectIsAuthenticated = (state: AuthState) => state.isAuthenticated;
 export const selectIsInitialized = (state: AuthState) => state.isInitialized;
 
-export function currentToken(): string | null {
-  return getToken();
-}

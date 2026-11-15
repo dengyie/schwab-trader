@@ -609,6 +609,16 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
         {/* === CONDITIONAL ORDER INPUTS === */}
         {orderCategory === 'conditional' && (
           <>
+            {/* 2026-11-16: 条件单已镜像到券商 7×24 监控（GTC 长期有效）。
+                TP 限价单在限价位挂起生效——比旧的"触发即市价"更早触达、
+                且成交价不会差于限价，与旧本地触发的语义差异在此说明。 */}
+            <div className={styles.sessionHint || ''} style={{ fontSize: 11, color: 'var(--text-tertiary, #8a8a8a)', margin: '4px 0 8px' }}>
+              {type === 'trailing_stop'
+                ? (isForeignMarket || trailingActivationPrice
+                    ? (t.orderEntry?.localMirrorHint || '跟踪止损在本机评估执行')
+                    : (t.orderEntry?.venueMirrorHint || '已同步至券商跟踪委托，7×24 监控（GTC）'))
+                : (t.orderEntry?.venueMirrorHint || '已同步至券商委托，7×24 监控（GTC 长期有效）')}
+            </div>
             {type === 'trailing_stop' ? (
               <>
                 {/* Trailing Stop Inputs */}

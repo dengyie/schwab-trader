@@ -113,6 +113,9 @@ class Order(BaseModel):
     # therefore cannot date a trade.
     filled_at: Optional[datetime] = None
     reject_reason: Optional[str] = None
+    # Trailing-stop callback (venue round-trip; 'percent' | 'absolute').
+    trail_value: Optional[float] = None
+    trail_type: Optional[str] = None
 
 
 class Position(BaseModel):

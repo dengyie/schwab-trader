@@ -115,6 +115,7 @@ class MarketRouterBroker(BaseBroker):
         stop_price: Optional[float] = None,
         trail_value: Optional[float] = None,
         trail_type: Optional[str] = None,
+        time_in_force: Optional[str] = None,
     ) -> Order:
         route = self._broker_for(symbol)
         if route is None:
@@ -129,6 +130,7 @@ class MarketRouterBroker(BaseBroker):
             stop_price=stop_price,
             trail_value=trail_value,
             trail_type=trail_type,
+            time_in_force=time_in_force,
         )
 
     def cancel_order(self, order_id: str) -> Optional[Order]:

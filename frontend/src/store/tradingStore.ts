@@ -81,12 +81,7 @@ interface TradingState {
   fetchOrders: () => Promise<void>;
 
   // Getters
-  getOrder: (clientOrderId: string) => PaperOrder | undefined;
   getOpenOrders: () => PaperOrder[];
-  getConditionalOrders: () => PaperOrder[];
-  getOrderHistory: () => PaperOrder[];
-  getPosition: (symbol: string) => Position | undefined;
-  getOCOOrders: () => OCOOrder[];
 }
 
 /**
@@ -281,6 +276,12 @@ export const useTradingStore = create<TradingState>()(
                   ? parseFloat(order.trailingValue)
                   : undefined,
                 trail_type: order.type === 'trailing_stop' ? order.trailingType : undefined,
+                // 2026-11-16 review P1: a venue-resting stop under the
+                // backend's 'day' default expired at the session close —
+                // the position went unprotected overnight while the local
+                // record just moved to history. Protective orders ride GTC.
+                time_in_force:
+                  isConditionalOrder(order.type) || order.isOcoOrder ? 'gtc' : undefined,
                 market,
                 // Idempotency key: a retry after a lost response replays the
                 // original order server-side instead of placing a duplicate.
@@ -843,7 +844,11 @@ export const useTradingStore = create<TradingState>()(
               );
               for (const order of get().orders) {
                 if (!filledNow.has(order.clientOrderId)) continue;
-                if (!['filled', 'partial'].includes(order.status)) continue;
+                // Venue OCO semantics: only a FULLY filled leg cancels the
+                // sibling. A partial fill must keep both legs working —
+                // cancelling on 'partial' left the remaining quantity
+                // without a stop (2026-11-16 review P2).
+                if (order.status !== 'filled') continue;
                 const sibling = get().orders.find((candidate) => (
                   candidate.clientOrderId === order.ocoLinkedOrderId &&
                   CANCELLABLE_STATUSES.includes(candidate.status)
@@ -858,18 +863,9 @@ export const useTradingStore = create<TradingState>()(
             }
           },
 
-          getOrder: (id) => get().orders.find((order) => order.clientOrderId === id),
           getOpenOrders: () => get().orders.filter((order) => (
             ['open', 'partial', 'pending', 'submitted'].includes(order.status) && !isConditionalOrder(order.type)
           )),
-          getConditionalOrders: () => get().orders.filter((order) => (
-            order.status === 'open' && isConditionalOrder(order.type) && !order.isTriggered
-          )),
-          getOrderHistory: () => get().orders.filter((order) => (
-            ['filled', 'cancelled', 'rejected', 'expired'].includes(order.status)
-          )),
-          getPosition: (symbol) => get().positions.get(symbol),
-          getOCOOrders: () => get().ocoOrders.filter((order) => order.status === 'active'),
         };
       },
       {
@@ -910,7 +906,5 @@ export const useTradingStore = create<TradingState>()(
 // ===== Selectors =====
 export const selectOrders = (state: TradingState) => state.orders;
 export const selectOpenOrders = (state: TradingState) => state.getOpenOrders();
-export const selectConditionalOrders = (state: TradingState) => state.getConditionalOrders();
-export const selectOCOOrders = (state: TradingState) => state.getOCOOrders();
 export const selectFocusMode = (state: TradingState) => state.focusMode;
 export const selectPositions = (state: TradingState) => state.positions;
