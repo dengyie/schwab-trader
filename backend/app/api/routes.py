@@ -658,7 +658,22 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
     @router.get("/orders", dependencies=[Depends(require_auth)])
     def list_orders() -> List[Dict[str, Any]]:
         orders = broker.get_orders()
-        return [ord.model_dump(mode="json") for ord in orders]
+        # Echo the idempotency key back per row (reverse of the POST map):
+        # the client's reconcile matches a locally-pending order whose POST
+        # response was lost to the broker row only through this field.
+        with _client_order_lock:
+            by_order_id = {
+                entry.get("order_id"): client_id
+                for client_id, entry in _client_orders.items()
+            }
+        rows: List[Dict[str, Any]] = []
+        for ord in orders:
+            row = ord.model_dump(mode="json")
+            client_id = by_order_id.get(row.get("order_id"))
+            if client_id:
+                row["client_order_id"] = client_id
+            rows.append(row)
+        return rows
 
     @router.post("/orders", dependencies=[Depends(require_auth)])
     def submit_order(req: OrderRequest) -> Dict[str, Any]:
@@ -677,10 +692,12 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 try:
                     fresh = broker.get_order(replay.get("order_id") or "")
                     if fresh is not None:
-                        return fresh.model_dump(mode="json")
+                        payload = fresh.model_dump(mode="json")
+                        payload["client_order_id"] = req.client_order_id
+                        return payload
                 except Exception:
                     pass
-                return replay
+                return dict(replay, client_order_id=req.client_order_id)
         try:
             # Sync latest quote before submitting
             quote = actual_feed.get_latest_quote(sym)
@@ -697,11 +714,15 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             )
             payload = order.model_dump(mode="json")
             if req.client_order_id:
+                payload["client_order_id"] = req.client_order_id
                 with _client_order_lock:
-                    _client_orders[req.client_order_id] = payload
+                    # Store a copy without the echoed field: the reverse map
+                    # in list_orders derives it from the key, and a shared
+                    # reference would double-count on mutation.
+                    _client_orders[req.client_order_id] = dict(payload)
+                    _client_orders[req.client_order_id].pop("client_order_id", None)
                     while len(_client_orders) > _CLIENT_ORDER_MAP_MAX:
                         _client_orders.pop(next(iter(_client_orders)))
-                payload["client_order_id"] = req.client_order_id
             return payload
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

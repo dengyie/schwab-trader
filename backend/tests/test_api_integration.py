@@ -22,9 +22,13 @@ AUTH = {"X-Auth-Token": "test-token"}
 
 @pytest.fixture(autouse=True)
 def reset_state():
-    """Reset ledger and orders before each test."""
+    """Reset ledger, orders and auth-failure state before each test."""
     ledger.reset(10000.0)
     virtual_engine.orders.clear()
+    # The per-IP failure table is module state: 401s from one test must not
+    # bleed into the next and trip the 429 budget (limit is 8/min).
+    from app.core import auth as _auth
+    _auth._auth_failures.clear()
 
 
 def test_health_endpoint():
@@ -734,6 +738,13 @@ def test_order_submission_is_idempotent_under_client_order_id():
         assert second.status_code == 200
         assert second.json()["order_id"] == first.json()["order_id"], \
             "retry with the same client_order_id must not create a new order"
+        # The reconcile path needs the key echoed on the LIST too, not only
+        # on the submit response: a client whose POST response was lost
+        # matches its locally-pending order to the broker row through it.
+        rows = client.get("/api/orders", headers=AUTH).json()
+        echoed = [r for r in rows if r.get("client_order_id") == "client-uuid-123"]
+        assert echoed and echoed[0]["order_id"] == first.json()["order_id"], \
+            "GET /orders must echo client_order_id for the reconcile match"
         # Two positions of 1 share would prove a double execution; one proves
         # the replay returned the original order.
         p = client.get("/api/portfolio", headers=AUTH).json()
