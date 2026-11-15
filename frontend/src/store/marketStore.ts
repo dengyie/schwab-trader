@@ -367,7 +367,12 @@ export const useMarketStore = create<MarketState>()(
               }
               case 'BAR_UPDATE': {
                 const barMsg = payload as any;
-                if (barMsg && barMsg.data) {
+                // Symbol filter: the worker can still emit a trailing bar for
+                // the previous subscription mid-swap — storing it would pin
+                // a foreign symbol's bar as `latestBar` for the next
+                // consumer (2026-11-16 review; PriceChart already filters,
+                // this makes the store safe by itself).
+                if (barMsg && barMsg.data && barMsg.symbol === get().activeSymbol) {
                   set({
                     latestBar: {
                       symbol: barMsg.symbol,

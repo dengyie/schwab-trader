@@ -117,16 +117,40 @@ export function createPolledGetter<T>(
   };
 }
 
-/** Validate a candidate token against the backend before storing it. */
+/** Validate a candidate token against the backend and establish the
+ * HttpOnly session cookie. The admin token is used ONCE here (as the
+ * X-Auth-Token header of this call) and never stored — the cookie that the
+ * response sets carries every later request, and a WS handshake rides it
+ * same-origin automatically. */
 export async function verifyToken(token: string): Promise<boolean> {
   try {
-    const response = await fetch(`${API_BASE}/auth/verify`, {
+    const response = await fetch(`${API_BASE}/auth/login`, {
+      method: 'POST',
       headers: { 'X-Auth-Token': token },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     return response.ok;
   } catch {
     return false;
+  }
+}
+
+/** Probe whether the current session (cookie) is still live. */
+export async function probeSession(): Promise<boolean> {
+  try {
+    const response = await apiFetch('/auth/verify');
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Revoke the server-side session and drop the cookie. */
+export async function destroySession(): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/auth/session`, { method: 'DELETE' });
+  } catch {
+    /* the cookie will simply expire server-side */
   }
 }
 

@@ -594,3 +594,65 @@ def test_equity_history_empty_result_is_cached_briefly(monkeypatch):
     assert broker.get_equity_history() is None
     assert calls == [1], "an empty result must be served from cache"
     assert broker._equity_history_cache["1M:1D"] == (None, broker._equity_history_cache["1M:1D"][1])
+
+
+def test_stop_limit_and_trailing_payload_shapes(monkeypatch):
+    """2026-11-16: conditional orders mirror to the venue — a STOP with a
+    limit price maps to Alpaca's native stop_limit (trigger + limit), and a
+    trailing stop maps to trailing_stop with trail_percent/trail_price."""
+    import httpx
+
+    sent = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "id": f"venue-{len(sent)}",
+                "symbol": sent[-1]["symbol"],
+                "qty": sent[-1]["qty"],
+                "side": sent[-1]["side"],
+                "type": sent[-1]["type"],
+                "status": "accepted",
+                "filled_qty": "0",
+            }
+
+    def fake_post(self, url, json=None, **kw):
+        sent.append(json or {})
+        return _Resp()
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
+        quantity=1, price=89.0, stop_price=90.0,
+    )
+    assert sent[-1]["type"] == "stop_limit"
+    assert sent[-1]["limit_price"] == "89.0"
+    assert sent[-1]["stop_price"] == "90.0"
+
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.SELL, order_type=OrderType.TRAILING_STOP,
+        quantity=1, trail_value=2.5, trail_type="percent",
+    )
+    assert sent[-1]["type"] == "trailing_stop"
+    assert sent[-1]["trail_percent"] == "2.5"
+
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.SELL, order_type=OrderType.TRAILING_STOP,
+        quantity=1, trail_value=5.0, trail_type="absolute",
+    )
+    assert sent[-1]["trail_price"] == "5.0"
+
+    # A plain STOP without a price stays a stop-market
+    broker.submit_order(
+        symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
+        quantity=1, stop_price=90.0,
+    )
+    assert sent[-1]["type"] == "stop"
+    assert "limit_price" not in sent[-1]

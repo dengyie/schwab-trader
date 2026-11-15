@@ -161,8 +161,12 @@ export class OrderBookManager {
     this.state.bids.clear();
     this.state.asks.clear();
 
-    this.state.bids.set(bid.toFixed(2), String(Math.max(1, Math.round(data.bid_size || 0))));
-    this.state.asks.set(ask.toFixed(2), String(Math.max(1, Math.round(data.ask_size || 0))));
+    // Price keys keep full precision: a fixed toFixed(2) collapsed
+    // sub-cent symbols (US <$1 tick 0.0001) into one cent bucket and the
+    // book mis-displayed (2026-11-16 review). The display layer owns
+    // formatting.
+    this.state.bids.set(String(bid), String(Math.max(1, Math.round(data.bid_size || 0))));
+    this.state.asks.set(String(ask), String(Math.max(1, Math.round(data.ask_size || 0))));
 
     const mid = (bid + ask) / 2.0;
     this.state.lastPrice = last || mid;

@@ -202,7 +202,9 @@ class AlpacaPaperBroker(BaseBroker):
         order_type: OrderType,
         quantity: int,
         price: Optional[float] = None,
-        stop_price: Optional[float] = None
+        stop_price: Optional[float] = None,
+        trail_value: Optional[float] = None,
+        trail_type: Optional[str] = None,
     ) -> Order:
         if quantity <= 0:
             raise ValueError("Order quantity must be positive")
@@ -222,6 +224,21 @@ class AlpacaPaperBroker(BaseBroker):
             if stop_price is None:
                 raise ValueError("Stop order requires stop_price")
             payload["stop_price"] = str(round(stop_price, 2))
+            if price is not None:
+                # A STOP carrying a limit price is the venue's native
+                # stop-limit: trigger at stop_price, protect at limit_price.
+                # The generic enum collapses stop_limit into STOP, so the
+                # price field is what distinguishes the two here.
+                payload["type"] = "stop_limit"
+                payload["limit_price"] = str(round(price, 2))
+        elif order_type == OrderType.TRAILING_STOP:
+            payload["type"] = "trailing_stop"
+            if trail_value is None or trail_value <= 0:
+                raise ValueError("Trailing stop requires a trail distance")
+            if (trail_type or "percent") == "percent":
+                payload["trail_percent"] = str(round(trail_value, 4))
+            else:
+                payload["trail_price"] = str(round(trail_value, 2))
 
         try:
             resp = self.client.post(f"{self.base_url}/orders", json=payload)

@@ -1,4 +1,6 @@
 
+import { useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useTradingStore } from '../../store/tradingStore';
 import { useI18n } from '../../i18n';
 import { toast } from '../Toast';
@@ -15,9 +17,17 @@ function OrderRow({ order }: { order: PaperOrder }) {
     ? (parseFloat(order.filledQty) / parseFloat(order.quantity)) * 100 
     : 0;
 
-  const handleCancel = () => {
-    cancelOrder(order.clientOrderId);
-    toast.info(t.toast.orderCancelled);
+  const [cancelling, setCancelling] = useState(false);
+
+  const handleCancel = async () => {
+    // Result-driven toast: the optimistic "cancelled" fired before the
+    // async cancel resolved, so a failure surfaced a second, contradictory
+    // toast (2026-11-16 review).
+    if (cancelling) return;
+    setCancelling(true);
+    const ok = await cancelOrder(order.clientOrderId);
+    setCancelling(false);
+    if (ok) toast.info(t.toast.orderCancelled);
   };
 
   const getStatusText = (status: string) => {
@@ -69,7 +79,7 @@ function OrderRow({ order }: { order: PaperOrder }) {
       </td>
       <td style={{ textAlign: 'right' }}>
         {canCancel && (
-          <button className={styles.cancelBtn} onClick={handleCancel}>
+          <button className={styles.cancelBtn} onClick={handleCancel} disabled={cancelling}>
             Cancel
           </button>
         )}
@@ -80,7 +90,7 @@ function OrderRow({ order }: { order: PaperOrder }) {
 
 export function OpenOrders() {
   const { t } = useI18n();
-  const orders = useTradingStore((state) => state.getOpenOrders());
+  const orders = useTradingStore(useShallow((state) => state.getOpenOrders()));
 
   return (
     <div className={styles.container}>

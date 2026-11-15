@@ -42,9 +42,18 @@ class BaseBroker(ABC):
         order_type: OrderType,
         quantity: int,
         price: Optional[float] = None,
-        stop_price: Optional[float] = None
+        stop_price: Optional[float] = None,
+        trail_value: Optional[float] = None,
+        trail_type: Optional[str] = None,
     ) -> Order:
-        """Submits an order to the execution engine."""
+        """Submits an order to the execution engine.
+
+        ``trail_value``/``trail_type`` (``'percent'`` | ``'absolute'``) carry
+        a trailing-stop's callback distance; brokers without a native
+        trailing order ignore them (the client keeps those evaluated
+        locally). A STOP with ``price`` set is a stop-limit: the venue
+        triggers at ``stop_price`` and protects at ``price``.
+        """
         pass
 
     @abstractmethod

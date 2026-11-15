@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { hasToken, setToken, clearToken, verifyToken, getToken } from '../services/apiClient';
+import { hasToken, clearToken, verifyToken, probeSession, destroySession, getToken } from '../services/apiClient';
 
 export interface User {
   id: string;
@@ -30,9 +30,13 @@ interface AuthState {
   isAuthenticated: boolean;
   isInitialized: boolean;
   isLoading: boolean;
+  /** Persisted, non-sensitive: a session cookie was live at last check. */
+  hadSession?: boolean;
 
   // Actions
   loginWithToken: (token: string) => Promise<{ success: boolean; error?: string }>;
+  /** Boot: migrate a legacy stored token to a cookie, then probe the session. */
+  establishSession: () => Promise<void>;
   logout: () => void;
   updateProfile: (updates: Partial<Pick<User, 'displayName' | 'bio' | 'timezone'>>) => void;
   updateAvatar: (dataUrl: string | null) => void;
@@ -50,11 +54,14 @@ const defaultPreferences: UserPreferences = {
   },
 };
 
+// Placeholder display profile (2026-11-16 review): the old default carried
+// a real personal email in every visitor's localStorage. The profile is
+// editable in Settings; nothing here is a credential.
 const defaultTrader: User = {
   id: 'trader-001',
-  username: 'mango',
-  email: 'dengyie@gmail.com',
-  displayName: 'Mango Pro Trader',
+  username: 'trader',
+  email: 'trader@localhost',
+  displayName: 'Trader',
   avatar: null,
   bio: 'Schwab & Alpaca Quant Trader',
   timezone: 'America/New_York',
@@ -74,12 +81,16 @@ export const useAuthStore = create<AuthState>()(
 
       loginWithToken: async (token: string) => {
         set({ isLoading: true });
+        // 2026-11-16 token upgrade: verifyToken POSTs /auth/login, which
+        // validates the admin token and sets an HttpOnly session cookie.
+        // The token itself is used exactly once here and never stored —
+        // localStorage no longer holds any admin credential.
         const ok = await verifyToken(token);
         if (!ok) {
           set({ isLoading: false });
           return { success: false, error: 'invalidToken' };
         }
-        setToken(token);
+        clearToken(); // drop any legacy stored token; the cookie owns auth now
         set({
           user: get().user || defaultTrader,
           isAuthenticated: true,
@@ -95,6 +106,9 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: () => {
+        // Revoke the server session (drops the HttpOnly cookie server-side
+        // and on the browser) plus any legacy stored token.
+        void destroySession();
         clearToken();
         // Wipe every piece of client-side risk state: an armed stop-loss
         // surviving into the next session on this browser would resume
@@ -121,6 +135,31 @@ export const useAuthStore = create<AuthState>()(
           isInitialized: false,
           // Keep preferences for next login
         });
+      },
+
+      /** Boot-time session establishment.
+       *
+       * A legacy stored admin token is exchanged ONCE for a cookie and then
+       * erased from localStorage; every boot afterwards probes the cookie.
+       * A 401 here flows through apiFetch's unauthorized event, which
+       * routes the app to the login gate. */
+      establishSession: async () => {
+        if (hasToken()) {
+          const legacy = getToken();
+          if (legacy && await verifyToken(legacy)) {
+            clearToken();
+            set({ isAuthenticated: true, isInitialized: true });
+          } else {
+            clearToken();
+          }
+        }
+        if (get().isAuthenticated) {
+          const live = await probeSession();
+          if (!live) {
+            // probeSession's 401 already fired the unauthorized event.
+            set({ isAuthenticated: false });
+          }
+        }
       },
 
       updateProfile: (updates) => {
@@ -171,12 +210,17 @@ export const useAuthStore = create<AuthState>()(
         user: state.user,
         preferences: state.preferences,
         isInitialized: state.isInitialized,
+        // Non-sensitive marker: a cookie session probably exists. The boot
+        // probe (establishSession) is the authority — this only keeps the
+        // login gate from flashing before the probe answers.
+        hadSession: state.isAuthenticated,
       }),
-      // Merge: local persistence never asserts authentication; the token decides.
+      // Merge: optimistic session assumption from the non-sensitive marker;
+      // never from a stored credential (none is stored anymore).
       merge: (persisted, current) => ({
         ...current,
         ...(persisted as Partial<AuthState>),
-        isAuthenticated: hasToken(),
+        isAuthenticated: hasToken() || Boolean((persisted as Partial<AuthState> | undefined)?.hadSession),
       }),
     }
   )

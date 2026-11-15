@@ -44,6 +44,13 @@ export function App() {
   const { isAuthenticated } = useAuthStore();
   const loadMarkets = useMarketsStore((s) => s.loadMarkets);
 
+  // Boot: exchange a legacy stored token for an HttpOnly session cookie
+  // (once), then probe the cookie session. A dead session flows through the
+  // unauthorized event into the login gate below.
+  useEffect(() => {
+    void useAuthStore.getState().establishSession();
+  }, []);
+
   // 市场注册表（币种/每手/最小跳动/涨跌停/时段）是全局唯一来源，登录后拉取一次。
   // 时段钟随 payload 一起来，消费方（如 Watchlist 轮询降频）依赖它判断开收盘；
   // 每 5 分钟刷新一次让"收盘→开盘"的节奏切换在一个轮询周期内生效。

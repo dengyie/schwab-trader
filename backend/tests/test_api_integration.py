@@ -787,3 +787,36 @@ def test_cancel_via_router_reports_failure_as_error():
         resp = client.delete("/api/orders/ord_does_not_matter", headers=AUTH)
         assert resp.status_code == 400
         assert resp.json()["detail"], "the failure reason must reach the client"
+
+
+def test_session_cookie_login_use_and_revoke():
+    """2026-11-16 token upgrade: the browser path exchanges the admin token
+    (header) once for an HttpOnly session cookie, uses the cookie for every
+    later call, and revokes it on logout."""
+    with TestClient(app) as client:
+        # Login: valid admin token in the header mints the session
+        resp = client.post("/api/auth/login", headers=AUTH)
+        assert resp.status_code == 200
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert "st_session=" in set_cookie
+        assert "httponly" in set_cookie.lower()
+        assert "samesite=strict" in set_cookie.lower()
+
+        # The cookie alone now authenticates (no X-Auth-Token header)
+        cookie_value = set_cookie.split("st_session=")[1].split(";")[0]
+        resp = client.get("/api/portfolio", cookies={"st_session": cookie_value})
+        assert resp.status_code == 200
+
+        # A session token in the header works too (API-client path)
+        resp = client.get("/api/portfolio", headers={"X-Auth-Token": cookie_value})
+        assert resp.status_code == 200
+
+        # Logout revokes: the same cookie is dead afterwards
+        resp = client.delete("/api/auth/session", cookies={"st_session": cookie_value})
+        assert resp.status_code == 200
+        resp = client.get("/api/portfolio", cookies={"st_session": cookie_value})
+        assert resp.status_code == 401
+
+        # The admin token itself still works (script path unchanged)
+        resp = client.get("/api/portfolio", headers=AUTH)
+        assert resp.status_code == 200

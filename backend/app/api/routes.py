@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator
 
 from app.models.trading import (
@@ -89,6 +89,10 @@ class OrderRequest(BaseModel):
     # order: the same key answers the original order. Optional so older
     # clients (and tests) keep working without it.
     client_order_id: Optional[str] = None
+    # Trailing-stop callback distance (mirror to the venue's native trailing
+    # order); brokers without one ignore it.
+    trail_value: Optional[float] = None
+    trail_type: Optional[str] = None
 
     @field_validator("side", mode="before")
     @classmethod
@@ -102,6 +106,10 @@ class OrderRequest(BaseModel):
     def normalize_order_type(cls, v):
         if isinstance(v, str):
             v_upper = v.upper()
+            # TRAILING_STOP contains "STOP" — check it FIRST, or a trailing
+            # order would be mis-booked as a plain stop.
+            if "TRAILING" in v_upper:
+                return OrderType.TRAILING_STOP
             if "STOP" in v_upper:
                 return OrderType.STOP
             if "LIMIT" in v_upper:
@@ -304,6 +312,40 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
     @router.get("/auth/verify", dependencies=[Depends(require_auth)])
     def verify_token():
         """Token validity check used by the frontend login gate (401 if invalid)."""
+        return {"ok": True}
+
+    @router.post("/auth/login", dependencies=[Depends(require_auth)])
+    def auth_login(response: Response):
+        """Exchange a valid credential for an HttpOnly session cookie.
+
+        require_auth already validated the ADMIN_TOKEN (header) or an
+        existing session — this endpoint mints the browser's session so the
+        admin token can leave localStorage entirely. The cookie is
+        HttpOnly (unreadable by any script), Secure on https, SameSite=Strict.
+        """
+        from app.core.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, create_session
+        token, expires_at = create_session()
+        response.set_cookie(
+            key=SESSION_COOKIE,
+            value=token,
+            httponly=True,
+            secure=settings.cookie_secure,
+            samesite="strict",
+            max_age=int(SESSION_TTL_SECONDS),
+            path="/",
+        )
+        return {"ok": True, "expires_at": expires_at.isoformat()}
+
+    @router.delete("/auth/session")
+    def auth_session_delete(request: Request, response: Response):
+        """Revoke the caller's session (logout). Unauthenticated by design:
+        revoking YOUR OWN cookie is always safe, and a stale cookie must not
+        block a logout."""
+        from app.core.auth import SESSION_COOKIE, revoke_session
+        token = request.cookies.get(SESSION_COOKIE)
+        if token:
+            revoke_session(token)
+        response.delete_cookie(key=SESSION_COOKIE, path="/")
         return {"ok": True}
 
     # Market catalog ------------------------------------------------------
@@ -710,7 +752,9 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 order_type=req.order_type,
                 quantity=req.quantity,
                 price=req.price,
-                stop_price=req.stop_price
+                stop_price=req.stop_price,
+                trail_value=req.trail_value,
+                trail_type=req.trail_type,
             )
             payload = order.model_dump(mode="json")
             if req.client_order_id:

@@ -11,7 +11,7 @@ import type {
 import { useTradingStore } from './tradingStore';
 import { useMarketStore } from './marketStore';
 import { useWalletStore } from './walletStore';
-import { hasToken } from '../services/apiClient';
+import { useAuthStore } from './authStore';
 
 // ===== Constants =====
 // Execution configuration (reserved for future use)
@@ -348,7 +348,7 @@ export const useAutomationStore = create<AutomationState>()(
             // session: after a logout (or a 401 mid-session) an auto-started
             // engine would resume firing someone else's stop-losses into
             // whatever session logs in next (2026-11-16 review).
-            if (hasToken()) {
+            if (useAuthStore.getState().isAuthenticated) {
               state.startEngine();
             }
           }
@@ -487,7 +487,13 @@ useMarketStore.subscribe(
 );
 
 function updateAndProcess(symbol: string, source: 'last' | 'bid' | 'ask' | 'mid', current: Decimal) {
-  if (!lastPrices[symbol]) lastPrices[symbol] = {};
+  if (!lastPrices[symbol]) {
+    // Bound the map: one entry per symbol ever seen (2026-11-16 review).
+    if (Object.keys(lastPrices).length > 200) {
+      delete lastPrices[Object.keys(lastPrices)[0]];
+    }
+    lastPrices[symbol] = {};
+  }
   
   const previous = lastPrices[symbol][source];
   if (previous && !previous.equals(current)) {

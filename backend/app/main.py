@@ -91,6 +91,14 @@ state_dir = (
 )
 market_cache_dir = os.path.join(state_dir, "market_cache") if state_dir else None
 
+# Session cookies (2026-11-16): persisted so a deploy does not force a
+# re-login. STATE_DIR=off (tests) keeps sessions in memory only.
+from app.core import auth as _auth
+from app.engine.state_store import JsonStateStore as _JsonSessionStore
+_auth.init_session_store(
+    _JsonSessionStore(state_dir, filename="auth_sessions.json") if state_dir else None
+)
+
 # 1. Market Data Provider Factory
 if settings.market_data_provider == "alpaca":
     if not settings.alpaca_api_key or not settings.alpaca_api_secret:
@@ -370,7 +378,14 @@ async def websocket_endpoint(websocket: WebSocket):
         await ws_manager.close(websocket, code=4401, reason="unauthorized")
         return
 
-    auth_via = "query"
+    # Credential source for the log line; the session cookie is the
+    # browser's normal path (same-origin handshake carries it automatically,
+    # 2026-11-16 token upgrade).
+    auth_via = "query" if authenticated else None
+    if not authenticated and _auth.session_valid(websocket.cookies.get(_auth.SESSION_COOKIE)):
+        authenticated = True
+        auth_via = "cookie"
+
     if not authenticated:
         try:
             first = json.loads(

@@ -220,6 +220,8 @@ class VirtualMatchingEngine(BaseBroker):
         quantity: int,
         price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        trail_value: Optional[float] = None,
+        trail_type: Optional[str] = None,
     ) -> Order:
         ref = resolve_symbol(symbol)
         if ref is None:
@@ -370,10 +372,22 @@ class VirtualMatchingEngine(BaseBroker):
                 self._mark_dirty()
                 return None
 
+            # A STOP carrying a limit price is a stop-limit: trigger at
+            # stop_price, then fill like a limit (same fill-at-improvement
+            # simplification the LIMIT branch makes). Without a price it is
+            # a stop-market: fill at the trigger quote ± slippage.
             if order.side == OrderSide.BUY and quote.last >= order.stop_price:
-                fill_price = quote.last * (1.0 + slippage_factor)
+                fill_price = (
+                    min(quote.last, order.price)
+                    if order.price
+                    else quote.last * (1.0 + slippage_factor)
+                )
             elif order.side == OrderSide.SELL and quote.last <= order.stop_price:
-                fill_price = quote.last * (1.0 - slippage_factor)
+                fill_price = (
+                    max(quote.last, order.price)
+                    if order.price
+                    else quote.last * (1.0 - slippage_factor)
+                )
 
         if fill_price is not None and fill_price > 0:
             if tick > 0:

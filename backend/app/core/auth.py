@@ -2,16 +2,26 @@
 Single-user access control for the trading API.
 
 The terminal is deployed on a public host, so every account-mutating or
-account-reading endpoint must be authenticated. The client stores the token in
-localStorage and sends it as ``X-Auth-Token`` (REST) or an ``AUTH`` frame
-(WebSocket); the legacy ``?token=`` query parameter is still honored.
+account-reading endpoint must be authenticated. Three credentials are
+accepted, in order of preference:
+
+* an ``X-Auth-Token`` header carrying the ADMIN_TOKEN (scripts, prod_audit);
+* an HttpOnly session cookie issued by ``POST /api/auth/login`` (the
+  browser's normal path — the admin token never has to live in
+  localStorage);
+* a session token presented in the header (an API client that logged in
+  once and kept the issued token).
+
+The legacy WebSocket ``?token=`` query parameter is still honored.
 """
 from __future__ import annotations
 
 import collections
 import hmac
+import secrets
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Deque, Dict, Optional, Tuple
 
 from fastapi import Header, HTTPException, Request
@@ -30,6 +40,79 @@ AUTH_PENALTY_IPS = 1024  # bound the ip table against address spoofing
 
 _auth_failures: Dict[str, Deque[float]] = {}
 _auth_failures_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Server-side sessions (2026-11-16): an HttpOnly cookie lets the browser
+# authenticate without storing the admin token in localStorage. Sessions are
+# persisted so a deploy does not force a re-login.
+# ---------------------------------------------------------------------------
+SESSION_COOKIE = "st_session"
+SESSION_TTL_SECONDS = 7 * 24 * 3600.0
+SESSIONS_VERSION = 1
+
+_sessions: Dict[str, float] = {}
+_sessions_lock = threading.Lock()
+_session_store = None  # JsonStateStore, wired from main (None = memory-only)
+
+
+def init_session_store(store) -> None:
+    """Attach the persisted session store and load any live sessions."""
+    global _session_store
+    _session_store = store
+    if store is None:
+        return
+    snapshot = store.load()
+    raw = (snapshot or {}).get("sessions") or {}
+    now = time.time()
+    with _sessions_lock:
+        _sessions.clear()
+        for token, expiry in raw.items():
+            try:
+                if float(expiry) > now:
+                    _sessions[str(token)] = float(expiry)
+            except (TypeError, ValueError):
+                continue
+
+
+def _persist_sessions_locked() -> None:
+    if _session_store is None:
+        return
+    _session_store.save({
+        "version": SESSIONS_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "sessions": dict(_sessions),
+    })
+
+
+def create_session() -> Tuple[str, datetime]:
+    """Issue a session token; returns (token, expiry)."""
+    token = secrets.token_urlsafe(32)
+    expiry = time.time() + SESSION_TTL_SECONDS
+    with _sessions_lock:
+        now = time.time()
+        for t in [t for t, exp in _sessions.items() if exp <= now]:
+            _sessions.pop(t, None)
+        _sessions[token] = expiry
+        _persist_sessions_locked()
+    return token, datetime.fromtimestamp(expiry, tz=timezone.utc)
+
+
+def revoke_session(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    with _sessions_lock:
+        existed = _sessions.pop(token, None) is not None
+        if existed:
+            _persist_sessions_locked()
+    return existed
+
+
+def session_valid(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    with _sessions_lock:
+        expiry = _sessions.get(token)
+    return bool(expiry and expiry > time.time())
 
 
 def _client_ip(request: Request) -> str:
@@ -77,6 +160,17 @@ def token_matches(provided: str | None) -> bool:
     return hmac.compare_digest(provided, expected)
 
 
+def _credential_ok(request: Request, x_auth_token: str | None) -> bool:
+    """Admin token (header), session cookie, or session token (header)."""
+    if token_matches(x_auth_token):
+        return True
+    if session_valid(request.cookies.get(SESSION_COOKIE)):
+        return True
+    # A session token riding in the header: only valid when it is NOT equal
+    # to the admin token (already checked above) — cheap dict probe.
+    return session_valid(x_auth_token)
+
+
 def require_auth(request: Request, x_auth_token: str | None = Header(default=None)) -> None:
     """FastAPI dependency guarding every account-facing route."""
     ip = _client_ip(request)
@@ -93,11 +187,14 @@ def require_auth(request: Request, x_auth_token: str | None = Header(default=Non
     if not settings.admin_token:
         # Fail closed: never expose trading endpoints when no token is configured.
         raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured on the server")
-    if not token_matches(x_auth_token):
-        _record_auth_failure(ip)
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Token"},
-        )
-    _clear_auth_failures(ip)
+
+    if _credential_ok(request, x_auth_token):
+        _clear_auth_failures(ip)
+        return
+
+    _record_auth_failure(ip)
+    raise HTTPException(
+        status_code=401,
+        detail="Unauthorized",
+        headers={"WWW-Authenticate": "Token"},
+    )

@@ -208,7 +208,7 @@ describe('OrderBookManager', () => {
       const orderBook = manager.getOrderBook();
       expect(orderBook.bids).toHaveLength(1);
       expect(orderBook.asks).toHaveLength(1);
-      expect(orderBook.bids[0]?.price).toBe('500.00');
+      expect(orderBook.bids[0]?.price).toBe('500');
       expect(orderBook.asks[0]?.price).toBe('500.05');
       expect(orderBook.bids[0]?.quantity).toBe('300');
       expect(orderBook.asks[0]?.quantity).toBe('200');

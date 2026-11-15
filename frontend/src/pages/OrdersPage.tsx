@@ -440,7 +440,15 @@ function OrderDetailDrawer({
 // 性能分析面板
 function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fill: PaperOrder['fills'][0]; order: PaperOrder }[] }) {
   const fxRates = useMarketsStore((state) => state.fxRates);
-  const usdPerUnit = (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1;
+  const usdPerUnit = (currency?: string) => {
+    const code = (currency || 'USD').toUpperCase();
+    const rate = fxRates[code];
+    if (typeof rate === 'number' && rate > 0) return rate;
+    // A missing rate for a non-USD currency must not silently price the
+    // fill 1:1 (2026-11-16 review): the fallback map only carries USD, so
+    // anything else is "unknown" and the aggregate reports it as such.
+    return code === 'USD' ? 1 : NaN;
+  };
   // Each fill is priced in its venue's currency; account totals are reported in
   // the base currency, so convert per fill instead of adding HKD to USD.
   const usdValue = (fill: PaperOrder['fills'][0]) =>
@@ -629,7 +637,15 @@ export function OrdersPage() {
   const currencyOf = useMarketsStore((state) => state.currencyOf);
   const fxRates = useMarketsStore((state) => state.fxRates);
 
-  const usdPerUnit = (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1;
+  const usdPerUnit = (currency?: string) => {
+    const code = (currency || 'USD').toUpperCase();
+    const rate = fxRates[code];
+    if (typeof rate === 'number' && rate > 0) return rate;
+    // A missing rate for a non-USD currency must not silently price the
+    // fill 1:1 (2026-11-16 review): the fallback map only carries USD, so
+    // anything else is "unknown" and the aggregate reports it as such.
+    return code === 'USD' ? 1 : NaN;
+  };
 
   // 时间过滤
   const filterByTime = useCallback((timestamp: number) => {
@@ -689,8 +705,14 @@ export function OrdersPage() {
       sum + usdValue(fill), 0);
     const totalFees = allTrades.reduce(
       (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
-    const avgFillPrice = totalTrades > 0 
-      ? allTrades.reduce((sum, { fill }) => sum + parseFloat(fill.price), 0) / totalTrades 
+    // Averaging raw venue-currency prices across markets mixed HKD/JPY/CNY
+    // into one number (2026-11-16 review). Convert each fill to USD first;
+    // fills with an unknown rate are excluded rather than mispriced.
+    const usdPriced = allTrades
+      .map(({ fill }) => parseFloat(fill.price) * usdPerUnit(fill.feeAsset))
+      .filter((v) => Number.isFinite(v));
+    const avgFillPrice = usdPriced.length > 0
+      ? usdPriced.reduce((sum, v) => sum + v, 0) / usdPriced.length
       : 0;
     
     // 最近一小时交易量

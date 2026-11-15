@@ -39,10 +39,19 @@ class Settings(BaseModel):
     schwab_callback_url: str = "https://127.0.0.1:8182/"
     schwab_token_path: str = "token.json"
 
-    # Access control for the trading API. The single-user terminal requires the
-    # token entered in the browser (stored in localStorage) for every REST call
-    # and for the WebSocket handshake. Empty = refuse all mutating requests.
+    # Access control for the trading API. The single-user terminal requires
+    # the token entered in the browser (or a server-issued session cookie)
+    # for every REST call and for the WebSocket handshake. Empty = refuse all
+    # mutating requests.
     admin_token: Optional[str] = Field(default_factory=lambda: os.getenv("ADMIN_TOKEN"))
+
+    # Session cookies are issued HttpOnly so the admin token never has to
+    # live in localStorage. Secure is on for the https deployment; a plain-
+    # http dev session (vite proxy) sets COOKIE_SECURE=0 or the browser
+    # silently drops the cookie.
+    cookie_secure: bool = Field(
+        default_factory=lambda: os.getenv("COOKIE_SECURE", "1") not in ("0", "false", "False")
+    )
 
     # Browser origins allowed to call the API (comma separated, exact match).
     allowed_origins: List[str] = Field(

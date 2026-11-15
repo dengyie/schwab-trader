@@ -1,7 +1,7 @@
 # K线无截断滑动阅读 — 开发文档（切片 5a/5b/5c）
 
 > 项目：schwab-trader（Schwab & Alpaca Trader Hub）
-> 状态：待开发 → 本文档即实施依据
+> 状态：已完成（切片 5a/5b/5c + defeatbeta 兜底均已上线，2026-11-16 确认；vault 登记待 vault 可达时补记 §7.13）
 > 权威入口：vault `Note/Infra/schwab-trader 部署与运维.md`（§7 数据层系列）；本切片完成后在 §7 登记为 §7.13。
 > 创建：2026-11-11
 

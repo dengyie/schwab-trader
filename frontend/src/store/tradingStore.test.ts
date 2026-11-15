@@ -207,7 +207,20 @@ describe('client-side conditional orders', () => {
 });
 
 describe('OCO orders', () => {
-  it('submits the winning leg as a limit and cancels its sibling', () => {
+  it('mirrors both legs to the venue at creation (limit leg + native stop_limit)', () => {
+    globalThis.fetch = async (url: any, init?: any) => {
+      const method = String(init?.method || 'GET').toUpperCase();
+      requested.push({ url: String(url), method, body: init?.body ? JSON.parse(init.body as string) : undefined });
+      if (String(url).endsWith('/orders') && method === 'POST') {
+        return json({ order_id: `ord_${requested.filter((r) => r.method === 'POST').length}`, status: 'OPEN' });
+      }
+      if (String(url).endsWith('/orders') && method === 'GET') return json([]);
+      if (String(url).endsWith('/portfolio')) {
+        return json({ cash: 100000, total_equity: 100000, initial_capital: 200000, positions: {} });
+      }
+      return json({});
+    };
+
     const oco = useTradingStore.getState().createOCOOrder({
       symbol: 'SPY',
       side: 'sell',
@@ -218,21 +231,73 @@ describe('OCO orders', () => {
     });
 
     expect(oco).not.toBeNull();
-    expect(submission()).toBeUndefined();
+    // 2026-11-16: conditional orders rest at the venue — both OCO legs are
+    // submitted immediately, the stop leg as a native stop_limit carrying
+    // trigger + limit. The local trigger evaluation skips mirrored legs,
+    // so no second order can fire locally.
+    const posts = requested.filter((r) => r.url.endsWith('/orders') && r.method === 'POST');
+    expect(posts).toHaveLength(2);
+    const types = posts.map((p) => p.body.order_type).sort();
+    expect(types).toEqual(['LIMIT', 'STOP']);
+    const stopPost = posts.find((p) => p.body.order_type === 'STOP')!;
+    expect(stopPost.body).toMatchObject({ stop_price: 90, price: 89 });
+    const limitPost = posts.find((p) => p.body.order_type === 'LIMIT')!;
+    expect(limitPost.body).toMatchObject({ price: 110, client_order_id: expect.any(String) });
 
-    useTradingStore.getState().evaluateOrderTriggers(book('100.00', '100.10'));
+    // A local trigger must NOT fire on top of the venue-mirrored legs.
     useTradingStore.getState().evaluateOrderTriggers(book('111.00', '111.10'));
+    const postsAfterTrigger = requested.filter((r) => r.url.endsWith('/orders') && r.method === 'POST');
+    expect(postsAfterTrigger).toHaveLength(2);
+  });
 
-    const post = submission();
-    expect(post!.body).toMatchObject({
-      symbol: 'SPY',
-      side: 'SELL',
-      order_type: 'LIMIT',
-      quantity: 10,
-      price: 110,
+  it('cascades a venue-filled OCO leg into a sibling cancel', async () => {
+    globalThis.fetch = async (url: any, init?: any) => {
+      const method = String(init?.method || 'GET').toUpperCase();
+      requested.push({ url: String(url), method, body: init?.body ? JSON.parse(init.body as string) : undefined });
+      if (String(url).endsWith('/orders') && method === 'GET') {
+        return json([
+          // The TP leg filled at the venue; the stop leg is still open.
+          { order_id: 'ord_tp', client_order_id: 'leg-tp', symbol: 'SPY', side: 'sell',
+            order_type: 'limit', quantity: 10, price: 110, status: 'FILLED' },
+          { order_id: 'ord_sl', client_order_id: 'leg-sl', symbol: 'SPY', side: 'sell',
+            order_type: 'stop_limit', quantity: 10, stop_price: 90, status: 'OPEN' },
+        ]);
+      }
+      if (method === 'DELETE') return json({ status: 'CANCELED' });
+      return json({});
+    };
+
+    useTradingStore.setState({
+      orders: [
+        { clientOrderId: 'leg-tp', backendId: 'ord_tp', symbol: 'SPY', side: 'sell',
+          type: 'limit', price: '110', quantity: '10', filledQty: '0', avgPrice: '0',
+          status: 'open', createdAt: Date.now(), updatedAt: Date.now(), fills: [],
+          ocoGroupId: 'oco_x', ocoLinkedOrderId: 'leg-sl', isOcoOrder: true },
+        { clientOrderId: 'leg-sl', backendId: 'ord_sl', symbol: 'SPY', side: 'sell',
+          type: 'stop_limit', price: '89', quantity: '10', filledQty: '0', avgPrice: '0',
+          status: 'open', createdAt: Date.now(), updatedAt: Date.now(), fills: [],
+          triggerPrice: '90', ocoGroupId: 'oco_x', ocoLinkedOrderId: 'leg-tp', isOcoOrder: true },
+      ],
+      ocoOrders: [{
+        ocoGroupId: 'oco_x', symbol: 'SPY', side: 'sell', quantity: '10',
+        limitPrice: '110', stopPrice: '90', stopLimitPrice: '89', status: 'active',
+        limitOrderId: 'leg-tp', stopOrderId: 'leg-sl', createdAt: Date.now(), updatedAt: Date.now(),
+      }],
     });
-    expect(useTradingStore.getState().ocoOrders[0].status).toBe('triggered');
-    expect(useTradingStore.getState().orders.find((o) => !o.isTriggered)?.status).toBe('cancelled');
+
+    await useTradingStore.getState().fetchOrders();
+    // The sibling cancel is fire-and-forget async: settle its DELETE round
+    // trip before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const del = requested.find((r) => r.method === 'DELETE');
+    expect(del).toBeDefined();
+    expect(del!.url).toContain('ord_sl');
+    const sibling = useTradingStore.getState().orders.find((o) => o.backendId === 'ord_sl');
+    expect(sibling?.status).toBe('cancelled');
+    // The group derivation marks a group with a filled leg 'filled'
+    // (fill takes priority over the triggered marker).
+    expect(useTradingStore.getState().ocoOrders[0].status).toBe('filled');
   });
 });
 

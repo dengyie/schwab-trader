@@ -179,8 +179,44 @@ function normalizeSymbol(symbol: string): string {
   return symbol.replace('/USD', '').replace('USDT', '');
 }
 
-function backendType(type: OrderType): 'MARKET' | 'LIMIT' {
-  return type === 'limit' ? 'LIMIT' : 'MARKET';
+/**
+ * Map a local order type to the backend's coarse order-type enum.
+ *
+ * Backend enum: MARKET | LIMIT | STOP | TRAILING_STOP. A stop_limit rides
+ * as STOP carrying BOTH stop_price (trigger) and price (limit) — the broker
+ * layer turns that pair into the venue's native stop_limit. A
+ * take_profit_limit rides as LIMIT at its limit price: for a long it rests
+ * as a sell limit above the market (fills when the target is reached), for
+ * a short as a buy limit below — venue semantics identical to the local
+ * trigger's intent.
+ */
+function backendType(type: OrderType): 'MARKET' | 'LIMIT' | 'STOP' | 'TRAILING_STOP' {
+  if (type === 'limit' || type === 'take_profit_limit') return 'LIMIT';
+  if (type === 'trailing_stop') return 'TRAILING_STOP';
+  if (type === 'stop_limit' || type === 'stop_market') return 'STOP';
+  return 'MARKET';
+}
+
+/**
+ * True when this order should rest at the venue instead of waiting for the
+ * local trigger. One-shot conditionals (stop_limit / take_profit_limit) are
+ * mirrored for BOTH markets: US maps to Alpaca's native stop_limit, HK/JP/CN
+ * rest in the server-side virtual engine, which matches them on quotes
+ * independently of any browser. Trailing stops mirror only for US (Alpaca
+ * has a native trailing order) and only without an activation price (the
+ * venue cannot defer activation). Mirrored orders are skipped by the local
+ * trigger evaluation — the venue owns their execution; a local trigger
+ * firing on top would place a duplicate order.
+ */
+function mirrorToVenue(order: PaperOrder): boolean {
+  if (isConditionalOrder(order.type)) {
+    if (order.type === 'stop_limit' || order.type === 'take_profit_limit') return true;
+    if (order.type === 'trailing_stop') {
+      return marketOf(order.symbol) === 'US' && !order.trailingActivationPrice;
+    }
+    return false;
+  }
+  return true;
 }
 
 async function rejectionReason(res: Response): Promise<string> {
@@ -235,9 +271,16 @@ export const useTradingStore = create<TradingState>()(
                 side: order.side.toUpperCase(),
                 order_type: backendType(order.type),
                 quantity: Math.trunc(parseFloat(order.quantity)),
-                price: order.type === 'limit' && order.price
+                price: (order.type === 'limit' || order.type === 'take_profit_limit' || order.type === 'stop_limit') && order.price
                   ? parseFloat(order.price)
                   : undefined,
+                stop_price: (order.type === 'stop_limit' || order.type === 'stop_market') && order.triggerPrice
+                  ? parseFloat(order.triggerPrice)
+                  : undefined,
+                trail_value: order.type === 'trailing_stop' && order.trailingValue
+                  ? parseFloat(order.trailingValue)
+                  : undefined,
+                trail_type: order.type === 'trailing_stop' ? order.trailingType : undefined,
                 market,
                 // Idempotency key: a retry after a lost response replays the
                 // original order server-side instead of placing a duplicate.
@@ -348,8 +391,13 @@ export const useTradingStore = create<TradingState>()(
         const checkConditionalOrders = (symbol: string, currentPrice: string, previousPrice: string) => {
           const candidates = get().orders.filter((order) => {
             if (order.symbol !== symbol || order.status !== 'open' || order.isTriggered) return false;
+            // A venue-mirrored order is executed by the broker — the local
+            // trigger firing on top would place a duplicate order. Its fill
+            // arrives through reconcile, which cascades the OCO sibling.
+            if (order.backendId) return false;
             if (isConditionalOrder(order.type)) return Boolean(order.triggerPrice);
-            // An OCO's limit leg is a resting limit watched locally.
+            // An OCO's limit leg is a resting limit watched locally (only
+            // when it was NOT mirrored — mirrored legs have a backendId).
             return Boolean(order.isOcoOrder && order.type === 'limit' && order.price);
           });
 
@@ -373,7 +421,9 @@ export const useTradingStore = create<TradingState>()(
             order.symbol === symbol &&
             order.status === 'open' &&
             order.type === 'trailing_stop' &&
-            !order.isTriggered
+            !order.isTriggered &&
+            // Venue-mirrored trailing (Alpaca native) trails server-side.
+            !order.backendId
           ));
 
           for (const order of candidates) {
@@ -444,6 +494,10 @@ export const useTradingStore = create<TradingState>()(
 
             const now = Date.now();
             const isConditional = isConditionalOrder(type);
+            // Mirror decision made up front so the initial status is right:
+            // venue-bound orders start 'pending' (the local trigger only
+            // acts on 'open'), local-only conditionals start 'open'.
+            const willMirror = !isConditional || type === 'stop_limit' || type === 'take_profit_limit';
 
             const order: PaperOrder = {
               clientOrderId: uuidv4(),
@@ -454,8 +508,7 @@ export const useTradingStore = create<TradingState>()(
               quantity: String(execQuantity),
               filledQty: '0',
               avgPrice: '0',
-              // Conditional orders are local until their trigger fires.
-              status: isConditional ? 'open' : 'pending',
+              status: willMirror ? 'pending' : 'open',
               createdAt: now,
               updatedAt: now,
               fills: [],
@@ -470,11 +523,15 @@ export const useTradingStore = create<TradingState>()(
 
             set((state) => ({ orders: [order, ...state.orders] }));
 
-            // Conditional orders never reach the broker before they trigger:
-            // a resting stop is client-side automation, not a broker order.
-            // The backend executes at its own quote, so the caller's last
-            // traded price is only a UI hint and is not sent.
-            if (!isConditional) void submitToBackend(order);
+            // Conditional orders REST AT THE VENUE now: stop_limit /
+            // take_profit_limit mirror for both markets (Alpaca native
+            // stop_limit; the server-side virtual engine matches intl ones
+            // on quotes), US trailing mirrors to Alpaca's trailing order.
+            // The venue owns their execution; the local trigger evaluation
+            // skips anything with a backendId so a price crossing cannot
+            // place a duplicate. Non-mirrored conditionals (intl trailing,
+            // trailing with an activation price) keep the old local path.
+            if (mirrorToVenue(order)) void submitToBackend(order);
             return order;
           },
 
@@ -533,7 +590,7 @@ export const useTradingStore = create<TradingState>()(
               quantity: String(execQuantity),
               filledQty: '0',
               avgPrice: '0',
-              status: 'open',
+              status: 'pending',
               createdAt: now,
               updatedAt: now,
               fills: [],
@@ -551,7 +608,7 @@ export const useTradingStore = create<TradingState>()(
               quantity: String(execQuantity),
               filledQty: '0',
               avgPrice: '0',
-              status: 'open',
+              status: 'pending',
               createdAt: now,
               updatedAt: now,
               fills: [],
@@ -582,6 +639,14 @@ export const useTradingStore = create<TradingState>()(
               orders: [limitOrder, stopOrder, ...state.orders],
               ocoOrders: [ocoOrder, ...state.ocoOrders],
             }));
+
+            // Both legs mirror to the venue: the limit leg rests as a plain
+            // limit, the stop leg as a native stop_limit. Whichever fills
+            // first cascades a cancel of the sibling (see fetchOrders'
+            // venue-fill cascade) — the OCO pairing lives in the client
+            // metadata, the executions live at the venue.
+            void submitToBackend(limitOrder);
+            void submitToBackend(stopOrder);
 
             notification.success(`oco:created:${now}`, `OCO Order created: ${symbol} ${side.toUpperCase()}`);
             return ocoOrder;
@@ -624,7 +689,10 @@ export const useTradingStore = create<TradingState>()(
               quantity: String(execQuantity),
               filledQty: '0',
               avgPrice: '0',
-              status: 'open',
+              // Venue-mirrored trailing starts 'pending' until the POST
+              // confirms; local-only trailing (intl, activation-gated)
+              // starts 'open' and is watched by the local trigger.
+              status: 'pending',
               createdAt: now,
               updatedAt: now,
               fills: [],
@@ -638,6 +706,15 @@ export const useTradingStore = create<TradingState>()(
             };
 
             set((state) => ({ orders: [order, ...state.orders] }));
+            // US trailing without an activation price mirrors to the venue's
+            // native trailing order (server-side monitoring); everything
+            // else stays on the local trigger path — flip those back to
+            // 'open' so the local trigger watches them.
+            if (mirrorToVenue(order)) {
+              void submitToBackend(order);
+            } else {
+              updateOrder(order.clientOrderId, { status: 'open' });
+            }
             notification.success(`trailing:created:${now}`, `Trailing Stop created: ${symbol} ${side.toUpperCase()}`);
             return order;
           },
@@ -678,6 +755,12 @@ export const useTradingStore = create<TradingState>()(
             const midPrice = new Decimal(bestBid.price).plus(bestAsk.price).div(2).toFixed(8);
             const previousPrice = previousPrices.get(orderBook.symbol) ?? midPrice;
             previousPrices.set(orderBook.symbol, midPrice);
+            // Bound the map: one entry per symbol ever subscribed grows on
+            // symbol-lookup trading (2026-11-16 review).
+            if (previousPrices.size > 200) {
+              const oldestKey = previousPrices.keys().next().value;
+              if (oldestKey) previousPrices.delete(oldestKey);
+            }
 
             checkConditionalOrders(orderBook.symbol, midPrice, previousPrice);
             updateTrailingStops(orderBook.symbol, midPrice);
@@ -745,10 +828,28 @@ export const useTradingStore = create<TradingState>()(
               const rows: BackendOrderRow[] = await res.json();
               if (!Array.isArray(rows)) return;
 
+              const before = get().orders;
               set((state) => {
                 const orders = reconcileOrders(state.orders, rows);
                 return { orders, ocoOrders: reconcileOcoGroups(state.ocoOrders, orders) };
               });
+              // Venue-fill OCO cascade: a mirrored leg that the venue just
+              // filled must cancel its sibling there too — the OCO pairing
+              // is client metadata, so the cascade lives on the client.
+              const filledNow = new Set(
+                before
+                  .filter((o) => o.ocoGroupId && o.backendId && !['filled', 'partial'].includes(o.status))
+                  .map((o) => o.clientOrderId)
+              );
+              for (const order of get().orders) {
+                if (!filledNow.has(order.clientOrderId)) continue;
+                if (!['filled', 'partial'].includes(order.status)) continue;
+                const sibling = get().orders.find((candidate) => (
+                  candidate.clientOrderId === order.ocoLinkedOrderId &&
+                  CANCELLABLE_STATUSES.includes(candidate.status)
+                ));
+                if (sibling) void cancelRecord(sibling, false);
+              }
               // Trade statistics are a pure view over these reconciled fills.
               useWalletStore.getState().syncPerformanceFromOrders(get().orders);
 

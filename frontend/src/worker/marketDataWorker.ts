@@ -42,9 +42,6 @@ const STALE_CHECK_INTERVAL_MS = 2000;  // 状态检查频率
 const STALE_RECONNECT_THRESHOLD_MS = 180000; // 180秒（3分钟）无行情平滑刷新
 const METRICS_UPDATE_INTERVAL_MS = 250; // 指标更新频率
 const MAX_RECONNECTS_PER_MINUTE = 5;    // 每分钟最大重连次数（放宽）
-const QUEUE_WARNING_THRESHOLD = 100;
-const QUEUE_TRADE_DOWNSAMPLE_THRESHOLD = 500;
-const QUEUE_RESYNC_THRESHOLD = 1000;
 
 // ===== State =====
 let ws: WebSocket | null = null;
@@ -61,9 +58,8 @@ let reconnectMonitorTimer: ReturnType<typeof setInterval> | null = null; // 重�
 let lastMessageTime = 0;
 let gapCount = 0;
 let resyncCount = 0;
-let messageQueue: unknown[] = [];
+let snapshotRetryAttempt = 0;
 let tradeBatch: Trade[] = []; // 成交批处理队列
-let tradeDownsampleActive = false;
 let isIntentionalClose = false; // 标记是否为主动关闭（切换币种/取消订阅）
 let connectionId = 0; // 连接 ID，用于处理竞态条件
 let pendingConnectTimer: ReturnType<typeof setTimeout> | null = null; // 延迟连接定时器
@@ -311,7 +307,6 @@ async function connect(symbol: string): Promise<void> {
     const prevSymbol = currentSymbol;
     currentSymbol = symbol;
     orderBookManager = new OrderBookManager(symbol);
-    messageQueue = [];
     tradeBatch = [];
 
     try {
@@ -349,10 +344,8 @@ async function connect(symbol: string): Promise<void> {
   resyncCount = 0;
   lastMessageTime = 0;
   lastReconnectAttemptTime = 0;
-  messageQueue = [];
   messageTimestamps = [];
   latencyHistory = [];
-  tradeDownsampleActive = false;
   
   // 启动重连监控器
   startReconnectMonitor();
@@ -495,6 +488,7 @@ async function connect(symbol: string): Promise<void> {
 }
 
 async function fetchSnapshot(symbol: string): Promise<void> {
+  snapshotRetryAttempt = 0;
   const url = `/api/market/quote?symbol=${encodeURIComponent(symbol)}`;
   
   log('info', 'orderbook', 'ob.snapshot_start', { symbol, url });
@@ -533,12 +527,15 @@ async function fetchSnapshot(symbol: string): Promise<void> {
       url,
     });
     
-    // Retry after delay
+    // Retry with capped exponential backoff (2026-11-16 review): the fixed
+    // 2.5s retry hammered a persistently failing endpoint forever.
+    snapshotRetryAttempt += 1;
+    const delay = Math.min(2500 * 2 ** (snapshotRetryAttempt - 1), 60_000);
     setTimeout(() => {
       if (currentSymbol === symbol && connectionState === 'connected') {
         fetchSnapshot(symbol);
       }
-    }, 2500);
+    }, delay);
   }
 }
 
@@ -613,33 +610,6 @@ function sendTradeBatch(): void {
   tradeBatch = [];
 }
 
-function checkBackpressure(): void {
-  const queueLen = messageQueue.length;
-
-  if (queueLen > QUEUE_RESYNC_THRESHOLD && orderBookManager) {
-    log('warn', 'system', 'backpressure.resync_triggered', { queueLen });
-    orderBookManager.markResyncStart();
-    if (currentSymbol) {
-      fetchSnapshot(currentSymbol);
-    }
-    messageQueue = [];
-    tradeDownsampleActive = false;
-  } else if (queueLen > QUEUE_TRADE_DOWNSAMPLE_THRESHOLD) {
-    if (!tradeDownsampleActive) {
-      log('warn', 'system', 'backpressure.trade_downsample', { queueLen });
-      tradeDownsampleActive = true;
-    }
-  } else if (queueLen > QUEUE_WARNING_THRESHOLD) {
-    log('debug', 'system', 'backpressure.warning', { queueLen });
-  } else {
-    tradeDownsampleActive = false;
-  }
-
-  // Clear processed messages
-  if (messageQueue.length > 100) {
-    messageQueue = messageQueue.slice(-50);
-  }
-}
 
 /**
  * A rejected token is terminal: every retry would present the same token, so
@@ -752,10 +722,8 @@ async function reconnectWithRetainedData(symbol: string): Promise<void> {
   
   // 重置连接相关的临时状态
   lastMessageTime = 0;
-  messageQueue = [];
   messageTimestamps = [];
   latencyHistory = [];
-  tradeDownsampleActive = false;
   
   sendConnectionStatus();
   
@@ -993,10 +961,8 @@ function disconnect(): void {
   resyncCount = 0;
   lastMessageTime = 0;
   lastReconnectAttemptTime = 0;
-  messageQueue = [];
   messageTimestamps = [];
   latencyHistory = [];
-  tradeDownsampleActive = false;
   
   sendConnectionStatus();
   

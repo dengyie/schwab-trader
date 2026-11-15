@@ -183,3 +183,28 @@ def test_model_exporter_and_agent_context():
     assert context["symbol"] == "SPY"
     assert context["technical_indicators"]["trend"] == "BULLISH"
     assert context["real_time_quote"]["last"] == 520.05
+
+
+def test_stop_limit_order_matching():
+    """2026-11-16: a STOP carrying a limit price is a stop-limit — trigger at
+    stop_price, fill at the limit (the same fill-at-improvement
+    simplification the LIMIT branch makes). Without a price it stays a
+    stop-market at the trigger quote."""
+    ledger = PortfolioLedger(initial_capital=10000.0)
+    engine = VirtualMatchingEngine(ledger)
+
+    engine.on_quote(Quote(symbol="MSFT", bid=100.0, ask=100.0, last=100.0))
+    engine.submit_order(symbol="MSFT", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=10)
+
+    # Stop-limit sell: trigger 95, protect at 94.5
+    stop = engine.submit_order(
+        symbol="MSFT", side=OrderSide.SELL, order_type=OrderType.STOP,
+        quantity=10, stop_price=95.0, price=94.5,
+    )
+    assert stop.status == OrderStatus.PENDING
+
+    # Quote drops through the trigger -> fills at the limit, not the quote
+    trades = engine.on_quote(Quote(symbol="MSFT", bid=93.8, ask=94.2, last=94.0))
+    assert len(trades) == 1
+    assert stop.status == OrderStatus.FILLED
+    assert stop.filled_avg_price == 94.5

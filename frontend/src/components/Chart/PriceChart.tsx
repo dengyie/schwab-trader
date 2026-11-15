@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { createChart, IChartApi, ColorType, UTCTimestamp, LineSeries, CandlestickSeries, HistogramSeries, CrosshairMode } from 'lightweight-charts';
 import { handleApiError, logError } from '../../utils/errorHandler';
 import { apiFetch } from '../../services/apiClient';
@@ -187,7 +188,9 @@ export function PriceChart() {
     return def?.clock?.is_open !== false; // 时钟缺失保守按开盘（多轮询好过漏更新）
   }, [markets, selectedSymbol]);
   const triggers = useAutomationStore((state) => state.triggers);
-  const openOrders = useTradingStore((state) => state.orders.filter(o => o.status === 'open'));
+  // useShallow: the filter builds a new array each store set — without it
+  // every unrelated order update re-renders the chart subtree.
+  const openOrders = useTradingStore(useShallow((state) => state.orders.filter(o => o.status === 'open')));
   
   const [chartType, setChartType] = useState<ChartType>('candlestick');
   const [timeRange, setTimeRange] = useState<TimeRange>('15m');
@@ -593,12 +596,16 @@ export function PriceChart() {
     // 常驻轻量诊断：线上核对"历史是否真的进了序列"用（/trade 控制台读
     // window.__mergeLog）。不可变段合并频率极低，日志开销可忽略。
     if (typeof window !== 'undefined') {
-      (window as any).__mergeLog = ((window as any).__mergeLog || []).concat([{
+      // Capped at 50 entries: a long-lived tab paging deep history all day
+      // would otherwise grow this diagnostic array without bound
+      // (2026-11-16 review).
+      const logSoFar: any[] = (window as any).__mergeLog || [];
+      (window as any).__mergeLog = logSoFar.concat([{
         at: new Date().toISOString().slice(11, 19),
         page: older.length,
         total: merged.length,
         first: merged[0]?.time,
-      }]);
+      }]).slice(-50);
     }
   }, []);
 
