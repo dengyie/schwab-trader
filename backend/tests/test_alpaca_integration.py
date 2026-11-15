@@ -664,13 +664,13 @@ def test_stop_limit_and_trailing_payload_shapes(monkeypatch):
         symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
         quantity=1, price=89.0, stop_price=90.0, time_in_force="gtc",
     )
-    assert sent[-1]["time_in_force"] == "GTC"  # broker upper-cases the client value
+    assert sent[-1]["time_in_force"] == "gtc"  # wire spelling is lowercase (venue contract)
 
     # Plain spot orders without an explicit TIF keep the day default.
     broker.submit_order(
         symbol="SPY", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=1,
     )
-    assert sent[-1]["time_in_force"] == "DAY"  # venue payload upper-cases TIF
+    assert sent[-1]["time_in_force"] == "day"
 
     # An invalid TIF is refused by the request layer, but the broker must
     # not silently downgrade an unknown value either.

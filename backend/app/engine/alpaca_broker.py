@@ -215,6 +215,10 @@ class AlpacaPaperBroker(BaseBroker):
             # Defense in depth: the request layer validates this too, but a
             # garbage TIF must never reach the venue from any caller.
             raise ValueError("time_in_force must be one of DAY/GTC/EXT")
+        # Alpaca's API takes the lowercase spelling; the uppercase form is
+        # internal (the domain enum) — 'GTC' verbatim is rejected by the
+        # venue as "invalid time_in_force" (caught live, 2026-11-16).
+        tif_wire = tif.lower()
 
         payload = {
             "symbol": symbol.upper(),
@@ -224,7 +228,7 @@ class AlpacaPaperBroker(BaseBroker):
             # Venue-resting conditionals arrive with 'gtc' from the client
             # (a 'day' stop expired at the session close — 2026-11-16
             # review P1). Anything else keeps the historical day default.
-            "time_in_force": tif,
+            "time_in_force": tif_wire,
         }
         if order_type == OrderType.LIMIT:
             if price is None:
