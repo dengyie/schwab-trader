@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { useWalletStore } from '../../store/walletStore';
 import { useMarketStore } from '../../store/marketStore';
+import { hasLiveRiskOrders, useTriggerRunner } from '../../store/trading/triggerRunner';
 import { MobileLayout } from './MobileLayout';
 import { DesktopLayout } from './DesktopLayout';
 
@@ -16,13 +17,19 @@ export function AdaptiveLayout() {
   // 收盘判定用市场时钟；时钟缺失时保守按"开盘"节奏（多轮询好过漏更新）。
   const marketOpen = useMarketStore((s) => s.marketClock?.is_open !== false);
 
+  // 应用级触发器引擎：条件单/止盈止损的评估不再依赖 /trade 页面挂载
+  // （2026-11-16 review P1——离开页面后止损静默失效）。挂载即启动。
+  useTriggerRunner();
+
   // 后台标签页降载：隐藏时掐断 WS 行情流（心跳/指标批/stale 快照在
   // 无人看的页面全是空转），回到前台原符号原 token 重连。HTTP 轮询
   // 各自已有 document.hidden 门控；这里统一管 WS 这一条。
+  // 例外：存在待触发的风险单（本地止损/条件单/自动化触发器）时保持
+  // 连接——这类订单只在浏览器里评估，"没人看"不能等于"没人盯"。
   useEffect(() => {
     const { pauseFeed, resumeFeed } = useMarketStore.getState();
     const onVisibility = () => {
-      if (document.hidden) pauseFeed();
+      if (document.hidden && !hasLiveRiskOrders()) pauseFeed();
       else resumeFeed();
     };
     document.addEventListener('visibilitychange', onVisibility);

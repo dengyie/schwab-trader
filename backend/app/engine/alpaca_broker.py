@@ -2,10 +2,12 @@
 Alpaca Paper Trading Broker implementation.
 Routes orders to Alpaca Paper Trading REST API and syncs cloud portfolio state.
 """
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Callable
+import threading
 import time
 import httpx
+from zoneinfo import ZoneInfo
 from app.models.trading import (
     Order, OrderSide, OrderType, OrderStatus, Trade, Quote, Position, Portfolio, utc_now
 )
@@ -17,7 +19,7 @@ from app.core.config import settings
 class AlpacaPaperBroker(BaseBroker):
     """
     Broker implementation delegating execution and account bookkeeping
-    directly to Alpaca Markets Paper Trading REST endpoints.
+    directly to Alpaca Paper Trading REST endpoints.
     Includes in-memory TTL caching to avoid blocking HTTP event loops.
     """
 
@@ -43,6 +45,17 @@ class AlpacaPaperBroker(BaseBroker):
         self.cached_orders: Dict[str, Order] = {}
         self.orders = self.cached_orders
         self.cached_portfolio: Optional[Portfolio] = None
+
+        # One lock guards every piece of cached broker state. Callers run on
+        # the feed thread (on_quote), FastAPI's sync threadpool (REST routes)
+        # and asyncio.to_thread workers concurrently: without it, two
+        # concurrent /api/orders requests could raise
+        # "dictionary changed size during iteration" inside the cached_orders
+        # copy, and a quote could mutate a position while get_portfolio
+        # serialized it. The venue HTTP calls happen OUTSIDE the lock — only
+        # the in-memory state is guarded. Same contract as the virtual
+        # engine's _book_lock (see matching_engine.py).
+        self._state_lock = threading.RLock()
 
         # TTL cache trackers (5-second freshness)
         self._portfolio_cached_at: float = 0.0
@@ -70,12 +83,13 @@ class AlpacaPaperBroker(BaseBroker):
     def get_portfolio(self, force_refresh: bool = False) -> Portfolio:
         """Fetch remote account equity and open positions from Alpaca REST API with TTL cache."""
         now = time.time()
-        if not force_refresh and self.cached_portfolio and (now - self._portfolio_cached_at < self._portfolio_ttl):
-            # Update position mark-to-market prices from latest streaming quotes
-            for sym, pos in self.cached_portfolio.positions.items():
-                if sym in self.latest_quotes:
-                    pos.current_price = self.latest_quotes[sym].last
-            return self.cached_portfolio
+        with self._state_lock:
+            if not force_refresh and self.cached_portfolio and (now - self._portfolio_cached_at < self._portfolio_ttl):
+                # Update position mark-to-market prices from latest streaming quotes
+                for sym, pos in self.cached_portfolio.positions.items():
+                    if sym in self.latest_quotes:
+                        pos.current_price = self.latest_quotes[sym].last
+                return self.cached_portfolio.model_copy(deep=True)
 
         try:
             acc_resp = self.client.get(f"{self.base_url}/account")
@@ -89,17 +103,19 @@ class AlpacaPaperBroker(BaseBroker):
             portfolio = AlpacaDataAdapter.parse_account_to_portfolio(account_data, positions_data)
 
             # Apply latest quotes if available for real-time unrealized PnL
-            for sym, pos in portfolio.positions.items():
-                if sym in self.latest_quotes:
-                    pos.current_price = self.latest_quotes[sym].last
+            with self._state_lock:
+                for sym, pos in portfolio.positions.items():
+                    if sym in self.latest_quotes:
+                        pos.current_price = self.latest_quotes[sym].last
 
-            self.cached_portfolio = portfolio
-            self._portfolio_cached_at = now
-            return portfolio
+                self.cached_portfolio = portfolio
+                self._portfolio_cached_at = now
+                return portfolio.model_copy(deep=True)
         except Exception as exc:
             # Serve the last known good snapshot if we have one...
-            if self.cached_portfolio:
-                return self.cached_portfolio
+            with self._state_lock:
+                if self.cached_portfolio:
+                    return self.cached_portfolio.model_copy(deep=True)
             # ...otherwise fail loudly: a fabricated $100k account must never be shown.
             raise RuntimeError(f"Alpaca account unavailable and no cached portfolio: {exc}")
 
@@ -115,24 +131,33 @@ class AlpacaPaperBroker(BaseBroker):
         waiting for the 30s portfolio poll.
         """
         now = time.time()
-        if not force_refresh and self.cached_orders and (now - self._orders_cached_at < self._orders_ttl):
-            return list(self.cached_orders.values())
+        with self._state_lock:
+            if not force_refresh and self.cached_orders and (now - self._orders_cached_at < self._orders_ttl):
+                return [o.model_copy(deep=True) for o in self.cached_orders.values()]
 
         try:
             resp = self.client.get(f"{self.base_url}/orders", params={"status": "all", "limit": 50})
             resp.raise_for_status()
             orders_data = resp.json()
             domain_orders = [AlpacaDataAdapter.parse_order_to_domain(o) for o in orders_data]
-            for o in domain_orders:
-                self._detect_fill(o)
-                self.cached_orders[o.order_id] = o
-            self._orders_cached_at = now
+            with self._state_lock:
+                for o in domain_orders:
+                    self._detect_fill(o)
+                    self.cached_orders[o.order_id] = o
+                self._orders_cached_at = now
             return domain_orders
         except Exception:
-            return list(self.cached_orders.values())
+            # The fetch failed: serve the last known list. Copy under the
+            # lock; a second failure here surfaces as a real 500 instead of
+            # crashing inside an exception handler.
+            with self._state_lock:
+                return [o.model_copy(deep=True) for o in self.cached_orders.values()]
 
     def _detect_fill(self, order: Order) -> None:
-        """Emit a fill event for newly filled quantity since the last poll."""
+        """Emit a fill event for newly filled quantity since the last poll.
+
+        Caller must hold ``_state_lock`` (it mutates the tracking dicts).
+        """
         was_known = order.order_id in self._last_order_status
         prev_filled = self._last_filled_qty.get(order.order_id, 0)
         newly = order.filled_quantity - prev_filled
@@ -161,11 +186,14 @@ class AlpacaPaperBroker(BaseBroker):
             resp = self.client.get(f"{self.base_url}/orders/{order_id}")
             if resp.status_code == 200:
                 ord_obj = AlpacaDataAdapter.parse_order_to_domain(resp.json())
-                self.cached_orders[ord_obj.order_id] = ord_obj
-                return ord_obj
+                with self._state_lock:
+                    self.cached_orders[ord_obj.order_id] = ord_obj
+                return ord_obj.model_copy(deep=True)
         except Exception:
             pass
-        return self.cached_orders.get(order_id)
+        with self._state_lock:
+            cached = self.cached_orders.get(order_id)
+            return cached.model_copy(deep=True) if cached else None
 
     def submit_order(
         self,
@@ -199,13 +227,14 @@ class AlpacaPaperBroker(BaseBroker):
             resp = self.client.post(f"{self.base_url}/orders", json=payload)
             resp.raise_for_status()
             order = AlpacaDataAdapter.parse_order_to_domain(resp.json())
-            self.cached_orders[order.order_id] = order
-            # Prime fill tracking; any filled quantity reported later is a new fill.
-            self._last_order_status[order.order_id] = order.status
-            self._last_filled_qty[order.order_id] = 0
-            # Invalidate caches to reflect new trade immediately
-            self._portfolio_cached_at = 0.0
-            self._orders_cached_at = 0.0
+            with self._state_lock:
+                self.cached_orders[order.order_id] = order
+                # Prime fill tracking; any filled quantity reported later is a new fill.
+                self._last_order_status[order.order_id] = order.status
+                self._last_filled_qty[order.order_id] = 0
+                # Invalidate caches to reflect new trade immediately
+                self._portfolio_cached_at = 0.0
+                self._orders_cached_at = 0.0
             return order
         except httpx.HTTPStatusError as e:
             try:
@@ -217,24 +246,43 @@ class AlpacaPaperBroker(BaseBroker):
             raise ValueError(f"Alpaca Order Submission Error: {str(e)}")
 
     def cancel_order(self, order_id: str) -> Optional[Order]:
+        """Cancel at the venue; a failed cancel must be visible, never silent.
+
+        The old version swallowed every exception and returned the cached
+        order — the route answered 200 while the order could still fill at
+        the venue, the exact opposite of what "cancel" promised. Failures now
+        raise ValueError (the routes layer maps it to a 400 with the reason).
+        """
         try:
             resp = self.client.delete(f"{self.base_url}/orders/{order_id}")
-            if resp.status_code in (200, 204):
+        except Exception as e:
+            raise ValueError(f"Cancel request failed (order may still be live): {e}")
+        if resp.status_code in (200, 204):
+            with self._state_lock:
                 self._orders_cached_at = 0.0
-                if order_id in self.cached_orders:
-                    self.cached_orders[order_id].status = OrderStatus.CANCELLED
-                    self.cached_orders[order_id].updated_at = utc_now()
-                    return self.cached_orders[order_id]
-                return self.get_order(order_id)
-        except Exception:
-            pass
-        return self.cached_orders.get(order_id)
+                cached = self.cached_orders.get(order_id)
+                if cached:
+                    cached.status = OrderStatus.CANCELLED
+                    cached.updated_at = utc_now()
+                    return cached.model_copy(deep=True)
+            return self.get_order(order_id)
+        if resp.status_code == 404:
+            # Unknown to the venue: already filled, already cancelled, or the
+            # id is wrong. Not an error — report the local truth.
+            with self._state_lock:
+                cached = self.cached_orders.get(order_id)
+                return cached.model_copy(deep=True) if cached else None
+        raise ValueError(
+            f"Cancel failed with HTTP {resp.status_code} (order may still be live)"
+        )
 
     def on_quote(self, quote: Quote) -> List[Trade]:
         """Update local quote cache and mark-to-market prices for positions."""
-        self.latest_quotes[quote.symbol.upper()] = quote
-        if self.cached_portfolio and quote.symbol.upper() in self.cached_portfolio.positions:
-            self.cached_portfolio.positions[quote.symbol.upper()].current_price = quote.last
+        sym = quote.symbol.upper()
+        with self._state_lock:
+            self.latest_quotes[sym] = quote
+            if self.cached_portfolio and sym in self.cached_portfolio.positions:
+                self.cached_portfolio.positions[sym].current_price = quote.last
         return []
 
     def reset(self, initial_capital: float = 100000.0) -> None:
@@ -244,10 +292,11 @@ class AlpacaPaperBroker(BaseBroker):
             self.client.delete(f"{self.base_url}/positions")
         except Exception:
             pass
-        self.cached_orders.clear()
-        self.cached_portfolio = None
-        self._last_order_status.clear()
-        self._last_filled_qty.clear()
+        with self._state_lock:
+            self.cached_orders.clear()
+            self.cached_portfolio = None
+            self._last_order_status.clear()
+            self._last_filled_qty.clear()
 
     def get_market_clock(self, market: Optional[str] = None) -> Optional[dict]:
         """Alpaca trading clock: tells the UI 'market closed' vs 'feed degraded'."""
@@ -308,7 +357,11 @@ class AlpacaPaperBroker(BaseBroker):
             raw = resp.json().get("created_at")
             created = datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else None
             if created is not None:
-                boundary = created.astimezone(timezone(timedelta(hours=-5)))
+                # America/New_York, not a fixed UTC-5: the venue's intraday
+                # series starts at that day's 09:30 *local* open, and a fixed
+                # offset truncates to the wrong midnight half the year (EST
+                # vs EDT shifts by an hour in March/November).
+                boundary = created.astimezone(ZoneInfo("America/New_York"))
                 boundary = datetime.combine(boundary.date(), dtime.min, tzinfo=boundary.tzinfo)
             else:
                 boundary = None

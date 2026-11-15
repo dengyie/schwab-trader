@@ -54,9 +54,19 @@ export function App() {
     return () => clearInterval(interval);
   }, [isAuthenticated, loadMarkets]);
 
-  // A 401 from any API call clears the token; reflect that immediately.
+  // A 401 from any API call clears the token; reflect that immediately and
+  // wipe client-side risk state with it — armed triggers must not keep
+  // firing under whatever session logs in next (2026-11-16 review).
   useEffect(() => {
-    const onUnauthorized = () => useAuthStore.setState({ isAuthenticated: false });
+    const onUnauthorized = () => {
+      import('./store/automationStore').then(({ useAutomationStore }) => {
+        useAutomationStore.getState().resetForLogout();
+      });
+      import('./store/notificationStore').then(({ useNotificationStore }) => {
+        useNotificationStore.getState().clear();
+      });
+      useAuthStore.setState({ isAuthenticated: false });
+    };
     window.addEventListener('schwab:unauthorized', onUnauthorized);
     return () => window.removeEventListener('schwab:unauthorized', onUnauthorized);
   }, []);

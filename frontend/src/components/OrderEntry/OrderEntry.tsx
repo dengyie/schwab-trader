@@ -409,7 +409,7 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       });
     }
 
-    if (order) {
+    if (order && !('blocked' in order)) {
       // 收盘时段：市价单已被前面拦下，能提交的只有挂单型订单。这类订单由
       // 券商在下次开盘后撮合，所以提示里必须写明"何时生效"，否则用户会把
       // "已提交"误读成"已即时成交"。
@@ -438,8 +438,24 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       setTrailingValue('');
       setTrailingActivationPrice('');
       if (type === 'limit') setPrice('');
-      setShowDegradedConfirm(false); 
+      setShowDegradedConfirm(false);
       setFocusMode(false);
+    } else if (order && 'blocked' in order) {
+      // The store refused to build the order. Name the real cause — the old
+      // catch-all "insufficient balance" sent users chasing the wrong
+      // problem during a routine feed resync (2026-11-16 review).
+      const blockToast: Record<string, string | undefined> = {
+        data_confidence: t.orderEntry.resyncingBlock,
+        invalid_quantity: t.orderEntry.invalidAmount,
+        missing_price: t.orderEntry.invalidPrice,
+        missing_trigger: t.orderEntry?.invalidTriggerPrice,
+        lot_floor_zero: t.orderEntry.lotError,
+      };
+      toast.warning(
+        blockToast[order.blocked]
+          || t.orderEntry.invalidAmount
+          || 'Order could not be created',
+      );
     } else {
       toast.error(t.orderEntry.insufficientBalance);
     }

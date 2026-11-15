@@ -444,6 +444,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     sym = _clean_symbol(msg.get("symbol"), msg.get("market"))
                     if not sym:
                         raise ValueError("invalid symbol")
+                    # The REST path validates quantity via pydantic (int);
+                    # the socket path must hold the same line. Python's int()
+                    # would silently truncate 10.5 -> 10 shares.
+                    qty = msg.get("quantity")
+                    if not isinstance(qty, int) or isinstance(qty, bool):
+                        raise ValueError("quantity must be an integer number of shares")
                     q = await asyncio.to_thread(feed.get_latest_quote, sym)
                     if q:
                         broker.on_quote(q)
@@ -453,7 +459,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         symbol=sym,
                         side=OrderSide(msg["side"]),
                         order_type=OrderType(msg["order_type"]),
-                        quantity=int(msg["quantity"]),
+                        quantity=qty,
                         price=float(msg["price"]) if msg.get("price") is not None else None,
                         stop_price=float(msg["stop_price"]) if msg.get("stop_price") is not None else None,
                     )

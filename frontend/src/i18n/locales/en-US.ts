@@ -317,6 +317,7 @@ export const enUS: Locale = {
     invalidStopLimitPrice: 'Invalid stop limit price',
     invalidTrailingValue: 'Invalid trailing value',
     insufficientBalance: 'Insufficient balance',
+    resyncingBlock: 'Data feed is resyncing — order blocked, try again in a moment',
     // Multi-market
     perLot: 'per lot',
     lotError: 'Quantity must be a multiple of the board lot',

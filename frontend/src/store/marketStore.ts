@@ -20,7 +20,7 @@ import { useI18n } from '../i18n';
 import { formatMessage } from '../i18n';
 import { useWalletStore } from './walletStore';
 import { useTradingStore } from './tradingStore';
-import { getToken, createPolledGetter } from '../services/apiClient';
+import { getToken, clearToken, createPolledGetter } from '../services/apiClient';
 
 // ===== Store State =====
 interface MarketState {
@@ -386,11 +386,20 @@ export const useMarketStore = create<MarketState>()(
                   currentState.dataConfidence,
                   currentState.marketClock
                 );
-                set({ 
+                set({
                   connectionStatus: data,
                   dataConfidence: newConfidence,
                   networkHealth: data.networkHealth || null,
                 });
+                break;
+              }
+              case 'AUTH_REJECTED': {
+                // Terminal: the worker has already stopped its monitor and
+                // will not reconnect. Mirror the REST 401 path — drop the
+                // token and let the app's unauthorized handler route to the
+                // login gate instead of knocking a dead session forever.
+                clearToken();
+                window.dispatchEvent(new CustomEvent('schwab:unauthorized'));
                 break;
               }
               case 'LOG': {

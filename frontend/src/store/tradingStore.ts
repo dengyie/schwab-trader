@@ -59,14 +59,14 @@ interface TradingState {
   focusMode: boolean;
 
   // Basic order operations
-  createOrder: (params: CreateOrderParams, currentMarketPrice?: string) => PaperOrder | null;
+  createOrder: (params: CreateOrderParams, currentMarketPrice?: string) => CreateOrderResult;
   cancelOrder: (clientOrderId: string) => Promise<boolean>;
 
   // Advanced order operations
-  createStopLimitOrder: (params: CreateStopLimitParams) => PaperOrder | null;
-  createTakeProfitLimitOrder: (params: CreateTakeProfitLimitParams) => PaperOrder | null;
+  createStopLimitOrder: (params: CreateStopLimitParams) => CreateOrderResult;
+  createTakeProfitLimitOrder: (params: CreateTakeProfitLimitParams) => CreateOrderResult;
   createOCOOrder: (params: CreateOCOParams) => OCOOrder | null;
-  createTrailingStopOrder: (params: CreateTrailingStopParams) => PaperOrder | null;
+  createTrailingStopOrder: (params: CreateTrailingStopParams) => CreateOrderResult;
   cancelOCOOrder: (ocoGroupId: string) => Promise<boolean>;
 
   // Client-side trigger evaluation
@@ -88,6 +88,26 @@ interface TradingState {
   getPosition: (symbol: string) => Position | undefined;
   getOCOOrders: () => OCOOrder[];
 }
+
+/**
+ * Why a store-level order creation refused to build an order. The UI maps
+ * each reason to a specific toast — the old single "insufficient balance"
+ * answer sent users chasing the wrong cause during a routine feed resync
+ * (2026-11-16 review).
+ */
+export type OrderBlockReason =
+  | 'data_confidence'
+  | 'invalid_quantity'
+  | 'missing_price'
+  | 'missing_trigger'
+  | 'lot_floor_zero';
+
+export interface OrderBlock {
+  blocked: OrderBlockReason;
+}
+
+/** An order, a typed refusal, or null (legacy callers / no attempt made). */
+export type CreateOrderResult = PaperOrder | OrderBlock | null;
 
 interface CreateOrderParams {
   symbol: string;
@@ -219,6 +239,9 @@ export const useTradingStore = create<TradingState>()(
                   ? parseFloat(order.price)
                   : undefined,
                 market,
+                // Idempotency key: a retry after a lost response replays the
+                // original order server-side instead of placing a duplicate.
+                client_order_id: order.clientOrderId,
               }),
             });
 
@@ -241,8 +264,18 @@ export const useTradingStore = create<TradingState>()(
             // The broker moved cash or positions; pull the authoritative view.
             void useWalletStore.getState().fetchPortfolio();
           } catch {
-            notification.error(`order:reject:${order.clientOrderId}`, 'ORDER_REJECTED: network error');
-            markRejected(order.clientOrderId, 'Network error — order was not confirmed');
+            // Network error or 10s timeout: whether the backend received the
+            // order is UNKNOWN — the old code marked it rejected, which sent
+            // the user off to resubmit and place a duplicate live order
+            // (2026-11-16 review). Keep it pending, reconcile against the
+            // broker's own ledger: reconcileOrders matches the backend row
+            // by client_order_id (attaching its backendId) or drops the
+            // local ghost once the submit grace expires.
+            notification.warning(
+              `order:unconfirmed:${order.clientOrderId}`,
+              'ORDER_UNCONFIRMED: connection dropped mid-submit — reconciling with broker',
+            );
+            await get().fetchOrders();
           }
         };
 
@@ -392,22 +425,22 @@ export const useTradingStore = create<TradingState>()(
             const confidence = marketStore.dataConfidence;
             if (confidence.level === 'stale' || confidence.level === 'resyncing') {
               notification.error(`order:block:${Date.now()}`, `EXECUTION_BLOCKED: Data Integrity Critical (${confidence.level})`);
-              return null;
+              return { blocked: 'data_confidence' };
             }
 
-            if (!quantity || parseFloat(quantity) <= 0) return null;
+            if (!quantity || parseFloat(quantity) <= 0) return { blocked: 'invalid_quantity' };
 
             const needsLimitPrice = ['limit', 'stop_limit', 'take_profit_limit'].includes(type);
             const needsTriggerPrice = isConditionalOrder(type);
-            if (needsLimitPrice && (!price || parseFloat(price) <= 0)) return null;
-            if (needsTriggerPrice && (!triggerPrice || parseFloat(triggerPrice) <= 0)) return null;
+            if (needsLimitPrice && (!price || parseFloat(price) <= 0)) return { blocked: 'missing_price' };
+            if (needsTriggerPrice && (!triggerPrice || parseFloat(triggerPrice) <= 0)) return { blocked: 'missing_trigger' };
 
             // Every venue trades whole shares; foreign markets add a board
             // lot on top of that. The backend re-validates, this only keeps
             // obviously-invalid input from leaving the form.
             const lot = Math.max(1, Math.floor(useMarketsStore.getState().lotSizeFor(symbol)));
             const execQuantity = Math.floor(parseFloat(quantity) / lot) * lot;
-            if (!(execQuantity > 0)) return null;
+            if (!(execQuantity > 0)) return { blocked: 'lot_floor_zero' };
 
             const now = Date.now();
             const isConditional = isConditionalOrder(type);
@@ -558,21 +591,21 @@ export const useTradingStore = create<TradingState>()(
             const confidence = useMarketStore.getState().dataConfidence;
             if (confidence.level === 'stale' || confidence.level === 'resyncing') {
               notification.error(`order:block:${Date.now()}`, `EXECUTION_BLOCKED: Data Integrity Critical (${confidence.level})`);
-              return null;
+              return { blocked: 'data_confidence' };
             }
 
             const currentPrice = useMarketStore.getState().metrics?.mid;
             if (!currentPrice) {
               notification.error(`order:price:${Date.now()}`, 'No market price available');
-              return null;
+              return { blocked: 'data_confidence' };
             }
 
             const lot = Math.max(1, Math.floor(useMarketsStore.getState().lotSizeFor(symbol)));
             const execQuantity = Math.floor(parseFloat(quantity) / lot) * lot;
-            if (!(execQuantity > 0)) return null;
+            if (!(execQuantity > 0)) return { blocked: 'lot_floor_zero' };
 
             const parsedValue = parseFloat(trailingValue);
-            if (!Number.isFinite(parsedValue) || parsedValue <= 0) return null;
+            if (!Number.isFinite(parsedValue) || parsedValue <= 0) return { blocked: 'missing_price' };
 
             const current = new Decimal(currentPrice);
             const isSell = side === 'sell';

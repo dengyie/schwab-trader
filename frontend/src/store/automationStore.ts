@@ -11,6 +11,7 @@ import type {
 import { useTradingStore } from './tradingStore';
 import { useMarketStore } from './marketStore';
 import { useWalletStore } from './walletStore';
+import { hasToken } from '../services/apiClient';
 
 // ===== Constants =====
 // Execution configuration (reserved for future use)
@@ -37,6 +38,8 @@ interface AutomationState {
   // Actions - Engine
   startEngine: () => void;
   stopEngine: () => void;
+  /** Logout / 401: stop the engine and wipe armed triggers + persisted storage. */
+  resetForLogout: () => void;
   processTriggers: (symbol: string, priceState: { current: Decimal; previous: Decimal; source: 'last' | 'bid' | 'ask' | 'mid' }) => void;
   
   // Actions - Logs
@@ -86,6 +89,10 @@ function evaluateTrigger(trigger: Trigger, current: Decimal, previous: Decimal):
 
 // Track previous prices per source for each symbol to detect crossings
 const lastPrices: Record<string, Record<string, Decimal>> = {};
+
+function lastPricesClear(): void {
+  for (const key of Object.keys(lastPrices)) delete lastPrices[key];
+}
 
 export const useAutomationStore = create<AutomationState>()(
   subscribeWithSelector(
@@ -147,6 +154,16 @@ export const useAutomationStore = create<AutomationState>()(
         stopEngine: () => {
           set({ isEngineRunning: false });
           console.log('[AutomationStore] Engine stopped');
+        },
+
+        /** Logout / 401: armed triggers must not survive into the next
+         * session on this browser — the persisted storage is wiped too, so
+         * a different person logging in cannot inherit someone else's
+         * stop-losses (2026-11-16 review). */
+        resetForLogout: () => {
+          get().stopEngine();
+          set({ triggers: [], executionLogs: [] });
+          lastPricesClear();
         },
 
         processTriggers: (symbol, priceState) => {
@@ -327,7 +344,13 @@ export const useAutomationStore = create<AutomationState>()(
         }),
         onRehydrateStorage: () => (state) => {
           if (state) {
-            state.startEngine();
+            // Rehydrated armed triggers only run inside an authenticated
+            // session: after a logout (or a 401 mid-session) an auto-started
+            // engine would resume firing someone else's stop-losses into
+            // whatever session logs in next (2026-11-16 review).
+            if (hasToken()) {
+              state.startEngine();
+            }
           }
         },
       }
@@ -390,8 +413,14 @@ async function executeAction(
       quantity: finalQuantity,
     }, observedPrice.toFixed(8));
 
-    if (order) {
+    if (order && !('blocked' in order)) {
       return { success: true, orderId: order.clientOrderId };
+    } else if (order && 'blocked' in order) {
+      return {
+        success: false,
+        errorCode: 'ORDER_BLOCKED',
+        errorMessage: `Order blocked: ${order.blocked}`,
+      };
     } else {
       return { success: false, errorCode: 'ORDER_REJECTED', errorMessage: 'Trading engine rejected order' };
     }

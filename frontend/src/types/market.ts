@@ -187,6 +187,7 @@ export type WorkerMessageType =
   | 'BAR_UPDATE'
   | 'METRICS_UPDATE'
   | 'CONNECTION_STATUS'
+  | 'AUTH_REJECTED'
   | 'ERROR'
   | 'LOG'
   | 'BACKEND_EVENT';

@@ -129,7 +129,7 @@ export function MobileOrderEntry({
       quantity,
     }, metrics?.mid);
 
-    if (order) {
+    if (order && !('blocked' in order)) {
       // 收盘时段：市价单已在上面被拦下，能提交的只有挂单型订单，由券商在
       // 下次开盘后撮合。不写清楚的话，“已提交”会被读成“已成交”。
       // 时钟取自市场注册表（带 timezone），与桌面端 OrderEntry 同一来源。
@@ -150,6 +150,17 @@ export function MobileOrderEntry({
       setQuantity('');
       setQuantityPercent(0);
       onSuccess?.();
+    } else if (order && 'blocked' in order) {
+      // 商店拒单要报真实原因，不能一律甩"余额不足"（2026-11-16 review）。
+      const blockToast: Record<string, string | undefined> = {
+        data_confidence: t.orderEntry?.resyncingBlock,
+        invalid_quantity: t.orderEntry?.invalidAmount,
+        missing_price: t.orderEntry?.invalidPrice,
+        missing_trigger: t.orderEntry?.invalidTriggerPrice,
+        lot_floor_zero: t.orderEntry?.lotError,
+      };
+      toast.warning(blockToast[order.blocked] || t.orderEntry?.invalidAmount || 'Order could not be created');
+      trigger('error');
     } else {
       toast.error(t.orderEntry?.insufficientBalance || 'Insufficient balance');
       trigger('error');

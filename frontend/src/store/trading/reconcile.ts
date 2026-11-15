@@ -38,6 +38,8 @@ export interface BackendPosition {
 export interface BackendOrderRow {
   order_id?: string;
   id?: string;
+  /** Echoed idempotency key from POST /orders (the submitting client's UUID). */
+  client_order_id?: string;
   symbol?: string;
   side?: string;
   order_type?: string;
@@ -241,8 +243,13 @@ export function reconcileOrders(
   now = Date.now()
 ): PaperOrder[] {
   const localByBackendId = new Map<string, PaperOrder>();
+  // Orders whose POST response was lost carry no backendId, but the backend
+  // echoes the submit's client_order_id — match on it so an unconfirmed
+  // order adopts its broker identity instead of becoming a ghost duplicate.
+  const localByClientId = new Map<string, PaperOrder>();
   for (const order of previous) {
     if (order.backendId) localByBackendId.set(order.backendId, order);
+    localByClientId.set(order.clientOrderId, order);
   }
 
   const next: PaperOrder[] = [];
@@ -256,7 +263,8 @@ export function reconcileOrders(
     const fresh = paperOrderFromBackendRow(row);
     if (!fresh) continue;
 
-    const local = localByBackendId.get(backendId);
+    const local = (row.client_order_id && localByClientId.get(row.client_order_id))
+      || localByBackendId.get(backendId);
     next.push(local
       ? {
           ...fresh,

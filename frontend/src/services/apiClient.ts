@@ -3,8 +3,9 @@
  * Single source of truth for backend authentication and request plumbing.
  *
  * The backend is protected by a single ADMIN_TOKEN (X-Auth-Token on REST,
- * ?token= on the websocket). The token is kept in localStorage so a reload
- * does not force a re-login.
+ * AUTH frame on the websocket — a browser worker cannot set headers, and the
+ * URL variant would leak the token into access logs). The token is kept in
+ * localStorage so a reload does not force a re-login.
  */
 
 const TOKEN_KEY = 'schwab-admin-token';

@@ -166,7 +166,9 @@ describe('order submission', () => {
       quantity: '50',
     }, '419.80');
 
-    expect(order).toBeNull();
+    // 2026-11-16: refusals are typed blocks so the UI can name the real
+    // cause (the old null was misreported as "insufficient balance").
+    expect(order).toEqual({ blocked: 'lot_floor_zero' });
     expect(submission()).toBeUndefined();
   });
 });
@@ -314,5 +316,59 @@ describe('account reset', () => {
     expect(reset?.method).toBe('POST');
     expect(reset?.body).toEqual({ initial_capital: 200000 });
     expect(useTradingStore.getState().positions.size).toBe(0);
+  });
+});
+
+describe('unconfirmed order reconciliation', () => {
+  it('sends client_order_id as an idempotency key', async () => {
+    useTradingStore.getState().createOrder({
+      symbol: 'SPY', side: 'buy', type: 'market', quantity: '5',
+    }, '100.00');
+
+    const post = submission();
+    expect(post).toBeDefined();
+    expect(post!.body.client_order_id).toEqual(expect.any(String));
+  });
+
+  it('reconciles against broker truth on a network error instead of marking rejected', async () => {
+    // The submit POST dies mid-flight; the GET /orders afterwards reports the
+    // order the backend actually received (echoing client_order_id).
+    globalThis.fetch = async (url: any, init?: any) => {
+      const target = String(url);
+      const method = String(init?.method || 'GET').toUpperCase();
+      if (target.endsWith('/orders') && method === 'POST') {
+        throw new TypeError('connection dropped');
+      }
+      if (target.endsWith('/orders') && method === 'GET') {
+        return json([
+          {
+            order_id: 'ord_ghost',
+            client_order_id: 'client-uuid-777',
+            symbol: 'SPY', side: 'buy', order_type: 'market',
+            quantity: 5, status: 'OPEN',
+          },
+        ]);
+      }
+      if (target.endsWith('/portfolio')) {
+        return json({ cash: 100000, total_equity: 100000, initial_capital: 200000, positions: {} });
+      }
+      return json({});
+    };
+
+    useTradingStore.setState({
+      orders: [{
+        clientOrderId: 'client-uuid-777', symbol: 'SPY', side: 'buy',
+        type: 'market', price: null, quantity: '5', filledQty: '0',
+        avgPrice: '0', status: 'pending', createdAt: Date.now(),
+        updatedAt: Date.now(), fills: [],
+      }],
+    });
+
+    await useTradingStore.getState().fetchOrders();
+    const orders = useTradingStore.getState().orders;
+    expect(orders).toHaveLength(1);
+    expect(orders[0].backendId).toBe('ord_ghost');
+    expect(orders[0].clientOrderId).toBe('client-uuid-777');
+    expect(orders[0].status).not.toBe('rejected');
   });
 });

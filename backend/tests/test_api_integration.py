@@ -716,3 +716,63 @@ def test_symbol_lookup_rejects_bad_shapes_and_requires_auth():
     assert resp.status_code == 400
     resp = client.get("/api/market/symbol-lookup", params={"symbol": "0700.XX"}, headers=AUTH)
     assert resp.status_code == 400
+
+
+def test_order_submission_is_idempotent_under_client_order_id():
+    """2026-11-16 review pin: a retry after a lost response must replay the
+    original order, not place a second live one. The same client_order_id
+    answers with the same order (current venue state preferred)."""
+    with TestClient(app) as client:
+        payload = {
+            "symbol": "SPY", "side": "BUY", "order_type": "MARKET",
+            "quantity": 1,
+            "client_order_id": "client-uuid-123",
+        }
+        first = client.post("/api/orders", json=payload, headers=AUTH)
+        assert first.status_code == 200
+        second = client.post("/api/orders", json=payload, headers=AUTH)
+        assert second.status_code == 200
+        assert second.json()["order_id"] == first.json()["order_id"], \
+            "retry with the same client_order_id must not create a new order"
+        # Two positions of 1 share would prove a double execution; one proves
+        # the replay returned the original order.
+        p = client.get("/api/portfolio", headers=AUTH).json()
+        assert p["positions"]["SPY"]["quantity"] == 1
+
+
+def test_auth_failures_are_rate_limited_per_ip():
+    """2026-11-16 review pin: without a failure budget an attacker could
+    probe the token at wire speed forever. After AUTH_FAIL_LIMIT failures
+    inside the window, the IP gets 429 even with the correct token."""
+    from fastapi import FastAPI
+    from app.api.routes import create_api_router
+    from app.core import auth as auth_mod
+
+    app = FastAPI(); app.include_router(create_api_router(ledger, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+    try:
+        for _ in range(auth_mod.AUTH_FAIL_LIMIT):
+            resp = client.get("/api/portfolio", headers={"X-Auth-Token": "wrong"})
+            assert resp.status_code == 401
+        # Window exhausted: even the correct token is now throttled.
+        resp = client.get("/api/portfolio", headers=AUTH)
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+    finally:
+        auth_mod._auth_failures.clear()
+
+
+def test_cancel_via_router_reports_failure_as_error():
+    """2026-11-16 review pin: a cancel that cannot reach the venue must
+    surface as an error, never as a silent 200 (the order may still fill)."""
+    from unittest.mock import patch
+    from fastapi import FastAPI
+    from app.api.routes import create_api_router
+    from app.main import broker as routed_broker
+
+    app = FastAPI(); app.include_router(create_api_router(routed_broker, _StubBarsFeed([], 0.0)))
+    client = TestClient(app)
+    with patch.object(virtual_engine, "cancel_order", side_effect=ValueError("Cancel request failed")):
+        resp = client.delete("/api/orders/ord_does_not_matter", headers=AUTH)
+        assert resp.status_code == 400
+        assert resp.json()["detail"], "the failure reason must reach the client"

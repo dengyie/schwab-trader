@@ -643,7 +643,12 @@ function checkBackpressure(): void {
 
 /**
  * A rejected token is terminal: every retry would present the same token, so
- * stop instead of hammering the server every few seconds.
+ * stop instead of hammering the server every few seconds. The old version
+ * only stopped the heartbeat — the reconnect monitor kept firing every 2s
+ * and re-established the socket after 10s, looping 4401 at the rate limit
+ * forever while the UI never learned auth was dead (2026-11-16 review).
+ * Post a terminal AUTH_REJECTED so the app can clear the token and route to
+ * the login gate.
  */
 function handleAuthRejection(code: number, reason: string): boolean {
   if (code !== 4401) return false;
@@ -651,6 +656,12 @@ function handleAuthRejection(code: number, reason: string): boolean {
   connectionState = 'disconnected';
   sendConnectionStatus();
   stopHeartbeat();
+  stopReconnectMonitor();
+  self.postMessage({
+    type: 'AUTH_REJECTED',
+    payload: { code, reason },
+    timestamp: performance.now(),
+  });
   return true;
 }
 

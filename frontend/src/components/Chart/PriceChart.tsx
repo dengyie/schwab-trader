@@ -292,6 +292,11 @@ export function PriceChart() {
       
       // 竞态保护：请求期间用户切走了标的，丢弃过期响应
       if (selectedSymbolRef.current !== symbol) return;
+      // 周期同款守卫（loadOlder 在下方已有）：请求期间切了周期，15m 的
+      // 响应绝不能并进已切到 1h 的序列——keepHistoryAheadOfWindow 的
+      // 只增不减合并会让两种周期的 bar 交织并在 SWR 缓存里自续
+      // （2026-11-16 review 实测路径）。
+      if (tfForHistory(timeRangeRef.current) !== tf) return;
 
       // 只增不减（仅限同序列）：轮询的新鲜窗接到已补载的历史段后面，而
       // 不是整段替换；换标的/换周期则整段换血，杜绝跨标的串数据。

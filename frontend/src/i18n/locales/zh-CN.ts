@@ -316,6 +316,7 @@ export const zhCN = {
     invalidStopLimitPrice: '止损限价无效',
     invalidTrailingValue: '跟踪值无效',
     insufficientBalance: '余额不足',
+    resyncingBlock: '行情同步中，下单暂被阻止，请稍后重试',
     // 多市场
     perLot: '每手',
     lotError: '数量必须是每手股数的整数倍',

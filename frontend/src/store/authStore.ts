@@ -86,11 +86,22 @@ export const useAuthStore = create<AuthState>()(
           isInitialized: true,
           isLoading: false,
         });
+        // Rehydrate-time auto-start is auth-gated; a login after a logout
+        // must re-arm the automation engine explicitly.
+        void import('./automationStore').then(({ useAutomationStore }) => {
+          useAutomationStore.getState().startEngine();
+        });
         return { success: true };
       },
 
       logout: () => {
         clearToken();
+        // Wipe every piece of client-side risk state: an armed stop-loss
+        // surviving into the next session on this browser would resume
+        // firing orders for whoever logs in next (2026-11-16 review).
+        import('./automationStore').then(({ useAutomationStore }) => {
+          useAutomationStore.getState().resetForLogout();
+        });
         // Clear wallet and trading data for privacy
         import('./walletStore').then(({ useWalletStore }) => {
           useWalletStore.getState().resetWallet();
@@ -99,6 +110,9 @@ export const useAuthStore = create<AuthState>()(
           // Logging out only clears this browser; it must never reset the
           // broker account that other sessions may still be using.
           useTradingStore.getState().clearLocalState();
+        });
+        import('./notificationStore').then(({ useNotificationStore }) => {
+          useNotificationStore.getState().clear();
         });
 
         set({

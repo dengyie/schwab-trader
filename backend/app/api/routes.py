@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import inspect
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +84,11 @@ class OrderRequest(BaseModel):
     stop_price: Optional[float] = None
     # Optional hint for bare numeric codes (e.g. "0700" + market "HK").
     market: Optional[str] = None
+    # Client-generated UUID (frontend PaperOrder.clientOrderId). A retry of a
+    # request the backend actually accepted must not place a second live
+    # order: the same key answers the original order. Optional so older
+    # clients (and tests) keep working without it.
+    client_order_id: Optional[str] = None
 
     @field_validator("side", mode="before")
     @classmethod
@@ -235,6 +241,13 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
 
     _tickers_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
     _tickers_ttl = 5.0
+
+    # client_order_id -> first accepted response payload (idempotent retry
+    # support for POST /orders). OrderedDict is not needed: pop order only
+    # matters for eviction, and dict preserves insertion order.
+    _client_orders: Dict[str, Dict[str, Any]] = {}
+    _client_order_lock = threading.Lock()
+    _CLIENT_ORDER_MAP_MAX = 1000
 
     def _fx_rates() -> Dict[str, float]:
         getter = getattr(broker, "get_fx_rates", None)
@@ -650,6 +663,24 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
     @router.post("/orders", dependencies=[Depends(require_auth)])
     def submit_order(req: OrderRequest) -> Dict[str, Any]:
         sym = _normalize_symbol(req.symbol, req.market)
+        # Idempotency: a lost response (timeout, proxy drop) invites a retry
+        # that would otherwise place a second live order. The first accepted
+        # submission under a client_order_id is remembered and replayed; the
+        # map is bounded (LRU) and process-local — a restart clears it, and
+        # the client reconciles against /api/orders for anything older.
+        if req.client_order_id:
+            with _client_order_lock:
+                replay = _client_orders.get(req.client_order_id)
+            if replay is not None:
+                # Prefer the order's *current* state — the stored snapshot was
+                # taken at submission and the order may have filled since.
+                try:
+                    fresh = broker.get_order(replay.get("order_id") or "")
+                    if fresh is not None:
+                        return fresh.model_dump(mode="json")
+                except Exception:
+                    pass
+                return replay
         try:
             # Sync latest quote before submitting
             quote = actual_feed.get_latest_quote(sym)
@@ -664,13 +695,26 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 price=req.price,
                 stop_price=req.stop_price
             )
-            return order.model_dump(mode="json")
+            payload = order.model_dump(mode="json")
+            if req.client_order_id:
+                with _client_order_lock:
+                    _client_orders[req.client_order_id] = payload
+                    while len(_client_orders) > _CLIENT_ORDER_MAP_MAX:
+                        _client_orders.pop(next(iter(_client_orders)))
+                payload["client_order_id"] = req.client_order_id
+            return payload
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
     @router.delete("/orders/{order_id}", dependencies=[Depends(require_auth)])
     def cancel_order(order_id: str) -> Dict[str, Any]:
-        order = broker.cancel_order(order_id)
+        try:
+            order = broker.cancel_order(order_id)
+        except ValueError as e:
+            # The venue refused (or the cancel request could not be sent):
+            # the order may still be live, so this must reach the user as an
+            # error, never as a silent success.
+            raise HTTPException(status_code=400, detail=str(e))
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         return order.model_dump(mode="json")
