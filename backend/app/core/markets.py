@@ -13,7 +13,7 @@ import functools
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from typing import Optional, Iterable
+from typing import Dict, Optional, Iterable, Tuple
 from zoneinfo import ZoneInfo
 
 # Weekday numbering follows datetime.weekday(): Monday == 0.
@@ -497,14 +497,31 @@ def _is_open_between(market: MarketDef, local: datetime, day: date) -> bool:
     return False
 
 
+# The open/close answer for a market is asked on every accepted tick (quote
+# decoration, matching-engine session guard), but the answer only changes at
+# session boundaries -- minutes apart. A short TTL turns two full
+# astimezone + session-composition round trips per tick into a dict lookup.
+# Callers that pass an explicit ``now`` (tests, clock rendering) bypass it so
+# determinism is preserved where it is depended on.
+_MARKET_OPEN_TTL = 5.0
+_market_open_cache: Dict[str, Tuple[float, bool]] = {}
+
+
 def is_market_open(market: MarketDef, now: Optional[datetime] = None) -> bool:
-    moment = now or datetime.now(timezone.utc)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+    if now is None:
+        cached = _market_open_cache.get(market.code)
+        if cached and time.monotonic() - cached[0] < _MARKET_OPEN_TTL:
+            return cached[1]
+        open_now = is_market_open(market, datetime.now(timezone.utc))
+        _market_open_cache[market.code] = (time.monotonic(), open_now)
+        return open_now
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     # Only the local date is needed: build it directly instead of rendering
     # fourteen days of sessions into ISO strings (``market_clock``) for every
     # incoming tick.
-    local = moment.astimezone(ZoneInfo(market.timezone))
+    local = now.astimezone(ZoneInfo(market.timezone))
     return _is_open_between(market, local, local.date())
 
 

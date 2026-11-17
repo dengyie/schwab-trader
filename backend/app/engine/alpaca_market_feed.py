@@ -874,6 +874,16 @@ class AlpacaMarketFeedService:
         finally:
             self._bar_cache.end_refresh(sym, seg_tf)
 
+    def decorate_quote(self, quote: Optional[Quote]) -> Optional[Quote]:
+        """Public decoration entry point for callers outside this feed.
+
+        The tick path stopped decorating (2026-11-17: the per-tick rebuild
+        kept ~1/3 of a core busy with zero websocket clients), so the
+        broadcast path in ``main`` decorates behind its own subscriber gate
+        via this method.
+        """
+        return self._decorate_daily(quote)
+
     def _decorate_daily(self, quote: Optional[Quote]) -> Optional[Quote]:
         """Attach the consolidated daily context and the age of the print.
 
@@ -1285,11 +1295,24 @@ class AlpacaMarketFeedService:
                                 last_p = self.last_trade_prices.get(sym)
                                 quote = AlpacaDataAdapter.parse_stream_quote(item, last_price=last_p)
                                 if quote:
-                                    decorated = self._decorate_daily(quote) or quote
-                                    self.latest_quotes[sym] = decorated
+                                    # Store and forward the RAW venue quote.
+                                    # The decoration here used to rebuild the
+                                    # Quote with consolidated day stats and
+                                    # freshness per tick (two is_market_open
+                                    # round trips + a model_copy), which kept
+                                    # ~1/3 of a core busy during a session
+                                    # even with zero websocket clients. The
+                                    # matching/market-to-market consumers only
+                                    # read last/bid/ask, which are raw fields,
+                                    # and the read path (get_latest_quote)
+                                    # decorates on the way out -- so the
+                                    # display work belongs there, done once
+                                    # per served request instead of once per
+                                    # accepted print.
+                                    self.latest_quotes[sym] = quote
                                     for listener in self.quote_listeners:
                                         try:
-                                            listener(decorated)
+                                            listener(quote)
                                         except Exception:
                                             pass
 

@@ -182,13 +182,18 @@ def _schedule_coro(coro) -> None:
 
 
 def on_feed_quote(quote: Quote) -> None:
-    # Feed quote into execution broker & mark-to-market
+    # Feed quote into execution broker & mark-to-market. The feed hands the
+    # raw venue quote over (decoration moved off the tick path); the matching
+    # engine reads last/bid/ask, which are raw fields.
     broker.on_quote(quote)
     # Nobody subscribed (or only unauthenticated sockets): skip serialising and
-    # scheduling a broadcast that would be dropped anyway.
+    # scheduling a broadcast that would be dropped anyway. The display
+    # decoration (consolidated day stats + freshness) lives behind the same
+    # gate: with zero clients it was pure waste on every accepted tick.
     if not ws_manager.has_subscribers():
         return
-    _schedule_coro(ws_manager.broadcast_quote(quote.model_dump(mode="json")))
+    decorated = feed.decorate_quote(quote) or quote
+    _schedule_coro(ws_manager.broadcast_quote(decorated.model_dump(mode="json")))
 
 
 def on_feed_bar(symbol: str, bar: Bar) -> None:
