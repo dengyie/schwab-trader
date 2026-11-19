@@ -1428,6 +1428,15 @@ class AlpacaMarketFeedService:
                                     item.get("code"),
                                 )
                                 continue
+                            if t_type == "subscription":
+                                # Ack for a subscribe/unsubscribe frame: the
+                                # only server-side proof a runtime change took.
+                                logger.info(
+                                    "Alpaca stream subscription now: quotes=%s trades=%s",
+                                    ",".join(item.get("quotes") or []),
+                                    ",".join(item.get("trades") or []),
+                                )
+                                continue
                             sym = item.get("S", "").upper()
                             if not sym:
                                 continue
