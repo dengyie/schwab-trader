@@ -267,9 +267,36 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
     # client_order_id -> first accepted response payload (idempotent retry
     # support for POST /orders). OrderedDict is not needed: pop order only
     # matters for eviction, and dict preserves insertion order.
+    # _in_flight holds per-key submission locks: two concurrent submissions
+    # with the same key must not both reach the venue — the second waits for
+    # the first and replays its answer (2026-11-20 review P2).
     _client_orders: Dict[str, Dict[str, Any]] = {}
+    _in_flight: Dict[str, threading.Lock] = {}
     _client_order_lock = threading.Lock()
     _CLIENT_ORDER_MAP_MAX = 1000
+
+    def _acquire_in_flight(client_id: str) -> tuple[threading.Lock, bool]:
+        """Grab the per-key submission lock. Returns (lock, is_leader)."""
+        with _client_order_lock:
+            lock = _in_flight.get(client_id)
+            if lock is None:
+                lock = threading.Lock()
+                _in_flight[client_id] = lock
+                lock.acquire()  # leader takes it immediately
+                return lock, True
+        # Follower: block until the leader finishes, then release what is now
+        # ours (the leader only ever releases its own reference).
+        lock.acquire()
+        return lock, False
+
+    def _release_in_flight(client_id: str, lock: threading.Lock) -> None:
+        lock.release()
+        # Drop the table entry only if this exact lock is still registered —
+        # the next submission replaces the map slot with a fresh lock, so a
+        # stale entry must never block a later retry.
+        with _client_order_lock:
+            if _in_flight.get(client_id) is lock:
+                _in_flight.pop(client_id, None)
 
     def _fx_rates() -> Dict[str, float]:
         getter = getattr(broker, "get_fx_rates", None)
@@ -740,6 +767,7 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
         # map is bounded (LRU) and process-local — a restart clears it, and
         # the client reconciles against /api/orders for anything older.
         if req.client_order_id:
+            # Fast path: the submission already completed under this key.
             with _client_order_lock:
                 replay = _client_orders.get(req.client_order_id)
             if replay is not None:
@@ -754,6 +782,28 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                 except Exception:
                     pass
                 return dict(replay, client_order_id=req.client_order_id)
+
+        # Slow path: a real submission. A concurrent duplicate with the same
+        # key blocks here until the leader finishes and then re-reads the map
+        # (which now holds the leader's answer) instead of double-submitting.
+        flight_lock, is_leader = None, True
+        if req.client_order_id:
+            flight_lock, is_leader = _acquire_in_flight(req.client_order_id)
+            if not is_leader:
+                with _client_order_lock:
+                    replay = _client_orders.get(req.client_order_id)
+                if replay is not None:
+                    try:
+                        fresh = broker.get_order(replay.get("order_id") or "")
+                        if fresh is not None:
+                            payload = fresh.model_dump(mode="json")
+                            payload["client_order_id"] = req.client_order_id
+                            return payload
+                    except Exception:
+                        pass
+                    return dict(replay, client_order_id=req.client_order_id)
+                # Leader crashed before recording (e.g. process kill mid-call):
+                # fall through as the de-facto leader so the retry still lands.
         try:
             # Sync latest quote before submitting
             quote = actual_feed.get_latest_quote(sym)
@@ -782,8 +832,12 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                     _client_orders[req.client_order_id].pop("client_order_id", None)
                     while len(_client_orders) > _CLIENT_ORDER_MAP_MAX:
                         _client_orders.pop(next(iter(_client_orders)))
+            if flight_lock is not None:
+                _release_in_flight(req.client_order_id, flight_lock)
             return payload
         except ValueError as e:
+            if flight_lock is not None:
+                _release_in_flight(req.client_order_id, flight_lock)
             raise HTTPException(status_code=400, detail=str(e))
 
     @router.delete("/orders/{order_id}", dependencies=[Depends(require_auth)])

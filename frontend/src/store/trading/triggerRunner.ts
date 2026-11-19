@@ -89,20 +89,24 @@ async function evaluateOffSymbols(): Promise<void> {
   if (symbols.length === 0) return;
   multiSymbolInFlight = true;
   try {
-    for (const symbol of symbols) {
+    // Fan out in parallel: a serial await per symbol made the pass duration
+    // scale with the risk-symbol count — enough symbols and the tail
+    // outran the 30s cadence (2026-11-20 review P3). Each symbol evaluates
+    // independently; one failure skips only that symbol.
+    await Promise.allSettled(symbols.map(async (symbol) => {
       // A quote arrives per symbol; build the minimal book shape the
       // trigger machinery consumes (bid/ask mid, like the real orderbook).
       try {
         const quote = await apiJson<any>(
           `/market/quote?symbol=${encodeURIComponent(symbol)}`,
         );
-        if (!quote) continue;
+        if (!quote) return;
         const last = Number(quote.last) || 0;
         const bid = Number(quote.bid) > 0 ? Number(quote.bid) : last;
         const ask = Number(quote.ask) > 0 ? Number(quote.ask) : last;
-        if (!(last > 0)) continue;
+        if (!(last > 0)) return;
         const stillActive = useMarketStore.getState().activeSymbol;
-        if (stillActive === symbol) continue; // live book took over mid-poll
+        if (stillActive === symbol) return; // live book took over mid-poll
         useTradingStore.getState().evaluateOrderTriggers({
           symbol,
           bids: [{ price: String(bid), quantity: '0' }],
@@ -111,7 +115,7 @@ async function evaluateOffSymbols(): Promise<void> {
       } catch {
         // 404 (no quote for the symbol) or a network blip: skip this round.
       }
-    }
+    }));
   } finally {
     multiSymbolInFlight = false;
   }
@@ -138,9 +142,12 @@ export function startTriggerRunner(): void {
     if (!useAuthStore.getState().isAuthenticated || !hasLiveRiskOrders()) return;
     const selected = selectSelectedSymbol(useWatchlistStore.getState());
     const market = useMarketStore.getState();
-    if (selected && market.activeSymbol !== selected) {
-      // Off /trade: the Trade page unsubscribed on unmount. Keep the feed
-      // alive so trigger evaluation keeps receiving book updates.
+    // Only fill a *vacated* feed (activeSymbol === null): the Trade page
+    // unsubscribed on unmount. If some other page holds a subscription to a
+    // different symbol, re-subscribing here would reset its orderBook and
+    // fight that page's own lifecycle every 5s (2026-11-20 review P2). An
+    // off-selected risk symbol is still covered by the 30s REST poll below.
+    if (selected && market.activeSymbol === null) {
       market.subscribe(selected);
     }
   }, HEARTBEAT_MS);

@@ -145,7 +145,9 @@ class AlpacaPaperBroker(BaseBroker):
                     self._detect_fill(o)
                     self.cached_orders[o.order_id] = o
                 self._orders_cached_at = now
-            return domain_orders
+            # Same copy contract as the TTL-hit and error paths: callers may
+            # hold the list across an await, so it must not alias the cache.
+            return [o.model_copy(deep=True) for o in domain_orders]
         except Exception:
             # The fetch failed: serve the last known list. Copy under the
             # lock; a second failure here surfaces as a real 500 instead of
@@ -211,10 +213,13 @@ class AlpacaPaperBroker(BaseBroker):
             raise ValueError("Order quantity must be positive")
 
         tif = (time_in_force or "day").upper()
-        if tif not in ("DAY", "GTC", "EXT"):
+        # Same legal set as the request layer (DAY/GTC — routes.py validator).
+        # EXT was unreachable through any caller; advertising it here invited
+        # drift (2026-11-20 review P3).
+        if tif not in ("DAY", "GTC"):
             # Defense in depth: the request layer validates this too, but a
             # garbage TIF must never reach the venue from any caller.
-            raise ValueError("time_in_force must be one of DAY/GTC/EXT")
+            raise ValueError("time_in_force must be one of DAY/GTC")
         # Alpaca's API takes the lowercase spelling; the uppercase form is
         # internal (the domain enum) — 'GTC' verbatim is rejected by the
         # venue as "invalid time_in_force" (caught live, 2026-11-16).

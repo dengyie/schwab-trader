@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.core.auth import token_matches
 from app.core.markets import MARKETS, resolve_symbol
 from app.models.trading import (
-    Quote, Bar, Trade, Order, OrderSide, OrderType
+    Quote, Bar, Trade, Order
 )
 from app.engine.portfolio_ledger import PortfolioLedger
 from app.engine.matching_engine import VirtualMatchingEngine
@@ -485,32 +485,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     feed.deactivate(sym)
 
             elif action == "SUBMIT_ORDER":
-                try:
-                    sym = _clean_symbol(msg.get("symbol"), msg.get("market"))
-                    if not sym:
-                        raise ValueError("invalid symbol")
-                    # The REST path validates quantity via pydantic (int);
-                    # the socket path must hold the same line. Python's int()
-                    # would silently truncate 10.5 -> 10 shares.
-                    qty = msg.get("quantity")
-                    if not isinstance(qty, int) or isinstance(qty, bool):
-                        raise ValueError("quantity must be an integer number of shares")
-                    q = await asyncio.to_thread(feed.get_latest_quote, sym)
-                    if q:
-                        broker.on_quote(q)
-
-                    ord_obj = await asyncio.to_thread(
-                        broker.submit_order,
-                        symbol=sym,
-                        side=OrderSide(msg["side"]),
-                        order_type=OrderType(msg["order_type"]),
-                        quantity=qty,
-                        price=float(msg["price"]) if msg.get("price") is not None else None,
-                        stop_price=float(msg["stop_price"]) if msg.get("stop_price") is not None else None,
-                    )
-                    await websocket.send_json({"type": "ORDER_UPDATE", "data": ord_obj.model_dump(mode="json")})
-                except Exception as ex:
-                    await websocket.send_json({"type": "ORDER_ERROR", "error": str(ex)})
+                # Removed (2026-11-20 review P3): no frontend caller — the
+                # worker only ever sends AUTH/SUBSCRIBE/UNSUBSCRIBE/PING, and
+                # orders go through POST /api/orders. The socket path bypassed
+                # every defense the REST route grew (client_order_id
+                # idempotency, TIF plumb, pydantic validation), so a stray
+                # client using it could place a day-TIF conditional that the
+                # venue expires at the close. Fail loudly so a stale client
+                # sees the reason instead of a silent no-op.
+                await websocket.send_json({
+                    "type": "ORDER_ERROR",
+                    "error": "ORDER_SUBMIT over websocket is removed; use POST /api/orders",
+                })
 
             elif action == "PING":
                 await websocket.send_json({"type": "PONG"})

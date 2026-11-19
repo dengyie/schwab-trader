@@ -197,20 +197,19 @@ def test_websocket_auth_frame_then_order_flow():
             pong_msg = websocket.receive_json()
             assert pong_msg["type"] == "PONG"
 
-            # Submit order via WebSocket
-            order_msg = {
+            # Order submission over the socket was removed (2026-11-20 review
+            # P3): the path bypassed client_order_id idempotency, the TIF
+            # plumb and pydantic validation that POST /api/orders grew, and
+            # no frontend caller ever used it. A stale client must see the
+            # reason, not a silent no-op or a second unguarded entry point.
+            websocket.send_json({
                 "action": "SUBMIT_ORDER",
-                "symbol": "AAPL",
-                "side": "BUY",
-                "order_type": "MARKET",
-                "quantity": 2
-            }
-            websocket.send_json(order_msg)
-
-            # Receive ORDER_UPDATE
+                "symbol": "AAPL", "side": "BUY", "order_type": "MARKET",
+                "quantity": 2,
+            })
             ord_res = websocket.receive_json()
-            assert ord_res["type"] == "ORDER_UPDATE"
-            assert ord_res["data"]["status"] == "FILLED"
+            assert ord_res["type"] == "ORDER_ERROR"
+            assert "POST /api/orders" in ord_res["error"]
 
 
 def test_websocket_legacy_query_token_still_accepted():
@@ -749,6 +748,52 @@ def test_order_submission_is_idempotent_under_client_order_id():
         # the replay returned the original order.
         p = client.get("/api/portfolio", headers=AUTH).json()
         assert p["positions"]["SPY"]["quantity"] == 1
+
+
+def test_concurrent_submissions_with_same_client_order_id_place_one_order():
+    """2026-11-20 review pin: the idempotency key must also hold for two
+    submissions racing IN FLIGHT, not only for a retry after the first
+    finished. Both threads used to miss the map and reach the venue twice."""
+    import threading
+    # The real app + simulation feed: the submit path calls
+    # actual_feed.get_latest_quote before routing to the broker, so a bare
+    # FastAPI() + stub feed would 500 (and the real app's feed answers SPY).
+    from app.main import broker as routed_broker
+    client = TestClient(app)
+
+    # Slow the venue just enough for the two threads to overlap inside the
+    # submission path (past the fast replay check, into the in-flight lock).
+    from unittest.mock import patch
+    real_submit = routed_broker.submit_order
+    def slow_submit(*args, **kwargs):
+        import time as _t
+        _t.sleep(0.15)
+        return real_submit(*args, **kwargs)
+    with patch.object(routed_broker, "submit_order", side_effect=slow_submit):
+        barrier = threading.Barrier(2)
+        results: list = []
+        errors: list = []
+        def fire():
+            barrier.wait()
+            try:
+                r = client.post("/api/orders", json={
+                    "symbol": "SPY", "side": "BUY", "order_type": "MARKET",
+                    "quantity": 1, "client_order_id": "race-uuid-1",
+                }, headers=AUTH)
+                results.append(r.json().get("order_id"))
+            except Exception as exc:
+                errors.append(repr(exc))
+        t1 = threading.Thread(target=fire)
+        t2 = threading.Thread(target=fire)
+        t1.start(); t2.start(); t1.join(30); t2.join(30)
+
+    assert not errors, f"submit errors: {errors}"
+    assert len(results) == 2 and all(results), results
+    assert results[0] == results[1], \
+        f"concurrent same-key submissions must answer one order: {results}"
+    # Two fills would prove a double execution; one proves the lock held.
+    p = client.get("/api/portfolio", headers=AUTH).json()
+    assert p["positions"]["SPY"]["quantity"] == 1
 
 
 def test_auth_failures_are_rate_limited_per_ip():
