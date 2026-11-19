@@ -17,6 +17,21 @@ def _parse_alpaca_timestamp(ts_val: Any) -> datetime:
     if isinstance(ts_val, datetime):
         return ts_val.astimezone(timezone.utc)
     if isinstance(ts_val, str):
+        # Fast path for the canonical Alpaca tick shape "2026-11-02T19:48:19
+        # [.fraction]Z" (every stream timestamp ends in Z). On py3.10 the old
+        # replace/split munging plus astimezone(utc) measured ~13us per call
+        # on the VPS (astimezone alone ~4.6us vs fromisoformat ~0.3us); the
+        # slice form parses in well under half that and never rebases because
+        # the string is already UTC. Anything else falls through to the
+        # general munging below, unchanged.
+        if ts_val.endswith("Z"):
+            body = ts_val[:19]
+            frac = (ts_val[20:-1] + "000000")[:6]
+            try:
+                # frac is always 6 digits here ('000000' for whole seconds)
+                return datetime.fromisoformat(f"{body}.{frac}+00:00")
+            except ValueError:
+                pass  # unusual shape (no seconds, offset inside) -> slow path
         # Alpaca uses RFC3339 / ISO8601: "2026-11-02T19:48:19.218325244Z"
         # Handle nanoseconds by truncating to microseconds (6 digits)
         clean_str = ts_val.replace("Z", "+00:00")
