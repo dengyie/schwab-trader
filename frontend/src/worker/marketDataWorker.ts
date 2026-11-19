@@ -589,7 +589,10 @@ function handleMessage(data: unknown): void {
     return;
   }
 
-  if (msg.type === 'PORTFOLIO_SNAPSHOT' || msg.type === 'ORDER_FILLED' || msg.type === 'ORDER_UPDATE') {
+  // Backend event whitelist: only types the backend actually emits (main.py
+  // _broadcast_order_filled / _send_portfolio_snapshot). ORDER_UPDATE was once
+  // listed here but no backend code path ever produced it.
+  if (msg.type === 'PORTFOLIO_SNAPSHOT' || msg.type === 'ORDER_FILLED') {
     self.postMessage({
       type: 'BACKEND_EVENT',
       payload: msg,

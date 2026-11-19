@@ -223,16 +223,6 @@ export function SettingsPage() {
                 </select>
               </div>
 
-              <div className={styles.formGroup}>
-                <label className={styles.fieldLabel}>{t.settings?.profile?.email || 'Email'}</label>
-                <input
-                  type="text"
-                  className={styles.input}
-                  value={user.email}
-                  disabled
-                />
-              </div>
-
               <div className={styles.formActions}>
                 <button className={styles.primaryBtn} onClick={handleSaveProfile}>
                   {profileSaved ? (

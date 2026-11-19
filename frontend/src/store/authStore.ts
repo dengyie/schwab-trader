@@ -5,7 +5,6 @@ import { hasToken, clearToken, verifyToken, probeSession, destroySession, getTok
 export interface User {
   id: string;
   username: string;
-  email: string;
   displayName: string;
   avatar: string | null;
   bio: string;
@@ -18,10 +17,6 @@ export interface UserPreferences {
   language: 'zh-CN' | 'en-US';
   theme: 'light' | 'dark' | 'system';
   quoteAsset: 'USD' | 'BTC';
-  notifications: {
-    priceThreshold: number;
-    orderFills: boolean;
-  };
 }
 
 interface AuthState {
@@ -47,19 +42,14 @@ const defaultPreferences: UserPreferences = {
   language: 'zh-CN',
   theme: 'dark',
   quoteAsset: 'USD',
-  notifications: {
-    priceThreshold: 5,
-    orderFills: true,
-  },
 };
 
-// Placeholder display profile (2026-11-16 review): the old default carried
-// a real personal email in every visitor's localStorage. The profile is
-// editable in Settings; nothing here is a credential.
+// Placeholder display profile (2026-11-16 review): the profile is editable
+// in Settings; nothing here is a credential. No email field — the app has
+// no email capability and never collected one.
 const defaultTrader: User = {
   id: 'trader-001',
   username: 'trader',
-  email: 'trader@localhost',
   displayName: 'Trader',
   avatar: null,
   bio: 'Schwab & Alpaca Quant Trader',
@@ -190,10 +180,6 @@ export const useAuthStore = create<AuthState>()(
           preferences: {
             ...state.preferences,
             ...prefs,
-            notifications: {
-              ...state.preferences.notifications,
-              ...(prefs.notifications || {}),
-            },
           },
         }));
       },
