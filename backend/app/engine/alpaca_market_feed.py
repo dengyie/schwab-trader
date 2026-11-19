@@ -4,6 +4,7 @@ Connects to Alpaca IEX WebSocket Stream and REST API for real 1-minute bars, quo
 """
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -25,6 +26,7 @@ from app.core.markets import (
     freshness_updates,
     is_market_open,
     market_of,
+    resolve_symbol,
     within_day_range,
 )
 from app.core.timeframes import (
@@ -45,6 +47,10 @@ MAX_CACHE_ENTRIES = 300
 # Maximum fan-out rate for streamed quotes (matches the websocket manager's
 # 40ms conflation). IEX prints far faster than any screen can redraw.
 QUOTE_EMIT_SECONDS = 0.04
+# Soft cap on runtime-added stream subscriptions (WS SUBSCRIBE for symbols
+# outside the boot set). IEX has no hard per-connection limit, but an
+# unbounded set would let a looping client inflate the tick fan-out forever.
+MAX_DYNAMIC_SYMBOLS = 50
 
 # Reconnect policy. A connection only earns a fresh backoff once it has
 # actually stayed up; see ``next_reconnect_backoff`` for why.
@@ -281,6 +287,20 @@ class AlpacaMarketFeedService:
         self.symbols: Set[str] = set(
             sym.upper() for sym in (initial_symbols or settings.default_symbols)
         )
+        # The boot set can never be unsubscribed at runtime (a stray or buggy
+        # WS client must not be able to kick SPY off the stream); everything
+        # else is fair game for deactivate.
+        self._core_symbols: Set[str] = frozenset(self.symbols)
+        # Runtime subscription changes (WS SUBSCRIBE/UNSUBSCRIBE) travel this
+        # queue to the listener loop, which forwards incremental
+        # subscribe/unsubscribe frames to the live Alpaca socket. Created
+        # lazily on the loop side: an asyncio.Queue binds to the loop that
+        # first touches it, and activate() may run before start().
+        self._sub_control: Optional[asyncio.Queue] = None
+        self._sub_control_lock = threading.Lock()
+        self._sub_control_pending: List = []
+        # Keep-alive refs for background daily-stats warm futures.
+        self._daily_warm_tasks: set = set()
         self.api_key = api_key or settings.alpaca_api_key or ""
         self.api_secret = api_secret or settings.alpaca_api_secret or ""
         self.stream_url = stream_url or settings.alpaca_data_stream_url
@@ -1154,6 +1174,110 @@ class AlpacaMarketFeedService:
     def subscribe_quote(self, callback: Callable[[Quote], None]) -> None:
         self.quote_listeners.append(callback)
 
+    # -- watch (runtime stream subscriptions) -------------------------------
+    def activate(self, symbol: str) -> None:
+        """Add a symbol to the live IEX stream at runtime (WS SUBSCRIBE).
+
+        Adds to the subscription set and queues an incremental subscribe
+        frame for the listener loop; a reconnect would pick the symbol up
+        anyway, but the queue makes the first tick arrive without waiting
+        for one. Daily context (prev close / day range) is warmed in the
+        background so the first decorated quote is not range-less. Core
+        symbols are no-ops (already subscribed).
+        """
+        sym = self._canonical(symbol)
+        if not sym:
+            return
+        with self._sub_control_lock:
+            if sym in self.symbols:
+                return
+            if len(self.symbols - self._core_symbols) >= MAX_DYNAMIC_SYMBOLS:
+                logger.warning(
+                    "Dynamic subscription cap reached (%d); not subscribing %s",
+                    MAX_DYNAMIC_SYMBOLS, sym,
+                )
+                return
+            self.symbols.add(sym)
+            self._queue_control(("add", sym))
+        self._warm_daily_stats_background(sym)
+
+    def deactivate(self, symbol: str) -> None:
+        """Remove a runtime-added symbol from the live IEX stream.
+
+        Boot-set symbols are protected: a stray or buggy WS client must not
+        be able to kick SPY off the stream for every other consumer.
+        """
+        sym = self._canonical(symbol)
+        if not sym:
+            return
+        with self._sub_control_lock:
+            if sym in self._core_symbols or sym not in self.symbols:
+                return
+            self.symbols.discard(sym)
+            self._queue_control(("remove", sym))
+
+    @staticmethod
+    def _canonical(symbol: str) -> Optional[str]:
+        ref = resolve_symbol(symbol)
+        return ref.symbol if ref else None
+
+    @staticmethod
+    def _sub_change_frame(change: tuple) -> str:
+        """One runtime change -> incremental Alpaca frame (JSON text).
+
+        Our internal verbs ("add"/"remove") map onto the stream's actions
+        ("subscribe"/"unsubscribe").
+        """
+        action, sym = change
+        stream_action = {"add": "subscribe", "remove": "unsubscribe"}[action]
+        return json.dumps(
+            {"action": stream_action, "quotes": [sym], "trades": [sym], "bars": [sym]}
+        )
+
+    def _queue_control(self, change: tuple) -> None:
+        """Hand a subscription change to the listener loop.
+
+        Before the loop starts there is no loop-bound queue to hold the
+        change, so pending items park in a plain list; the loop drains both
+        on first connect.
+        """
+        if self._sub_control is not None:
+            self._sub_control.put_nowait(change)
+        else:
+            self._sub_control_pending.append(change)
+
+    def _take_sub_control(self) -> asyncio.Queue:
+        """Loop-side accessor: create the queue bound to the running loop.
+
+        Pre-loop changes parked in the plain list were already applied to
+        ``self.symbols``, so the boot subscribe covers them — dropping here
+        avoids a redundant duplicate subscribe frame per symbol.
+        """
+        with self._sub_control_lock:
+            if self._sub_control is None:
+                self._sub_control = asyncio.Queue()
+                for change in self._sub_control_pending:
+                    action, sym = change
+                    if action == "add" and sym in self.symbols:
+                        continue
+                    self._sub_control.put_nowait(change)
+                self._sub_control_pending.clear()
+            return self._sub_control
+
+    def _warm_daily_stats_background(self, sym: str) -> None:
+        """Warm one symbol's daily context off the caller's thread."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            task = loop.run_in_executor(None, self.ensure_daily_stats, [sym])
+            # Keep a reference so the executor future is not garbage-collected.
+            self._daily_warm_tasks.add(task)
+            task.add_done_callback(self._daily_warm_tasks.discard)
+        except Exception:
+            pass
+
     def subscribe_bar(self, callback: Callable[[str, Bar], None]) -> None:
         self.bar_listeners.append(callback)
 
@@ -1228,7 +1352,10 @@ class AlpacaMarketFeedService:
                                 f"Alpaca stream auth rejected: {item.get('msg')} (code={item.get('code')})"
                             )
 
-                    # 3. Subscribe to quotes and bars
+                    # 3. Subscribe to quotes and bars. Pre-loop runtime
+                    # changes (activate() before start()) must be folded in:
+                    # take over the pending queue here.
+                    sub_control = self._take_sub_control()
                     sub_msg = {
                         "action": "subscribe",
                         "quotes": list(self.symbols),
@@ -1246,9 +1373,48 @@ class AlpacaMarketFeedService:
                     quota_backoff = QUOTA_INITIAL_BACKOFF
                     quota_hits = 0
 
-                    # 4. Message processing loop
+                    # 4. Message processing loop. Two sources wake it: an
+                    # IEX frame on the socket, or a runtime subscription
+                    # change queued by activate()/deactivate() — the latter
+                    # is forwarded as an incremental frame without waiting
+                    # for a reconnect.
+                    recv_task: Optional[asyncio.Task] = None
+                    ctrl_task: Optional[asyncio.Task] = None
+                    msg_str: Optional[str] = None
                     while self._running:
-                        msg_str = await ws.recv()
+                        if recv_task is None:
+                            recv_task = asyncio.ensure_future(ws.recv())
+                        if ctrl_task is None:
+                            ctrl_task = asyncio.ensure_future(sub_control.get())
+                        done, _ = await asyncio.wait(
+                            {recv_task, ctrl_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if recv_task in done:
+                            msg_str = recv_task.result()
+                            recv_task = None
+                        else:
+                            recv_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await recv_task
+                            recv_task = None
+                            msg_str = None  # control-only wake
+                        if ctrl_task in done:
+                            change = ctrl_task.result()
+                            ctrl_task = None
+                            if change is not None:
+                                await ws.send(self._sub_change_frame(change))
+                                logger.info(
+                                    "Alpaca stream %s %s at runtime",
+                                    change[0], change[1],
+                                )
+                        else:
+                            ctrl_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await ctrl_task
+                            ctrl_task = None
+                        if msg_str is None:
+                            continue
                         items = json.loads(msg_str)
                         if not isinstance(items, list):
                             items = [items]
@@ -1374,6 +1540,13 @@ class AlpacaMarketFeedService:
                         delay,
                     )
                 await asyncio.sleep(delay)
+            finally:
+                # Exception/cancel exits must not strand the pending
+                # recv/control futures: their exceptions would otherwise
+                # surface as "Task exception was never retrieved" noise.
+                for task in (locals().get("recv_task"), locals().get("ctrl_task")):
+                    if task is not None and not task.done():
+                        task.cancel()
 
     async def _periodic_quote_sync_loop(self) -> None:
         """
