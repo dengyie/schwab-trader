@@ -16,6 +16,8 @@ export interface SymbolInfo {
 }
 
 // 默认交易对列表（美股核心大盘与科技成长标的）
+const DEFAULT_FAVORITES = ['SPY', 'QQQ', 'NVDA', 'AAPL'];
+
 const DEFAULT_SYMBOLS: SymbolInfo[] = [
   { symbol: 'SPY', baseAsset: 'SPY', quoteAsset: 'USD' },
   { symbol: 'QQQ', baseAsset: 'QQQ', quoteAsset: 'USD' },
@@ -61,14 +63,18 @@ interface WatchlistState {
   addSymbol: (symbol: SymbolInfo) => void;
   removeSymbol: (symbol: string) => void;
   updateSymbolPrice: (symbol: string, price: string, priceChange24h?: number) => void;
+  /** Batched variant: one store write per poll cycle instead of one per row (2026-11-23 review P2 — the per-row version made every watcher re-render N times even when prices were unchanged). */
+  updateSymbolPrices: (rows: Record<string, { price: string; priceChange24h?: number }>) => void;
   reorderSymbols: (fromIndex: number, toIndex: number) => void;
+  /** 登出清理（2026-11-23 review P3）：恢复默认自选，persist 写穿清掉 localStorage 字段。 */
+  reset: () => void;
 }
 
 export const useWatchlistStore = create<WatchlistState>()(
   persist(
     (set, get) => ({
       symbols: DEFAULT_SYMBOLS,
-      favorites: ['SPY', 'QQQ', 'NVDA', 'AAPL'],
+      favorites: [...DEFAULT_FAVORITES],
       pinned: [],
       selectedSymbol: 'SPY',
       searchQuery: '',
@@ -122,14 +128,29 @@ export const useWatchlistStore = create<WatchlistState>()(
       },
       
       updateSymbolPrice: (symbol, price, priceChange24h) => {
+        get().updateSymbolPrices({ [symbol]: { price, priceChange24h } });
+      },
+
+      updateSymbolPrices: (rows) => {
         const { symbols } = get();
-        set({
-          symbols: symbols.map(s => 
-            s.symbol === symbol 
-              ? { ...s, price, priceChange24h: priceChange24h ?? s.priceChange24h }
-              : s
-          ),
+        let changed = false;
+        const next = symbols.map(s => {
+          const row = rows[s.symbol];
+          if (!row) return s;
+          if (row.price === s.price && (row.priceChange24h === undefined || row.priceChange24h === s.priceChange24h)) {
+            return s;
+          }
+          changed = true;
+          return {
+            ...s,
+            price: row.price,
+            priceChange24h: row.priceChange24h ?? s.priceChange24h,
+          };
         });
+        // Reference stability: an unchanged poll must not hand subscribers a
+        // fresh array (every `symbols` selector re-rendered for nothing).
+        if (!changed) return;
+        set({ symbols: next });
       },
       
       reorderSymbols: (fromIndex, toIndex) => {
@@ -141,6 +162,18 @@ export const useWatchlistStore = create<WatchlistState>()(
           set({ symbols: newSymbols });
         }
       },
+
+      // (2026-11-23 review P3) 登出清理：本浏览器的自选/收藏/置顶恢复默认。
+      // zustand persist 对每次 set 都写回 localStorage，所以普通 set 即同步
+      // 清掉持久化字段，无需手动操作 storage。
+      reset: () => set({
+        symbols: DEFAULT_SYMBOLS,
+        favorites: [...DEFAULT_FAVORITES],
+        pinned: [],
+        selectedSymbol: 'SPY',
+        searchQuery: '',
+        showFavoritesOnly: false,
+      }),
     }),
     {
       name: 'watchlist_state',

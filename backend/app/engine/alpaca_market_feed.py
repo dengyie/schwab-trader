@@ -39,6 +39,7 @@ from app.core.timeframes import (
 )
 from app.engine.bar_cache import BarCache
 from app.engine.state_store import JsonStateStore
+from app.engine.feed_utils import notify_listeners
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +320,10 @@ class AlpacaMarketFeedService:
         self.daily_stats: Dict[str, Dict[str, float]] = {}
         self._snapshot_ts: float = 0.0
         self._snapshot_lock = threading.Lock()
+        # Per-symbol warm timestamps for targeted refreshes (dynamic
+        # subscribe): the global snapshot gate would no-op a single-symbol
+        # warm for up to an hour after the boot sweep (2026-11-23 review).
+        self._per_symbol_warm_ts: Dict[str, float] = {}
 
         # Multi-timeframe bars, kept on disk so a deploy does not start cold.
         # ``cache_dir`` is None in the test suite (STATE_DIR=off), which makes
@@ -344,6 +349,9 @@ class AlpacaMarketFeedService:
         self._ws_task: Optional[asyncio.Task] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._prewarm_task: Optional[asyncio.Task] = None
+        # stop() iterates this; without the placeholder, stopping a feed that
+        # was never start()ed raised AttributeError (2026-11-23 review P3).
+        self._deep_hist_task: Optional[asyncio.Task] = None
         # Optional callable returning True while a client is subscribed to a
         # symbol. ``main`` attaches it; None keeps background prewarming on.
         self.subscriber_probe: Optional[Callable[[], bool]] = None
@@ -1016,9 +1024,13 @@ class AlpacaMarketFeedService:
                     if q:
                         self.latest_quotes[sym] = q
                         return self._decorate_daily(q)
-        except Exception:
-            pass
-        return self.latest_quotes.get(sym)
+        except Exception as exc:
+            logger.warning("Alpaca REST quote lookup failed for %s: %s", sym, exc)
+        # Same decoration contract as the cache-hit and REST-success paths:
+        # callers (routes read is_stale, the WS first quote) must never see a
+        # raw quote slip through the failure branch (2026-11-23 review P3).
+        raw = self.latest_quotes.get(sym)
+        return self._decorate_daily(raw) if raw else None
 
     def refresh_daily_stats(self, symbols: Optional[List[str]] = None, force: bool = False) -> None:
         """Refresh per-symbol daily context from the consolidated tape.
@@ -1031,18 +1043,50 @@ class AlpacaMarketFeedService:
         consolidated figure, so it is the primary source here and the Alpaca
         snapshot is only the fallback for symbols Yahoo cannot answer.
         """
-        syms = sorted(symbols or self.symbols)
+        # Snapshot the subscription set under the lock that guards its
+        # mutations (activate/deactivate run on the event loop thread while
+        # this sweep runs on worker threads): iterating a set that changes
+        # mid-loop raises RuntimeError, and the callers below used to swallow
+        # it silently (2026-11-23 review P2-3).
+        if symbols is None:
+            with self._sub_control_lock:
+                syms = sorted(self.symbols)
+        else:
+            syms = sorted(symbols)
         if not syms:
             return
 
         # The timestamp is set before the (slow) upstream sweep so a second
         # caller waits for the TTL instead of starting a duplicate burst.
+        # A targeted call (dynamic subscribe passes an explicit symbol list)
+        # gates per symbol instead of on the global snapshot: the boot sweep
+        # starts that clock, which otherwise no-ops the new symbol's warm-up
+        # for up to SNAPSHOT_TTL_CLOSED (1h) and leaves its quote range-less
+        # (2026-11-23 review P2). A targeted call also must not advance the
+        # global timestamp, or it would postpone the next full sweep by a
+        # full TTL.
         with self._snapshot_lock:
             now = time.time()
             ttl = self._daily_ttl()
-            if not force and self._snapshot_ts and now - self._snapshot_ts < ttl:
-                return
-            self._snapshot_ts = now
+            if symbols is None:
+                if not force and self._snapshot_ts and now - self._snapshot_ts < ttl:
+                    return
+                self._snapshot_ts = now
+            else:
+                # getattr-defensive: tests build instances via __new__ and
+                # only set the attributes they exercise.
+                per_warm = getattr(self, "_per_symbol_warm_ts", None)
+                if per_warm is None:
+                    per_warm = self._per_symbol_warm_ts = {}
+                stale = [
+                    s for s in syms
+                    if force or now - per_warm.get(s, 0.0) >= ttl
+                ]
+                if not stale:
+                    return
+                for s in stale:
+                    per_warm[s] = now
+                syms = stale
 
         missing = self._refresh_consolidated_daily(syms)
         if missing:
@@ -1086,7 +1130,9 @@ class AlpacaMarketFeedService:
     def _daily_ttl(self) -> float:
         """Longer TTL when every venue is shut: a close does not move."""
         try:
-            closed = all(not is_market_open(market_of(sym)) for sym in self.symbols)
+            with self._sub_control_lock:
+                watched = tuple(self.symbols)
+            closed = all(not is_market_open(market_of(sym)) for sym in watched)
         except Exception:
             closed = False
         return self.SNAPSHOT_TTL_CLOSED if closed else self.SNAPSHOT_TTL
@@ -1448,11 +1494,7 @@ class AlpacaMarketFeedService:
                                     self.last_trade_prices[sym] = trade_p
                                 trade = AlpacaDataAdapter.parse_stream_trade(item)
                                 if trade:
-                                    for t_listener in self.trade_listeners:
-                                        try:
-                                            t_listener(trade)
-                                        except Exception:
-                                            pass
+                                    notify_listeners(self.trade_listeners, "trade", trade)
 
                             # Quote tick
                             elif t_type == "q":
@@ -1485,30 +1527,27 @@ class AlpacaMarketFeedService:
                                     # per served request instead of once per
                                     # accepted print.
                                     self.latest_quotes[sym] = quote
-                                    for listener in self.quote_listeners:
-                                        try:
-                                            listener(quote)
-                                        except Exception:
-                                            pass
+                                    notify_listeners(self.quote_listeners, "quote", quote)
 
                             # Bar tick
                             elif t_type == "b":
                                 bar = AlpacaDataAdapter.parse_stream_bar(item)
                                 if bar:
                                     bars = self.historical_bars.setdefault(sym, [])
-                                    # Replace bar if timestamp identical, else append
-                                    if bars and bars[-1].time == bar.time:
-                                        bars[-1] = bar
+                                    # Same timestamp updates in place; a print
+                                    # OLDER than the tail is a late/replayed
+                                    # venue frame — appending it would corrupt
+                                    # the sequence every consumer assumes is
+                                    # ordered (2026-11-23 review P3).
+                                    if bars and bar.time <= bars[-1].time:
+                                        if bar.time == bars[-1].time:
+                                            bars[-1] = bar
                                     else:
                                         bars.append(bar)
                                     if len(bars) > 500:
                                         bars.pop(0)
 
-                                    for b_listener in self.bar_listeners:
-                                        try:
-                                            b_listener(sym, bar)
-                                        except Exception:
-                                            pass
+                                    notify_listeners(self.bar_listeners, "bar", sym, bar)
 
             except asyncio.CancelledError:
                 break
@@ -1579,16 +1618,18 @@ class AlpacaMarketFeedService:
                     try:
                         await asyncio.to_thread(self.refresh_daily_stats)
                     except Exception:
-                        pass
+                        # The refresh loop already snapshots the symbol set
+                        # under its own lock; log instead of vanishing so a
+                        # repeated failure is at least visible (2026-11-23
+                        # review P2-3).
+                        logger.exception("Daily stats sweep failed")
 
-                for sym in self.symbols:
+                with self._sub_control_lock:
+                    watched = tuple(self.symbols)
+                for sym in watched:
                     q = self._decorate_daily(self.latest_quotes.get(sym))
                     if q:
-                        for listener in self.quote_listeners:
-                            try:
-                                listener(q)
-                            except Exception:
-                                pass
+                        notify_listeners(self.quote_listeners, "resync-quote", q)
             except asyncio.CancelledError:
                 break
             except Exception:

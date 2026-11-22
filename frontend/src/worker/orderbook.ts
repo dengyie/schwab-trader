@@ -165,8 +165,14 @@ export class OrderBookManager {
     // sub-cent symbols (US <$1 tick 0.0001) into one cent bucket and the
     // book mis-displayed (2026-11-16 review). The display layer owns
     // formatting.
-    this.state.bids.set(String(bid), String(Math.max(1, Math.round(data.bid_size || 0))));
-    this.state.asks.set(String(ask), String(Math.max(1, Math.round(data.ask_size || 0))));
+    // (2026-11-23 review P3) 缺 size / size<=0 置 '0' 而不是伪造 1 手——
+    // 旧 Math.max(1, ...) 把"未知数量"硬编造成"1"，UI 上是一手不存在的
+    // 挂单。'0' 仍是合法 Decimal 入参（metrics 求和按 0 计），消费端把
+    // 0 显示为 '—'。
+    const bidSize = data.bid_size && data.bid_size > 0 ? String(Math.round(data.bid_size)) : '0';
+    const askSize = data.ask_size && data.ask_size > 0 ? String(Math.round(data.ask_size)) : '0';
+    this.state.bids.set(String(bid), bidSize);
+    this.state.asks.set(String(ask), askSize);
 
     const mid = (bid + ask) / 2.0;
     this.state.lastPrice = last || mid;

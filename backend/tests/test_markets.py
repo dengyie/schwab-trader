@@ -144,6 +144,19 @@ class TestTicks:
         assert tick_size_for(jp, 3338) == 5.0
         assert tick_size_for(jp, 20000) == 10.0
 
+    def test_jp_tiers_official_high_tiers(self):
+        """2026-11-23 review P1-6: the table drifted above ¥50,000 (50 where
+        the JPX schedule says 100, etc.), rejecting legal limit prices for
+        high-priced names and letting sub-grid prices into the book."""
+        jp = MARKETS.require("JP")
+        assert tick_size_for(jp, 60000) == 100.0      # (50k, 300k] -> 100
+        assert tick_size_for(jp, 350000) == 500.0     # (300k, 500k] -> 500
+        assert tick_size_for(jp, 600000) == 1000.0    # (500k, 3M] -> 1,000
+        assert tick_size_for(jp, 4000000) == 5000.0   # (3M, 5M] -> 5,000
+        assert tick_size_for(jp, 10000000) == 10000.0  # (5M, 30M] -> 10,000
+        assert tick_size_for(jp, 40000000) == 50000.0  # (30M, 50M] -> 50,000
+        assert tick_size_for(jp, 60000000) == 100000.0  # > 50M -> 100,000
+
     def test_cn_tick_flat(self):
         cn = MARKETS.require("CN")
         assert tick_size_for(cn, 1453) == 0.01

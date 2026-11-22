@@ -832,13 +832,16 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
                     _client_orders[req.client_order_id].pop("client_order_id", None)
                     while len(_client_orders) > _CLIENT_ORDER_MAP_MAX:
                         _client_orders.pop(next(iter(_client_orders)))
-            if flight_lock is not None:
-                _release_in_flight(req.client_order_id, flight_lock)
             return payload
         except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        finally:
+            # Release on EVERY exit path: an unexpected exception escaping
+            # with the lock held left the per-key entry registered forever,
+            # and every retry with the same client_order_id blocked a threadpool
+            # worker for good (2026-11-23 review P3 hardening).
             if flight_lock is not None:
                 _release_in_flight(req.client_order_id, flight_lock)
-            raise HTTPException(status_code=400, detail=str(e))
 
     @router.delete("/orders/{order_id}", dependencies=[Depends(require_auth)])
     def cancel_order(order_id: str) -> Dict[str, Any]:

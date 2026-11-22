@@ -1,16 +1,15 @@
 /**
  * Pure trigger evaluation for client-side conditional orders.
  *
- * Stops, take profits, trailing stops and position TP/SL are watched locally
- * against the live order book. Trigger evaluation is pure so the order-flow
- * store stays a thin coordinator and the crossing rules are unit-testable.
+ * Stops, take profits and trailing stops are watched locally against the
+ * live order book. Trigger evaluation is pure so the order-flow store stays
+ * a thin coordinator and the crossing rules are unit-testable.
  */
 import Decimal from 'decimal.js';
 import type {
   OrderSide,
   OrderType,
   PaperOrder,
-  Position,
   TriggerDirection,
 } from '../../types/trading';
 
@@ -117,14 +116,4 @@ export function evaluateTrailingStop(
   const triggered = stopPrice.gt(0) && (isSell ? current.lte(stopPrice) : current.gte(stopPrice));
 
   return { patch, triggered };
-}
-
-export type TpslTrigger = 'take_profit' | 'stop_loss' | null;
-
-export function evaluatePositionTpsl(position: Position, midPrice: string): TpslTrigger {
-  if (!position || position.side === 'flat') return null;
-  const mid = new Decimal(midPrice);
-  if (position.takeProfitPrice && mid.gte(position.takeProfitPrice)) return 'take_profit';
-  if (position.stopLossPrice && mid.lte(position.stopLossPrice)) return 'stop_loss';
-  return null;
 }

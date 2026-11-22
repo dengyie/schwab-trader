@@ -69,6 +69,11 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const [stopLossPrice, setStopLossPrice] = useState('');
   const [showDegradedConfirm, setShowDegradedConfirm] = useState(false);
   const [showAllInConfirm, setShowAllInConfirm] = useState(false);
+  // In-flight guard (2026-11-23 review P2): every submit generates a NEW
+  // client_order_id, so the backend idempotency key cannot dedupe two
+  // separate clicks — the guard must live here, covering the degraded
+  // confirm path too.
+  const submittingRef = useRef(false);
   
   // Conditional order fields
   const [triggerPrice, setTriggerPrice] = useState('');
@@ -287,6 +292,7 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (submittingRef.current) return;
     if (dataConfidence.level === 'stale') { toast.warning(t.dataConfidence.staleDesc); return; }
     // 收盘时市价单无法成交；限价/条件单会被券商挂起等下次开盘
     if (dataConfidence.level === 'closed' && type === 'market' && orderCategory === 'spot') {
@@ -303,7 +309,14 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       return;
     }
     if (dataConfidence.level === 'degraded' && !showDegradedConfirm) { setShowDegradedConfirm(true); return; }
-    if (!quantity || parseFloat(quantity) <= 0) { toast.warning(t.orderEntry.invalidAmount); return; }
+    // Number.isFinite guards: parseFloat("1e999") = Infinity and parseFloat("abc")
+    // = NaN both slip through `<= 0` checks and die as a backend 422 AFTER the
+    // success toast (2026-11-23 review P2). The store re-validates too.
+    const qtyNum = parseFloat(quantity);
+    if (!quantity || !Number.isFinite(qtyNum) || qtyNum <= 0 || qtyNum > 1e9) {
+      toast.warning(t.orderEntry.invalidAmount);
+      return;
+    }
     if (quantityNotLot(quantity)) {
       toast.warning(t.orderEntry.lotError || `Quantity must be a multiple of ${lotSize}`);
       return;
@@ -341,7 +354,8 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     // Handle different order categories
     if (orderCategory === 'spot') {
       // Regular limit/market orders
-      if (type === 'limit' && (!price || parseFloat(price) <= 0)) { 
+      const limitNum = price ? parseFloat(price) : NaN;
+      if (type === 'limit' && (!price || !Number.isFinite(limitNum) || limitNum <= 0 || limitNum > 1e9)) { 
         toast.warning(t.orderEntry.invalidPrice); 
         return; 
       }
@@ -444,12 +458,16 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       // The store refused to build the order. Name the real cause — the old
       // catch-all "insufficient balance" sent users chasing the wrong
       // problem during a routine feed resync (2026-11-16 review).
+      // (2026-11-23 review P3) createOCOOrder 也返回结构化拒绝原因了，新增
+      // invalid_params / markets_loading 两个映射，不再落进 insufficientBalance。
       const blockToast: Record<string, string | undefined> = {
         data_confidence: t.orderEntry.resyncingBlock,
         invalid_quantity: t.orderEntry.invalidAmount,
+        invalid_params: t.orderEntry.invalidPrice,
         missing_price: t.orderEntry.invalidPrice,
         missing_trigger: t.orderEntry?.invalidTriggerPrice,
         lot_floor_zero: t.orderEntry.lotError,
+        markets_loading: t.orderEntry.marketsLoading,
       };
       toast.warning(
         blockToast[order.blocked]
@@ -751,6 +769,11 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
             <input ref={slInputRef} type="text" inputMode="decimal" className={`input ${styles.inputSmall}`} value={stopLossPrice} onChange={(e) => setStopLossPrice(e.target.value)} onFocus={handleInputFocus('sl')} onBlur={handleInputBlur} placeholder="—" />
           </div>
         </div>
+        {Boolean(takeProfitPrice || stopLossPrice) && (
+          <p className={styles.tpslHint}>
+            {t.orderEntry.tpslArmsOnFill || 'TP/SL activates automatically once the order fills'}
+          </p>
+        )}
 
         {/* Compact Estimated Info */}
         <div className={styles.estimatedInfo}>

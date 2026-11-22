@@ -33,6 +33,7 @@ from app.core.timeframes import (
     TIMEFRAME_TTLS,
 )
 from app.engine.bar_cache import BarCache
+from app.engine.feed_utils import notify_listeners
 from app.models.trading import Bar, Quote, utc_now
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ class YahooQuoteFeed:
 
     POLL_SECONDS = 6.0
     IDLE_POLL_SECONDS = 30.0
+    # Max concurrent upstream fetches per poll cycle: Yahoo throttles per
+    # IP, and an unbounded gather (one thread per watched symbol) turns a
+    # large watch list into a self-inflicted rate limit (2026-11-23 review).
+    POLL_CONCURRENCY = 5
     CACHE_SECONDS = 4.0
     # Fallback TTL for a timeframe the shared table does not know. The US feed
     # and this one read the same ``TIMEFRAME_TTLS``; a second, different number
@@ -335,10 +340,18 @@ class YahooQuoteFeed:
             if len(bars) > page_size:
                 bars = bars[-page_size:]
             if not bars:
-                # Nothing in this window: the true edge. Store the emptiness
-                # (with a fresh timestamp so the segment is served without
-                # re-hitting upstream) — a terminal state, not a failure.
-                self._bar_cache.put(ref.symbol, seg_tf, [], time.time())
+                # An empty page is NOT a trustworthy terminal edge here. Two
+                # measured Yahoo behaviours make it transient: the 59d/730d
+                # coverage edge slides with "now" (a cursor inside the edge
+                # answers empty today, non-empty tomorrow), and a rate limit
+                # masquerades as an empty answer ("possibly delisted"). The
+                # US feed learned this on 2026-11-14 and cools down instead
+                # of caching; the intl path kept caching the emptiness for
+                # the full 7-day segment TTL, stranding HK/JP charts at the
+                # seed edge for a week (2026-11-23 review — port the US
+                # semantics; unlike the US path there is no fixed archive
+                # here, so every empty is cool-down, never terminal).
+                self._bar_cache.cool_down(ref.symbol, seg_tf)
                 return []
             self._bar_cache.put(ref.symbol, seg_tf, bars)
             return bars
@@ -436,17 +449,26 @@ class YahooQuoteFeed:
 
                 any_open = any(is_market_open(market_of(sym)) for sym in active)
                 interval = self.POLL_SECONDS if any_open else self.IDLE_POLL_SECONDS
+                # Yahoo throttles per IP: fan out in bounded batches so a
+                # leaked (or legitimately large) watch list cannot fire one
+                # thread per symbol per cycle and trip the whole feed into a
+                # silent rate-limit state (2026-11-23 review P3).
+                sem = asyncio.Semaphore(self.POLL_CONCURRENCY)
+                async def _bounded(sym: str):
+                    async with sem:
+                        return await asyncio.to_thread(self._fetch_if_stale, sym)
                 quotes = await asyncio.gather(
-                    *(asyncio.to_thread(self._fetch_if_stale, sym) for sym in active),
+                    *(_bounded(sym) for sym in active),
                     return_exceptions=True,
                 )
                 for quote in quotes:
                     if isinstance(quote, Quote):
-                        for listener in list(self.quote_listeners):
-                            try:
-                                listener(quote)
-                            except Exception:
-                                pass
+                        notify_listeners(self.quote_listeners, "intl-quote", quote)
+                    elif isinstance(quote, BaseException):
+                        # gather(return_exceptions=True) hands back the
+                        # exception objects; dropping them silently made
+                        # per-symbol failures invisible here.
+                        logger.warning("Yahoo poll fetch failed: %s", quote)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break

@@ -220,7 +220,22 @@ export const useWalletStore = create<WalletState>()(
           // the broker holds every resting order and already excludes its
           // commitment from `cash`. Carrying a stale `frozen` forward would
           // show cash that is both spent and locked.
-          const newBalances = state.balances.map(b => ({ ...b, frozen: '0' })).map(b => {
+          // Withdraw-in-flight semantics: a simulated withdraw freezes the
+          // amount for 5-10s locally, but this sync used to wipe EVERY frozen
+          // value — the 30s portfolio poll landing inside that window broke
+          // deductFromFrozen and the withdraw stayed 'processing' forever
+          // with an orphan WITHDRAW_FREEZE ledger entry (2026-11-23 review).
+          // Broker-side cash already excludes resting orders, so ORDER-freeze
+          // rows are still correctly zeroed; only withdraw freezes survive.
+          const processingWithdrawAssets = new Set(
+            (state.withdraws || [])
+              .filter((w: { status: string; asset: string }) => w.status === 'processing')
+              .map((w: { asset: string }) => w.asset)
+          );
+          const newBalances = state.balances.map(b => ({
+            ...b,
+            frozen: processingWithdrawAssets.has(b.asset) ? b.frozen : '0',
+          })).map(b => {
             if (b.asset === 'USD') {
               return {
                 ...b,
@@ -256,6 +271,25 @@ export const useWalletStore = create<WalletState>()(
             }
             return b;
           });
+
+          // Foreign-currency positions (0700.HK / 7203.T / 600519.SS) never
+          // produced a balance row at all — the wallet hid them and every
+          // automation sell-protection failed INSUFFICIENT_BALANCE
+          // (2026-11-23 review P1). Surface each open foreign position as
+          // its own row.
+          if (data.positions) {
+            const known = new Set(newBalances.map(b => b.asset));
+            for (const [asset, pos] of Object.entries(data.positions)) {
+              const qty = Number((pos as { quantity?: number | string | null })?.quantity ?? 0);
+              if (!Number.isFinite(qty) || qty <= 0 || known.has(asset)) continue;
+              newBalances.push({
+                asset,
+                available: String(qty),
+                frozen: '0',
+                total: String(qty),
+              });
+            }
+          }
 
           set({
             balances: newBalances,
@@ -400,7 +434,7 @@ export const useWalletStore = create<WalletState>()(
 
           set(s => ({ withdraws: [withdraw, ...s.withdraws] }));
 
-          setTimeout(() => {
+          const withdrawTimer = setTimeout(() => {
             const s = get();
             const w = s.withdraws.find(x => x.withdrawId === withdrawId);
             if (!w || w.status !== 'processing') return;
@@ -411,7 +445,12 @@ export const useWalletStore = create<WalletState>()(
                 withdraws: state.withdraws.map(x => x.withdrawId === withdrawId ? { ...x, status: 'completed', completedAt: Date.now() } : x)
               }));
             }
+            get()._pendingTimers.delete(`withdraw:${withdrawId}`);
           }, 5000 + Math.random() * 5000);
+          // The old timer was anonymous and unreferenced — a component
+          // unmount could not cancel it and it escaped cleanup entirely
+          // (2026-11-23 review P2).
+          get()._pendingTimers.set(`withdraw:${withdrawId}`, withdrawTimer);
 
           return withdraw;
         },

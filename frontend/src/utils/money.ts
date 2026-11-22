@@ -22,6 +22,27 @@ export function currencyDecimals(currency: string | null | undefined, fallback =
   return fallback;
 }
 
+/**
+ * 把某币种金额折算成 USD（2026-11-23 review P2-4）。
+ *
+ * 契约：currency 为 USD（或缺省）原样返回；非 USD 且有汇率则乘以汇率；
+ * 非 USD 且缺汇率返回 NaN —— 缺失汇率绝不能静默按 1:1 定价（那会把
+ * 港币成交额当美元累加）。调用方在累加前用 Number.isFinite 过滤 NaN，
+ * 让"无法定价"的条目退出聚合而不是污染总额。
+ */
+export function usdValue(
+  amount: number | string,
+  currency: string | undefined | null,
+  fxRates: Record<string, number>,
+): number {
+  const value = typeof amount === 'number' ? amount : parseFloat(amount);
+  const code = (currency || 'USD').toUpperCase();
+  if (code === 'USD') return value;
+  const rate = fxRates[code];
+  if (typeof rate === 'number' && rate > 0) return value * rate;
+  return NaN;
+}
+
 export interface FormatMoneyOptions {
   decimals?: number;
   signed?: boolean;

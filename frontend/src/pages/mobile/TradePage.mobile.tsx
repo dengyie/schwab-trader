@@ -10,7 +10,7 @@ import { Icon } from '../../components/Icon';
 import { MobileDrawer, MobileSegmentedControl, TradeOverview } from '../../components/mobile';
 import { MobileOrderEntry } from './MobileOrderEntry';
 import { useHapticFeedback } from '../../hooks/useHapticFeedback';
-import { useMarketStore, selectOrderBook, selectMetrics } from '../../store/marketStore';
+import { useMarketStore, selectMetrics } from '../../store/marketStore';
 import { formatVolume, formatPrice } from '../../services/marketDataService';
 import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, resolveAccountTotals } from '../../store/walletStore';
@@ -31,7 +31,6 @@ const PanelFallback = ({ name }: { name: string }) => (
 export function MobileTradePage() {
   const { t } = useI18n();
   const { trigger } = useHapticFeedback();
-  const orderBook = useMarketStore(selectOrderBook);
   const metrics = useMarketStore(selectMetrics);
   const subscribe = useMarketStore((state) => state.subscribe);
   const unsubscribe = useMarketStore((state) => state.unsubscribe);
@@ -114,10 +113,16 @@ export function MobileTradePage() {
 
   // Evaluate client-side conditional/trailing triggers against the book.
   useEffect(() => {
-    if (orderBook) {
-      evaluateOrderTriggers(orderBook);
-    }
-  }, [orderBook, evaluateOrderTriggers]);
+    // Imperative subscribe (2026-11-23 review P2-12, same as desktop
+    // TradePage): the selector hook re-rendered the whole mobile tree per
+    // book tick just to call the evaluator.
+    return useMarketStore.subscribe(
+      (state) => state.orderBook,
+      (orderBook) => {
+        if (orderBook) evaluateOrderTriggers(orderBook);
+      }
+    );
+  }, [evaluateOrderTriggers]);
 
   // Swipe handling
   const handleTouchStart = (e: React.TouchEvent) => {

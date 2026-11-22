@@ -351,6 +351,28 @@ def _clean_symbol(value: object, market: object = None) -> str | None:
     return ref.symbol if ref else None
 
 
+def _release_feed_symbols(symbols) -> None:
+    """Deactivate feed subscriptions whose last WS watcher left.
+
+    A tab close / network drop never sends UNSUBSCRIBE, so before the
+    per-socket refcount (2026-11-23 review P1-4) every watched symbol leaked
+    into the feeds forever and the 50-symbol dynamic cap was permanently
+    exhausted within weeks. Symbols holding a resting virtual order keep
+    their subscription: the resting-order activation loop owns that
+    lifecycle and would re-activate them within 60s anyway.
+    """
+    if not symbols:
+        return
+    resting = set(virtual_engine.resting_order_symbols())
+    for sym in symbols:
+        if sym in resting:
+            continue
+        try:
+            feed.deactivate(sym)
+        except Exception as exc:
+            logger.warning("Feed deactivate failed for %s: %s", sym, exc)
+
+
 async def _send_portfolio_snapshot(websocket: WebSocket) -> None:
     """Send the initial snapshot; a broker hiccup must not tear the socket down."""
     try:
@@ -480,9 +502,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif action == "UNSUBSCRIBE":
                 sym = _clean_symbol(msg.get("symbol"), msg.get("market"))
-                if sym:
-                    ws_manager.unsubscribe(websocket, sym)
-                    feed.deactivate(sym)
+                if sym and ws_manager.unsubscribe(websocket, sym):
+                    # Last watcher left: release the feed subscription unless
+                    # a resting virtual order still needs quotes for it (the
+                    # resting-order activation loop owns those).
+                    _release_feed_symbols({sym})
 
             elif action == "SUBMIT_ORDER":
                 # Removed (2026-11-20 review P3): no frontend caller — the
@@ -499,15 +523,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
             elif action == "PING":
-                await websocket.send_json({"type": "PONG"})
+                # 2026-11-23 review P2-7: echo the client's ts so the worker
+                # can sample PING/PONG RTT into its latency history.
+                await websocket.send_json({"type": "PONG", "ts": msg.get("ts")})
 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        _release_feed_symbols(ws_manager.disconnect(websocket))
     except Exception as exc:
         # A malformed frame, a send error or a client that vanished must still
         # run cleanup; otherwise the connection leaks in active_connections.
         logger.warning("WebSocket session ended unexpectedly: %s", exc)
-        ws_manager.disconnect(websocket)
+        _release_feed_symbols(ws_manager.disconnect(websocket))
         try:
             await websocket.close()
         except Exception:

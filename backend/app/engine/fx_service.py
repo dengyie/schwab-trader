@@ -21,14 +21,27 @@ from app.adapters.yahoo_adapter import YahooFinanceAdapter
 logger = logging.getLogger(__name__)
 
 # Units of currency per USD. Only used until the first successful refresh.
+# These are 2026-11 levels — the previous CNY value (6.667) was a 2021-era
+# rate and mispriced every CNY position by ~7% whenever FX refresh was
+# disabled or failed (2026-11-23 review). If you touch these, keep them
+# within a sane band of the live pegs: CNY managed float ~7.1-7.3,
+# HKD peg 7.75-7.85, JPY recent range ~145-165.
 _FALLBACK_PER_USD = {
     "USD": 1.0,
     "HKD": 7.830,
     "JPY": 158.4,
-    "CNY": 6.667,
+    "CNY": 7.120,
+}
+# Rough sanity bands (units per USD) used to log a loud warning if a live
+# refresh ever returns a value wildly outside the expected regime.
+_SANITY_BAND_PER_USD = {
+    "HKD": (7.60, 8.00),
+    "JPY": (120.0, 180.0),
+    "CNY": (6.60, 7.80),
 }
 
 SUPPORTED_CURRENCIES = tuple(_FALLBACK_PER_USD)
+_UNWARNED_CURRENCIES: set[str] = set()
 
 
 class FxService:
@@ -39,6 +52,16 @@ class FxService:
         enabled: bool = True,
     ):
         self._base = base_currency
+        if self._base != "USD":
+            # _fetch builds "<CCY><BASE>=X" (units of CCY per BASE) but
+            # usd_per_unit inverts toward USD regardless — a non-USD base
+            # would misprice everything by a factor of the base/USD rate.
+            # Nothing in the deployment configures this today; make the
+            # latent trap explicit (2026-11-23 review P3).
+            logger.warning(
+                "FxService base_currency=%r is not USD: USD-per-unit outputs "
+                "are NOT actually USD-per-unit", self._base,
+            )
         self._ttl = ttl_seconds
         self._enabled = enabled
         # currency -> units per USD
@@ -77,6 +100,16 @@ class FxService:
                     continue
                 per_usd = self._fetch(currency)
                 if per_usd and per_usd > 0:
+                    band = _SANITY_BAND_PER_USD.get(currency)
+                    if band and not (band[0] <= per_usd <= band[1]):
+                        # A live rate outside the regime band is more likely a
+                        # parser/upstream artefact than a real move; refuse it
+                        # rather than misprice every converted position.
+                        logger.error(
+                            "FX rate for %s outside sanity band %s: %s — keeping previous",
+                            currency, band, per_usd,
+                        )
+                        continue
                     fresh[currency] = per_usd
                     ok += 1
             if ok:
@@ -104,7 +137,12 @@ class FxService:
 
     # -- public API --------------------------------------------------------
     def usd_per_unit(self, currency: str) -> float:
-        """Convert 1 unit of ``currency`` into USD (non-blocking)."""
+        """Convert 1 unit of ``currency`` into USD (non-blocking).
+
+        An unknown currency falls back to parity 1.0 — a wrong rate is worse
+        than a missing one, so at least make the fallback loud (throttled to
+        one warning per currency per process, 2026-11-23 review P3).
+        """
         currency = (currency or self._base).upper()
         if currency == self._base:
             return 1.0
@@ -113,6 +151,9 @@ class FxService:
             per_usd = self._rates.get(currency)
         if per_usd and per_usd > 0:
             return 1.0 / per_usd
+        if currency not in _UNWARNED_CURRENCIES:
+            _UNWARNED_CURRENCIES.add(currency)
+            logger.warning("FX parity fallback (1.0) for unknown currency %s", currency)
         return 1.0
 
     def convert(self, amount: float, currency: str) -> float:

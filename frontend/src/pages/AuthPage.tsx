@@ -16,11 +16,6 @@ export const AuthPage: React.FC = () => {
 
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [systemCheck, setSystemCheck] = useState({
-    ws: 'pending',
-    engine: 'pending',
-    security: 'pending',
-  });
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -30,18 +25,9 @@ export const AuthPage: React.FC = () => {
     }
   }, [isAuthenticated, navigate]);
 
-  // Simulate system checks on mount
-  useEffect(() => {
-    const runChecks = async () => {
-      await new Promise(r => setTimeout(r, 600));
-      setSystemCheck(prev => ({ ...prev, ws: 'ok' }));
-      await new Promise(r => setTimeout(r, 400));
-      setSystemCheck(prev => ({ ...prev, engine: 'ok' }));
-      await new Promise(r => setTimeout(r, 500));
-      setSystemCheck(prev => ({ ...prev, security: 'ok' }));
-    };
-    runChecks();
-  }, []);
+  // (2026-11-23 review P3) 登录页的 "Real-Time Engine Status" 状态灯是纯
+  // 定时伪造的（注释自称 "Simulate system checks"），连同 systemCheck
+  // state、样式与移动端同款指示灯一并删除——登录页不造假探测。
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -153,56 +139,12 @@ export const AuthPage: React.FC = () => {
                 <span>TOKEN AUTH</span>
               </div>
             </div>
-            
-            <div className={styles.systemStatus}>
-              <div className={styles.statusHeader}>
-                <Icon name="activity" size="xs" />
-                <span>Real-Time Engine Status</span>
-              </div>
-              <div className={styles.statusGrid}>
-                <div className={styles.statusItem}>
-                  <span className={`${styles.dot} ${styles[systemCheck.ws]}`} />
-                  <div className={styles.statusInfo}>
-                    <span className={styles.statusLabel}>WebSocket</span>
-                    <span className={styles.statusValue}>{systemCheck.ws === 'ok' ? 'Connected' : '...'}</span>
-                  </div>
-                </div>
-                <div className={styles.statusItem}>
-                  <span className={`${styles.dot} ${styles[systemCheck.engine]}`} />
-                  <div className={styles.statusInfo}>
-                    <span className={styles.statusLabel}>Matching</span>
-                    <span className={styles.statusValue}>{systemCheck.engine === 'ok' ? 'Active' : '...'}</span>
-                  </div>
-                </div>
-                <div className={styles.statusItem}>
-                  <span className={`${styles.dot} ${styles[systemCheck.security]}`} />
-                  <div className={styles.statusInfo}>
-                    <span className={styles.statusLabel}>Security</span>
-                    <span className={styles.statusValue}>{systemCheck.security === 'ok' ? 'Active' : '...'}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
-        {/* Mobile Footer - Compact System Status & Security */}
+        {/* Mobile Footer - Security & Language */}
         {isMobile && (
           <div className={styles.mobileFooter}>
-            <div className={styles.mobileSystemStatus}>
-              <div className={styles.mobileStatusItem}>
-                <span className={`${styles.mobileStatusDot} ${systemCheck.ws === 'ok' ? styles.ok : systemCheck.ws === 'pending' ? styles.pending : ''}`} />
-                <span>WS</span>
-              </div>
-              <div className={styles.mobileStatusItem}>
-                <span className={`${styles.mobileStatusDot} ${systemCheck.engine === 'ok' ? styles.ok : systemCheck.engine === 'pending' ? styles.pending : ''}`} />
-                <span>Engine</span>
-              </div>
-              <div className={styles.mobileStatusItem}>
-                <span className={`${styles.mobileStatusDot} ${systemCheck.security === 'ok' ? styles.ok : systemCheck.security === 'pending' ? styles.pending : ''}`} />
-                <span>Security</span>
-              </div>
-            </div>
             <div className={styles.mobileSecurityBadges}>
               <div className={styles.mobileSecurityBadge}>
                 <Icon name="shield-check" size="xs" />

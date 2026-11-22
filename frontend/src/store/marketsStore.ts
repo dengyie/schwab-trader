@@ -134,6 +134,8 @@ interface MarketsState {
 
   loadMarkets: () => Promise<void>;
   setActiveMarket: (code: MarketCode) => void;
+  /** 登出清理（2026-11-23 review P3）：市场注册表/汇率回到未加载态。 */
+  reset: () => void;
 
   marketOf: (symbol: string) => MarketDef | undefined;
   currencyOf: (symbol: string) => string;
@@ -187,6 +189,15 @@ export const useMarketsStore = create<MarketsState>()(
       },
 
       setActiveMarket: (code) => set({ activeMarket: code }),
+
+      // (2026-11-23 review P3) 登出清理：注册表/汇率回未加载态，persist 的
+      // partialize 只存 activeMarket，set 即同步写回。
+      reset: () => set({
+        markets: [],
+        fxRates: { USD: 1.0 },
+        activeMarket: 'US',
+        status: 'idle',
+      }),
 
       marketOf: (symbol) => {
         const { markets } = get();

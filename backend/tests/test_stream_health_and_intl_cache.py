@@ -548,3 +548,23 @@ def test_us_stream_health_reports_deep_hist_error_stats(monkeypatch):
     stats = feed.stream_health()["daily_fallback"]
     assert stats["last_error"] and "dataset unreachable" in stats["last_error"]
     assert stats["cached_symbols"] == 0, "failures must not cache frames"
+
+
+def test_intl_empty_page_cools_down_instead_of_caching_terminal_edge(yahoo, monkeypatch):
+    """2026-11-23 review P2-8 (ported from the US 2026-11-14 fix): Yahoo's
+    coverage edge slides with `now` and a 429 masquerades as an empty body,
+    so an empty page is NOT a trustworthy terminal edge — the intl path used
+    to cache the emptiness for the full 7-day segment TTL, stranding HK/JP
+    charts at the seed edge for a week."""
+    feed = yahoo(cache_dir=None)
+    monkeypatch.setattr(YahooFinanceAdapter, "fetch_bars", staticmethod(lambda *a, **k: []))
+    before = int(time.time())
+    bars, _fetched, has_more = feed.get_historical_segment(
+        "0700.HK", timeframe="15m", before=before
+    )
+    assert bars == []
+    assert has_more is False
+    seg_tf = feed._bar_cache.hist_timeframe("15m", before)
+    assert feed._bar_cache.is_cooling("0700.HK", seg_tf) is True
+    # No terminal empty segment may sit in the cache for this key.
+    assert feed._bar_cache.get("0700.HK", seg_tf) is None

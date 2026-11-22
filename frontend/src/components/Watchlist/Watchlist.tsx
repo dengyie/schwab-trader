@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useEffect, useState } from 'react';
+import { useCallback, useMemo, useRef, useEffect, useState, memo } from 'react';
 import { 
   useWatchlistStore, 
   selectFilteredSymbols, 
@@ -66,7 +66,7 @@ interface WatchlistItemProps {
   isCollapsed?: boolean;
 }
 
-function WatchlistItem({ 
+const WatchlistItem = memo(function WatchlistItem({ 
   symbol, 
   isSelected, 
   isFavorite,
@@ -185,7 +185,19 @@ function WatchlistItem({
       )}
     </div>
   );
-}
+}, (prev, next) => {
+  // Re-render only when something visible changed: the parent re-renders on
+  // every quote batch, but item props are primitives + row objects whose
+  // identity only moves when content moves (2026-11-23 review P2).
+  return (
+    prev.symbol === next.symbol &&
+    prev.isSelected === next.isSelected &&
+    prev.isFavorite === next.isFavorite &&
+    prev.isPinned === next.isPinned &&
+    prev.position === next.position &&
+    prev.isCollapsed === next.isCollapsed
+  );
+});
 
 interface WatchlistProps {
   onSymbolChange?: (symbol: string) => void;
@@ -284,13 +296,16 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
         const data = await response.json();
 
         const rows: Record<string, { price: number; changePct: number; currency?: string; isStale?: boolean }> = {};
+        const priceRows: Record<string, { price: string; priceChange24h?: number }> = {};
         for (const ticker of data) {
           const price = parseFloat(ticker.price) || 0;
           const changePct = parseFloat(ticker.priceChangePercent) || 0;
           rows[ticker.symbol] = { price, changePct, currency: ticker.currency, isStale: ticker.isStale === true };
-          // 同步本地 watchlist 的价格（供收藏/持仓徽标使用）
-          updateSymbolPrice(ticker.symbol, price ? String(price) : '0', changePct);
+          // 同步本地 watchlist 的价格（供收藏/持仓徽标使用）——整批一次写入
+          // (2026-11-23 review P2：逐行 setState 让组件每轮 N 次重渲染)
+          priceRows[ticker.symbol] = { price: price ? String(price) : '0', priceChange24h: changePct };
         }
+        updateSymbolPrices(priceRows);
         if (isSubscribed) setCatalogTickers(rows);
       } catch (err) {
         console.error('Failed to fetch prices:', err);
@@ -334,6 +349,7 @@ export function Watchlist({ onSymbolChange, isCollapsed = false, compact: _compa
     toggleFavorite,
     togglePinned,
     addSymbol,
+    updateSymbolPrices,
   } = useWatchlistStore();
 
   // 选中当前市场的第一个标的，确保切市场后图表/下单不会指向空符号。

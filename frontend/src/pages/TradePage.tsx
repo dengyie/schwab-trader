@@ -30,7 +30,7 @@ const ResizeHandle = ({ orientation = 'horizontal' }: { orientation?: 'horizonta
 
 export function TradePage() {
   const isMobile = useIsMobile();
-  const orderBook = useMarketStore(selectOrderBook);
+
   const subscribe = useMarketStore((state) => state.subscribe);
   const unsubscribe = useMarketStore((state) => state.unsubscribe);
   const evaluateOrderTriggers = useTradingStore((state) => state.evaluateOrderTriggers);
@@ -56,10 +56,19 @@ export function TradePage() {
   }, [selectedSymbol, subscribe, unsubscribe]);
 
   useEffect(() => {
-    if (orderBook) {
-      evaluateOrderTriggers(orderBook);
-    }
-  }, [orderBook, evaluateOrderTriggers]);
+    // Drive conditional-order evaluation via an imperative store subscribe:
+    // the old `useMarketStore(selectOrderBook)` hook re-rendered this whole
+    // tree (Watchlist / PriceChart / OrderEntry included) on EVERY book tick
+    // just to call one callback (2026-11-23 review P2-12). The selector
+    // subscription re-runs the callback without a render; triggerRunner's
+    // app-level subscription already covers page-hidden cases.
+    return useMarketStore.subscribe(
+      (state) => state.orderBook,
+      (orderBook) => {
+        if (orderBook) evaluateOrderTriggers(orderBook);
+      }
+    );
+  }, [evaluateOrderTriggers]);
 
   // Render mobile layout
   if (isMobile) {

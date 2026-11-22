@@ -44,7 +44,6 @@ import {
   type BackendPosition,
 } from './trading/reconcile';
 import {
-  evaluatePositionTpsl,
   evaluateTrailingStop,
   getDefaultTriggerDirection,
   isConditionalOrder,
@@ -65,7 +64,7 @@ interface TradingState {
   // Advanced order operations
   createStopLimitOrder: (params: CreateStopLimitParams) => CreateOrderResult;
   createTakeProfitLimitOrder: (params: CreateTakeProfitLimitParams) => CreateOrderResult;
-  createOCOOrder: (params: CreateOCOParams) => OCOOrder | null;
+  createOCOOrder: (params: CreateOCOParams) => OCOOrder | OrderBlock | null;
   createTrailingStopOrder: (params: CreateTrailingStopParams) => CreateOrderResult;
   cancelOCOOrder: (ocoGroupId: string) => Promise<boolean>;
 
@@ -74,7 +73,6 @@ interface TradingState {
 
   // Position management
   setFocusMode: (enabled: boolean) => void;
-  updatePositionTPSL: (symbol: string, takeProfitPrice?: string, stopLossPrice?: string) => void;
   resetAccount: () => Promise<void>;
   clearLocalState: () => void;
   syncPositionsFromBackend: (backendPositions: Record<string, BackendPosition>) => void;
@@ -93,9 +91,11 @@ interface TradingState {
 export type OrderBlockReason =
   | 'data_confidence'
   | 'invalid_quantity'
+  | 'invalid_params'
   | 'missing_price'
   | 'missing_trigger'
-  | 'lot_floor_zero';
+  | 'lot_floor_zero'
+  | 'markets_loading';
 
 export interface OrderBlock {
   blocked: OrderBlockReason;
@@ -230,6 +230,91 @@ function marketOf(symbol: string): string {
   return marketCodeOfSymbol(symbol, useMarketsStore.getState().markets);
 }
 
+/**
+ * Order-level TP/SL collected by the order entry forms, keyed by the
+ * submitting order's client id. The backend /orders contract has no TP/SL
+ * fields (2026-11-23 review P1: the values used to be stored on the local
+ * row and never read again — a silent fake protection), so on the order's
+ * FILL we convert them into automation triggers, the same mechanism the
+ * position panel's TPSLForm uses. Cleared on terminal non-fill states.
+ */
+const pendingTpslByOrderId = new Map<string, { takeProfitPrice?: string; stopLossPrice?: string }>();
+
+function createTpslTriggersFromFill(order: PaperOrder): void {
+  const entry = pendingTpslByOrderId.get(order.clientOrderId);
+  if (!entry) return;
+  pendingTpslByOrderId.delete(order.clientOrderId);
+
+  // Dynamic import: automationStore has module-level store subscriptions and
+  // imports tradingStore itself — a static import here would make the two
+  // modules evaluate each other mid-initialization (vitest caught it as a
+  // ReferenceError at tradingStore.ts:8).
+  void import('./automationStore').then(({ useAutomationStore }) => {
+  const automation = useAutomationStore.getState();
+  const tpId = uuidv4();
+  const slId = uuidv4();
+
+  if (entry.takeProfitPrice) {
+    automation.addTrigger({
+      id: tpId,
+      symbol: order.symbol,
+      type: 'takeProfit',
+      enabled: true,
+      condition: {
+        priceSource: 'last',
+        operator: 'gte',
+        threshold: entry.takeProfitPrice,
+        direction: 'up',
+        debounceMs: 1000,
+        cooldownMs: 60000,
+      },
+      action: {
+        type: 'order',
+        side: 'sell',
+        orderType: 'market',
+        quantityMode: 'percent',
+        quantityValue: '100',
+      },
+      allowDegraded: false,
+      repeat: false,
+      linkedTriggerId: entry.stopLossPrice ? slId : undefined,
+    });
+  }
+
+  if (entry.stopLossPrice) {
+    automation.addTrigger({
+      id: slId,
+      symbol: order.symbol,
+      type: 'stopLoss',
+      enabled: true,
+      condition: {
+        priceSource: 'last',
+        operator: 'lte',
+        threshold: entry.stopLossPrice,
+        direction: 'down',
+        debounceMs: 1000,
+        cooldownMs: 60000,
+      },
+      action: {
+        type: 'order',
+        side: 'sell',
+        orderType: 'market',
+        quantityMode: 'percent',
+        quantityValue: '100',
+      },
+      allowDegraded: false,
+      repeat: false,
+      linkedTriggerId: entry.takeProfitPrice ? tpId : undefined,
+    });
+  }
+
+  notification.info(
+    `order:tpsl-armed:${order.clientOrderId}`,
+    `TP/SL armed on fill: ${order.symbol} (protection triggers created)`,
+  );
+  });
+}
+
 export const useTradingStore = create<TradingState>()(
   subscribeWithSelector(
     persist(
@@ -246,6 +331,18 @@ export const useTradingStore = create<TradingState>()(
 
         const markRejected = (clientOrderId: string, reason: string) => {
           updateOrder(clientOrderId, { status: 'rejected', rejectReason: reason });
+          // OCO sibling cascade: one leg rejected at the venue must not
+          // leave the other leg running alone with the group still showing
+          // active (2026-11-23 review P2). cancelRecord's own cascade is
+          // suppressed — the initiating leg is already terminal.
+          const rejected = get().orders.find((o) => o.clientOrderId === clientOrderId);
+          if (rejected?.isOcoOrder && rejected.ocoLinkedOrderId) {
+            const sibling = get().orders.find((candidate) => (
+              candidate.clientOrderId === rejected.ocoLinkedOrderId &&
+              CANCELLABLE_STATUSES.includes(candidate.status)
+            ));
+            if (sibling) void cancelRecord(sibling, false);
+          }
         };
 
         const syncOcoGroups = () => {
@@ -304,6 +401,16 @@ export const useTradingStore = create<TradingState>()(
               backendId,
               status: status && status !== 'pending' ? status : 'open',
             });
+
+            // Arm the fill-linked TP/SL watch (2026-11-23 review P1): only
+            // once the venue accepted the order — a rejected submission
+            // must not leave protection triggers behind.
+            if (order.takeProfitPrice || order.stopLossPrice) {
+              pendingTpslByOrderId.set(order.clientOrderId, {
+                takeProfitPrice: order.takeProfitPrice,
+                stopLossPrice: order.stopLossPrice,
+              });
+            }
 
             // The broker moved cash or positions; pull the authoritative view.
             void useWalletStore.getState().fetchPortfolio();
@@ -445,21 +552,6 @@ export const useTradingStore = create<TradingState>()(
           }
         };
 
-        const checkPositionTpsl = (symbol: string, midPrice: string) => {
-          const position = get().positions.get(symbol);
-          if (!position) return;
-          const trigger = evaluatePositionTpsl(position, midPrice);
-          if (!trigger) return;
-
-          // Clear the local targets first so a rapid tick cannot fire twice.
-          get().updatePositionTPSL(symbol, undefined, undefined);
-          notification.info(
-            `order:tpsl:${symbol}`,
-            `${trigger === 'take_profit' ? 'Take profit' : 'Stop loss'} triggered: ${symbol}`
-          );
-          get().createOrder({ symbol, side: 'sell', type: 'market', quantity: position.quantity }, midPrice);
-        };
-
         return {
           orders: [],
           ocoOrders: [],
@@ -479,12 +571,34 @@ export const useTradingStore = create<TradingState>()(
               return { blocked: 'data_confidence' };
             }
 
-            if (!quantity || parseFloat(quantity) <= 0) return { blocked: 'invalid_quantity' };
+            // Number.isFinite guards: parseFloat("1e999") is Infinity and
+            // parseFloat("abc") is NaN — both used to pass every `<= 0`
+            // check, serialize to JSON null and die as a backend 422 AFTER
+            // the UI had toasted "submitted" (2026-11-23 review P2).
+            const qtyNum = parseFloat(quantity);
+            if (!quantity || !Number.isFinite(qtyNum) || qtyNum <= 0 || qtyNum > 1e9) {
+              return { blocked: 'invalid_quantity' };
+            }
 
             const needsLimitPrice = ['limit', 'stop_limit', 'take_profit_limit'].includes(type);
             const needsTriggerPrice = isConditionalOrder(type);
-            if (needsLimitPrice && (!price || parseFloat(price) <= 0)) return { blocked: 'missing_price' };
-            if (needsTriggerPrice && (!triggerPrice || parseFloat(triggerPrice) <= 0)) return { blocked: 'missing_trigger' };
+            const priceNum = price ? parseFloat(price) : NaN;
+            if (needsLimitPrice && (!price || !Number.isFinite(priceNum) || priceNum <= 0 || priceNum > 1e9)) {
+              return { blocked: 'missing_price' };
+            }
+            const triggerNum = triggerPrice ? parseFloat(triggerPrice) : NaN;
+            if (needsTriggerPrice && (!triggerPrice || !Number.isFinite(triggerNum) || triggerNum <= 0 || triggerNum > 1e9)) {
+              return { blocked: 'missing_trigger' };
+            }
+
+            // (2026-11-23 review P3) 市场注册表未就绪时，港/日/A 股的每手大小
+            // 与币种会按美股兜底（lot=1 / USD），整手取整和后续定价全错。
+            // 非美股形态的符号（带 .HK/.T/.SS/.SH/.SZ 后缀）直接拦截，等
+            // /api/markets 加载完成再下单；美股符号不受影响。
+            const marketsNow = useMarketsStore.getState();
+            if (marketsNow.markets.length === 0 && marketCodeOfSymbol(symbol, marketsNow.markets) !== 'US') {
+              return { blocked: 'markets_loading' };
+            }
 
             // Every venue trades whole shares; foreign markets add a board
             // lot on top of that. The backend re-validates, this only keeps
@@ -564,16 +678,18 @@ export const useTradingStore = create<TradingState>()(
             const confidence = useMarketStore.getState().dataConfidence;
             if (confidence.level === 'stale' || confidence.level === 'resyncing') {
               notification.error(`order:block:${Date.now()}`, `EXECUTION_BLOCKED: Data Integrity Critical (${confidence.level})`);
-              return null;
+              // (2026-11-23 review P3) 返回结构化拒绝原因而不是 null：旧的
+              // null 让调用方落进"余额不足"分支，把用户引向完全错误的排查方向。
+              return { blocked: 'data_confidence' };
             }
 
             if (!(parseFloat(limitPrice) > 0) || !(parseFloat(stopPrice) > 0) || !(parseFloat(stopLimitPrice) > 0)) {
-              return null;
+              return { blocked: 'invalid_params' };
             }
 
             const lot = Math.max(1, Math.floor(useMarketsStore.getState().lotSizeFor(symbol)));
             const execQuantity = Math.floor(parseFloat(quantity) / lot) * lot;
-            if (!(execQuantity > 0)) return null;
+            if (!(execQuantity > 0)) return { blocked: 'invalid_params' };
 
             // Prices and sizing are validated by the broker when the winning
             // leg triggers; the OCO itself is only a client-side watch.
@@ -765,26 +881,12 @@ export const useTradingStore = create<TradingState>()(
 
             checkConditionalOrders(orderBook.symbol, midPrice, previousPrice);
             updateTrailingStops(orderBook.symbol, midPrice);
-            checkPositionTpsl(orderBook.symbol, midPrice);
+            // (2026-11-23 review P3) checkPositionTpsl 已随 position 级 TP/SL
+            // 机制一并删除：position.takeProfitPrice/stopLossPrice 从未由任何
+            // 存活代码路径写入，保护全部走 automationStore triggers。
           },
 
           setFocusMode: (enabled) => set({ focusMode: enabled }),
-
-          updatePositionTPSL: (symbol, takeProfitPrice, stopLossPrice) => {
-            set((state) => {
-              const newPositions = new Map(state.positions);
-              const position = newPositions.get(symbol);
-              if (position) {
-                newPositions.set(symbol, {
-                  ...position,
-                  takeProfitPrice,
-                  stopLossPrice,
-                  updatedAt: Date.now(),
-                });
-              }
-              return { positions: newPositions };
-            });
-          },
 
           /** Reset the broker account, then drop every local copy of it. */
           resetAccount: async () => {
@@ -858,8 +960,31 @@ export const useTradingStore = create<TradingState>()(
               // Trade statistics are a pure view over these reconciled fills.
               useWalletStore.getState().syncPerformanceFromOrders(get().orders);
 
-            } catch {
-              // Offline or broker hiccup: keep the last known view.
+              // Fill-linked TP/SL (2026-11-23 review P1): a just-filled BUY
+              // whose entry carried TP/SL values now creates the protection
+              // triggers. Entries on terminally-failed orders are dropped.
+              const beforeFilled = new Set(
+                before.filter((o) => o.status === 'filled').map((o) => o.clientOrderId),
+              );
+              for (const order of get().orders) {
+                if (['rejected', 'cancelled', 'expired'].includes(order.status)) {
+                  pendingTpslByOrderId.delete(order.clientOrderId);
+                  continue;
+                }
+                if (
+                  order.status === 'filled' &&
+                  !beforeFilled.has(order.clientOrderId) &&
+                  order.side === 'buy'
+                ) {
+                  createTpslTriggersFromFill(order);
+                }
+              }
+
+            } catch (err) {
+              // Offline or broker hiccup: keep the last known view — but the
+              // failure used to vanish entirely, leaving the terminal on a
+              // stale ledger with no signal (2026-11-23 review P2).
+              console.error('[TradingStore] Order reconcile failed:', err);
             }
           },
 

@@ -316,7 +316,9 @@ export const zhCN = {
     invalidStopLimitPrice: '止损限价无效',
     invalidTrailingValue: '跟踪值无效',
     insufficientBalance: '余额不足',
+    tpslArmsOnFill: 'TP/SL 将在订单成交后自动生效',
     resyncingBlock: '行情同步中，下单暂被阻止，请稍后重试',
+    marketsLoading: '市场列表加载中，请稍后重试',
     venueMirrorHint: '已同步至券商委托，7×24 监控（GTC 长期有效）',
     localMirrorHint: '跟踪止损在本机评估执行',
     // 多市场

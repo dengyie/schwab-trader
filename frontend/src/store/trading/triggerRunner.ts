@@ -47,9 +47,9 @@ export function hasLiveRiskOrders(): boolean {
     if (armedConditional && (order.status === 'open' || order.status === 'triggered')) return true;
     if (order.status === 'pending') return true; // submit in flight
   }
-  for (const position of trading.positions.values()) {
-    if (position.takeProfitPrice || position.stopLossPrice) return true;
-  }
+  // (2026-11-23 review P3) position 级 TP/SL 分支已随该机制删除：position 上
+  // 的 takeProfitPrice/stopLossPrice 没有任何存活写入路径，保护全部走
+  // automationStore triggers（其 armed/blocked 状态在下方统计）。
   const automation = useAutomationStore.getState();
   return automation.triggers.some(
     (t) => t.status === 'armed' || t.status === 'blocked'
@@ -57,10 +57,10 @@ export function hasLiveRiskOrders(): boolean {
 }
 
 /**
- * Symbols whose risk state is evaluated ONLY on this client (position
- * TP/SL, non-mirrored conditional orders). Mirrored orders are absent —
- * the venue owns them. These need synthetic book evaluation when they are
- * not the active feed symbol.
+ * Symbols whose risk state is evaluated ONLY on this client (non-mirrored
+ * conditional orders). Mirrored orders are absent — the venue owns them.
+ * These need synthetic book evaluation when they are not the active feed
+ * symbol.
  */
 function collectLocalRiskSymbols(): Set<string> {
   const trading = useTradingStore.getState();
@@ -70,9 +70,6 @@ function collectLocalRiskSymbols(): Set<string> {
     if (order.status !== 'open' || order.isTriggered) continue;
     if (isConditionalOrder(order.type)) symbols.add(order.symbol);
     else if (order.isOcoOrder && order.type === 'limit' && order.price) symbols.add(order.symbol);
-  }
-  for (const [symbol, position] of trading.positions) {
-    if (position.takeProfitPrice || position.stopLossPrice) symbols.add(symbol);
   }
   return symbols;
 }

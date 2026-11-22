@@ -130,6 +130,7 @@ class BarCache:
                 self._directory = None
         if self._directory is not None:
             self._prune_disk()
+            self._prune_orphan_tmp_files()
 
     # -- keys ------------------------------------------------------------
     @staticmethod
@@ -334,9 +335,17 @@ class BarCache:
             self._cooldown_until[self._key(symbol, timeframe)] = time.time() + seconds
 
     def is_cooling(self, symbol: str, timeframe: str) -> bool:
+        key = self._key(symbol, timeframe)
         with self._lock:
-            until = self._cooldown_until.get(self._key(symbol, timeframe), 0.0)
-            return time.time() < until
+            until = self._cooldown_until.get(key, 0.0)
+            if time.time() < until:
+                return True
+            # Expired entries used to stay forever; the walker emits a new
+            # cursor key per failure (sym:tf#h<epoch>), so the dict grew
+            # without bound over months (2026-11-23 review P3).
+            if key in self._cooldown_until:
+                self._cooldown_until.pop(key, None)
+            return False
 
     # -- disk ------------------------------------------------------------
     def _write_to_disk(self, symbol: str, timeframe: str, bars: List[Bar], ts: float) -> None:
@@ -464,6 +473,24 @@ class BarCache:
             self._order.move_to_end(key)
             self._evict_locked()
         return CacheEntry(bars=bars, fetched_at=ts)
+
+    def _prune_orphan_tmp_files(self) -> None:
+        """Remove `.pid.tmp` leftovers from a crash mid-atomic-replace.
+
+        Prune only ever globbed `*.json`, so every deploy whose pid differed
+        from the crashed writer's left one more orphan behind, accumulating
+        forever (2026-11-23 review P3).
+        """
+        if self._directory is None:
+            return
+        try:
+            for path in self._directory.glob("*.tmp"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    continue
+        except OSError:
+            pass
 
     def _prune_disk(self) -> None:
         if self._directory is None:

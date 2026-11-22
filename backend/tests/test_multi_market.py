@@ -1044,3 +1044,21 @@ class TestRouterReset:
         router = MarketRouterBroker(us_broker=engine, other_broker=engine)
         router.reset(50000.0)
         assert engine.get_portfolio().initial_capital == pytest.approx(50000.0)
+
+def test_fx_fallback_cny_is_current_era():
+    """2026-11-23 review P2: the old 6.667 fallback was a 2021-era rate and
+    mispriced every CNY position by ~7% whenever FX refresh was disabled or
+    failing. Pin the fallback near the managed-float band."""
+    from app.engine.fx_service import _FALLBACK_PER_USD
+    assert 7.0 <= _FALLBACK_PER_USD["CNY"] <= 7.4
+
+
+def test_fx_refresh_rejects_out_of_band_rate(monkeypatch):
+    """A live refresh outside the sanity regime is refused, not applied:
+    a parser artefact must not misprice every converted position."""
+    from app.engine.fx_service import FxService
+
+    svc = FxService(ttl_seconds=0, enabled=True)
+    monkeypatch.setattr(svc, "_fetch", lambda c: 999.0 if c == "JPY" else None)
+    svc._refresh_worker()
+    assert svc._rates["JPY"] == 158.4  # fallback survived the absurd print

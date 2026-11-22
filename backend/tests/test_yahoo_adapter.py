@@ -51,6 +51,30 @@ def test_yahoo_aggregate_bars_4h_aligned_to_session_open():
     assert b3.volume == 900.0
 
 
+def test_yahoo_aggregate_bars_4h_survives_a_dropped_bar():
+    """2026-11-23 review P2: the old sequence-based bucketing shifted EVERY
+    later bucket of the day after one dropped bar — a dropped 10:30 made
+    bucket0 span 09:30-13:30 and cascaded the rest. Time-anchored bucketing
+    (fetch_bars passes the market session open) contains the damage to its
+    own bucket."""
+    t = _et_ts(2026, 11, 2, 9, 30)
+    bars = [
+        Bar(time=t + 0 * 3600, open=100.0, high=105.0, low=99.0, close=104.0, volume=1000.0),
+        # 10:30 print missing (Yahoo null)
+        Bar(time=t + 2 * 3600, open=107.0, high=109.0, low=106.0, close=108.0, volume=800.0),
+        Bar(time=t + 3 * 3600, open=108.0, high=110.0, low=107.0, close=109.5, volume=1200.0),
+        Bar(time=t + 4 * 3600, open=110.0, high=112.0, low=109.0, close=111.0, volume=2000.0),
+    ]
+    aggregated = YahooFinanceAdapter._aggregate_bars(
+        bars, bucket_seconds=14400, session_open_seconds=9 * 3600 + 30 * 60,
+    )
+    assert len(aggregated) == 2
+    assert aggregated[0].time == t
+    assert aggregated[0].volume == 3000.0  # 09:30/11:30/12:30 in bucket 0
+    assert aggregated[1].time == t + 4 * 3600  # 13:30 starts bucket 1 on TIME
+    assert aggregated[1].volume == 2000.0
+
+
 def test_yahoo_client_lifecycle():
     client1 = YahooFinanceAdapter.get_client()
     assert client1 is not None

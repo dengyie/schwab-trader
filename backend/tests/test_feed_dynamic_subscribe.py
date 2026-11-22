@@ -275,3 +275,39 @@ def test_pending_changes_survive_until_loop_starts():
         return items
 
     assert asyncio.run(drain()) == [("remove", "ANT")]
+
+
+def test_targeted_daily_stats_warm_bypasses_the_global_gate():
+    """2026-11-23 review P2-2: activate() promises a background daily-context
+    warm, but refresh_daily_stats gated it on the GLOBAL snapshot timestamp —
+    the boot sweep starts that clock, so the new symbol's warm-up no-opped
+    for up to SNAPSHOT_TTL_CLOSED (1h) and its quote stayed range-less. The
+    targeted path must gate per symbol and must not advance the global clock.
+    """
+    import threading
+    import time
+
+    feed = AlpacaMarketFeedService.__new__(AlpacaMarketFeedService)
+    feed.daily_stats = {}
+    feed._snapshot_ts = time.time()  # boot sweep just ran
+    feed._snapshot_lock = threading.Lock()
+    feed._sub_control_lock = threading.Lock()
+    feed.symbols = {"SPY", "QQQ"}
+    feed._per_symbol_warm_ts = {}
+    calls = []
+    feed._refresh_consolidated_daily = lambda syms: calls.append(list(syms)) or []
+    feed._refresh_alpaca_snapshots = lambda missing: None
+    feed._save_daily_stats_snapshot = lambda: None
+
+    # Targeted warm reaches upstream despite the fresh global snapshot.
+    feed.refresh_daily_stats(["NVDA"])
+    assert calls == [["NVDA"]]
+
+    # Repeats within the TTL are deduped per symbol.
+    feed.refresh_daily_stats(["NVDA"])
+    assert calls == [["NVDA"]]
+
+    # A full sweep still respects the global gate (and a targeted call never
+    # advanced it).
+    feed.refresh_daily_stats()
+    assert calls == [["NVDA"]]

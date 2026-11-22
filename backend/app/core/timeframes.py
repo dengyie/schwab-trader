@@ -75,7 +75,14 @@ MAX_HIST_SEGMENTS_PER_KEY = 3
 # per session, so a smaller page is plenty; minute buckets fall back to
 # HIST_SEGMENT_BARS). Shared by the Yahoo and Alpaca feeds — this is the
 # paging contract, not a per-feed preference.
+# 1h/4h carry their own page sizes: a 366-day page holds ~1200-1800 1h bars
+# on real venues — under the 2000 default, so the length-only has_more check
+# answered "no more" on the FIRST page and charts stopped at ~546d while the
+# contract promises 730d (2026-11-23 review). Size each page to its
+# venue-realistic fill so a full page reliably means "history continues".
 HIST_PAGE_BARS: Dict[str, int] = {
+    "1h": 800,
+    "4h": 300,
     "1d": HIST_SEGMENT_BARS_DAILY,
     "1wk": HIST_SEGMENT_BARS_DAILY,
     "1mo": HIST_SEGMENT_BARS_DAILY,

@@ -3,6 +3,7 @@ import { useTradingStore } from '../store/tradingStore';
 import { useAutomationStore } from '../store/automationStore';
 import { useI18n } from '../i18n';
 import { useMarketsStore } from '../store/marketsStore';
+import { usdValue } from '../utils/money';
 import { Icon, IconName } from '../components/Icon';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import { MobileOrdersPage } from './mobile';
@@ -440,26 +441,15 @@ function OrderDetailDrawer({
 // 性能分析面板
 function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fill: PaperOrder['fills'][0]; order: PaperOrder }[] }) {
   const fxRates = useMarketsStore((state) => state.fxRates);
-  const usdPerUnit = (currency?: string) => {
-    const code = (currency || 'USD').toUpperCase();
-    const rate = fxRates[code];
-    if (typeof rate === 'number' && rate > 0) return rate;
-    // A missing rate for a non-USD currency must not silently price the
-    // fill 1:1 (2026-11-16 review): the fallback map only carries USD, so
-    // anything else is "unknown" and the aggregate reports it as such.
-    return code === 'USD' ? 1 : NaN;
-  };
-  // Each fill is priced in its venue's currency; account totals are reported in
-  // the base currency, so convert per fill instead of adding HKD to USD.
-  // NaN for an unknown rate propagates into every aggregate and turns the
-  // totals into "NaN" — exclude those fills instead (2026-11-16 review).
-  const usdValue = (fill: PaperOrder['fills'][0]) => {
-    const v = parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
+  // (2026-11-23 review P2-4) FX 换算统一走共享 money.usdValue：缺汇率的
+  // 非 USD 币种返回 NaN，聚合前过滤，不再各自维护 1:1 兜底逻辑。
+  const fillUsd = (fill: PaperOrder['fills'][0]): number | null => {
+    const v = usdValue(parseFloat(fill.price) * parseFloat(fill.quantity), fill.feeAsset, fxRates);
     return Number.isFinite(v) ? v : null;
   };
   // 计算各种统计数据
   const filledOrders = orders.filter(o => o.status === 'filled');
-  
+
   // 按交易对分组
   const bySymbol = useMemo(() => {
     const map = new Map<string, { volume: number; trades: number; fees: number; currency: string; usdVolume: number }>();
@@ -467,7 +457,7 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
       const currency = (fill.feeAsset || order.currency || 'USD').toUpperCase();
       const current = map.get(order.symbol) || { volume: 0, trades: 0, fees: 0, currency, usdVolume: 0 };
       current.volume += parseFloat(fill.price) * parseFloat(fill.quantity);
-      current.usdVolume += usdValue(fill) ?? 0;
+      current.usdVolume += fillUsd(fill) ?? 0;
       current.trades += 1;
       current.fees += parseFloat(fill.fee);
       map.set(order.symbol, current);
@@ -481,23 +471,27 @@ function AnalyticsPanel({ orders, trades }: { orders: PaperOrder[]; trades: { fi
     trades.forEach(({ fill }) => {
       const date = new Date(fill.time).toLocaleDateString('en-CA'); // YYYY-MM-DD format
       const current = map.get(date) || { volume: 0, trades: 0 };
-      current.volume += usdValue(fill) ?? 0;
+      current.volume += fillUsd(fill) ?? 0;
       current.trades += 1;
       map.set(date, current);
     });
     return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0])).slice(-7);
   }, [trades, fxRates]);
 
-  const totalVolume = trades.reduce((sum, { fill }) => 
-    sum + (usdValue(fill) ?? 0), 0);
+  const totalVolume = trades.reduce((sum, { fill }) =>
+    sum + (fillUsd(fill) ?? 0), 0);
+  // 手续费与成交额同币种（feeAsset），缺汇率的条目不计入而不是显示 NaN。
   const totalFees = trades.reduce(
-    (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
+    (sum, { fill }) => {
+      const feeUsd = usdValue(parseFloat(fill.fee), fill.feeAsset, fxRates);
+      return sum + (Number.isFinite(feeUsd) ? feeUsd : 0);
+    }, 0);
   const avgOrderSize = trades.length > 0 ? totalVolume / trades.length : 0;
-  
+
   // 买卖比例
   const buyVolume = trades
     .filter(({ order }) => order.side === 'buy')
-    .reduce((sum, { fill }) => sum + (usdValue(fill) ?? 0), 0);
+    .reduce((sum, { fill }) => sum + (fillUsd(fill) ?? 0), 0);
   const sellVolume = totalVolume - buyVolume;
   const buyRatio = totalVolume > 0 ? (buyVolume / totalVolume) * 100 : 50;
 
@@ -641,16 +635,6 @@ export function OrdersPage() {
   const currencyOf = useMarketsStore((state) => state.currencyOf);
   const fxRates = useMarketsStore((state) => state.fxRates);
 
-  const usdPerUnit = (currency?: string) => {
-    const code = (currency || 'USD').toUpperCase();
-    const rate = fxRates[code];
-    if (typeof rate === 'number' && rate > 0) return rate;
-    // A missing rate for a non-USD currency must not silently price the
-    // fill 1:1 (2026-11-16 review): the fallback map only carries USD, so
-    // anything else is "unknown" and the aggregate reports it as such.
-    return code === 'USD' ? 1 : NaN;
-  };
-
   // 时间过滤
   const filterByTime = useCallback((timestamp: number) => {
     if (timeFilter === 'all') return true;
@@ -702,29 +686,37 @@ export function OrdersPage() {
   const stats = useMemo(() => {
     const filled = orders.filter(o => o.status === 'filled').length;
     const totalTrades = allTrades.length;
-    // Prices are venue-currency; totals are converted to the USD base currency.
-    const usdValue = (fill: PaperOrder['fills'][0]) =>
-      parseFloat(fill.price) * parseFloat(fill.quantity) * usdPerUnit(fill.feeAsset);
-    const totalVolume = allTrades.reduce((sum, { fill }) => 
-      sum + (usdValue(fill) ?? 0), 0);
+    // (2026-11-23 review P2-4) Prices are venue-currency; totals convert to
+    // the USD base via the shared money.usdValue helper. A missing rate
+    // returns NaN and the accumulation filters it out — the old `?? 0`
+    // never caught NaN, so one unpriced fill silently poisoned the totals.
+    const fillUsd = (fill: PaperOrder['fills'][0]): number => {
+      const v = usdValue(parseFloat(fill.price) * parseFloat(fill.quantity), fill.feeAsset, fxRates);
+      return Number.isFinite(v) ? v : 0;
+    };
+    const totalVolume = allTrades.reduce((sum, { fill }) =>
+      sum + fillUsd(fill), 0);
     const totalFees = allTrades.reduce(
-      (sum, { fill }) => sum + parseFloat(fill.fee) * usdPerUnit(fill.feeAsset), 0);
+      (sum, { fill }) => {
+        const feeUsd = usdValue(parseFloat(fill.fee), fill.feeAsset, fxRates);
+        return sum + (Number.isFinite(feeUsd) ? feeUsd : 0);
+      }, 0);
     // Averaging raw venue-currency prices across markets mixed HKD/JPY/CNY
     // into one number (2026-11-16 review). Convert each fill to USD first;
     // fills with an unknown rate are excluded rather than mispriced.
     const usdPriced = allTrades
-      .map(({ fill }) => parseFloat(fill.price) * usdPerUnit(fill.feeAsset))
+      .map(({ fill }) => usdValue(parseFloat(fill.price), fill.feeAsset, fxRates))
       .filter((v) => Number.isFinite(v));
     const avgFillPrice = usdPriced.length > 0
       ? usdPriced.reduce((sum, v) => sum + v, 0) / usdPriced.length
       : 0;
-    
+
     // 最近一小时交易量
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
     const recentTrades = allTrades.filter(({ fill }) => fill.time > oneHourAgo);
-    const recentVolume = recentTrades.reduce((sum, { fill }) => 
-      sum + (usdValue(fill) ?? 0), 0);
-    
+    const recentVolume = recentTrades.reduce((sum, { fill }) =>
+      sum + fillUsd(fill), 0);
+
     // 每日交易量趋势
     const dailyVolumes: number[] = [];
     for (let i = 6; i >= 0; i--) {
@@ -733,10 +725,10 @@ export function OrdersPage() {
       dayStart.setHours(0, 0, 0, 0);
       const dayEnd = new Date(dayStart);
       dayEnd.setDate(dayEnd.getDate() + 1);
-      
+
       const dayVolume = allTrades
         .filter(({ fill }) => fill.time >= dayStart.getTime() && fill.time < dayEnd.getTime())
-        .reduce((sum, { fill }) => sum + (usdValue(fill) ?? 0), 0);
+        .reduce((sum, { fill }) => sum + fillUsd(fill), 0);
       dailyVolumes.push(dayVolume);
     }
 
@@ -756,6 +748,40 @@ export function OrdersPage() {
   const handleCancel = (clientOrderId: string) => {
     cancelOrder(clientOrderId);
   };
+
+  // (2026-11-23 review P3) Export 按钮此前没有 onClick，是死按钮。生成当前
+  // 订单台账的 CSV 并触发下载；\uFEFF BOM 头保证 Excel 打开时中文不乱码。
+  const handleExportCsv = useCallback(() => {
+    const header = [
+      'clientOrderId', 'backendId', 'symbol', 'side', 'type', 'status',
+      'quantity', 'price', 'avgPrice', 'filledQty', 'createdAt',
+    ];
+    const escapeCell = (value: unknown): string =>
+      `"${(value === null || value === undefined ? '' : String(value)).replace(/"/g, '""')}"`;
+    const rows = orders.map((o) => [
+      o.clientOrderId,
+      o.backendId ?? '',
+      o.symbol,
+      o.side,
+      o.type,
+      o.status,
+      o.quantity,
+      o.price ?? '',
+      o.avgPrice ?? '',
+      o.filledQty,
+      new Date(o.createdAt).toISOString(),
+    ]);
+    const csv = '\uFEFF' + [header, ...rows]
+      .map((row) => row.map(escapeCell).join(','))
+      .join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `orders-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [orders]);
 
   // Branch only after every hook above has run. Returning the mobile layout
   // earlier changed the hook count when the viewport crossed the breakpoint
@@ -777,7 +803,7 @@ export function OrdersPage() {
             <span className={styles.simulatedBadge}>Paper Trading</span>
           </div>
           <div className={styles.headerActions}>
-            <button className={styles.exportBtn}>
+            <button className={styles.exportBtn} onClick={handleExportCsv}>
               <Icon name="download" size="sm" />
               Export
             </button>

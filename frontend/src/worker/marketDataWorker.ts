@@ -77,7 +77,10 @@ let messageTimestamps: number[] = [];
 
 // 延迟计算：滑动平均
 let latencyHistory: number[] = [];
-const MAX_LATENCY_SAMPLES = 20;
+const MAX_LATENCY_SAMPLES = 50;
+// (2026-11-23 review P2-7) 最近一次 PING/PONG RTT。此前 latencyHistory 全
+// 文件无 push，CONNECTION_STATUS 的 latencyMs 恒为 0——整条延迟链路是死的。
+let lastRttMs = 0;
 
 // ===== 网络健康监测 =====
 const MAX_NETWORK_EVENTS = 50;
@@ -259,7 +262,9 @@ function sendConnectionStatus(): void {
   
   sendMessage<ConnectionStatusPayload>('CONNECTION_STATUS', {
     state: connectionState,
-    latencyMs: avgLatency,
+    // (2026-11-23 review P2-7) latencyMs 取最近一次 PING/PONG RTT（此前恒
+    // 0）；滑动平均仍供延迟飙升检测与健康评分使用。
+    latencyMs: lastRttMs,
     lastMessageTime: lastMessageTime > 0 ? Date.now() - (now - lastMessageTime) : 0,
     reconnectCount: reconnectAttempts,
     gapCount,
@@ -346,7 +351,8 @@ async function connect(symbol: string): Promise<void> {
   lastReconnectAttemptTime = 0;
   messageTimestamps = [];
   latencyHistory = [];
-  
+  lastRttMs = 0; // (2026-11-23 review P2-7) 重置时清掉最近 RTT
+
   // 启动重连监控器
   startReconnectMonitor();
   
@@ -574,7 +580,9 @@ function handleMessage(data: unknown): void {
           localReceiveTime: performance.now(),
         };
         tradeBatch.push(trade);
-        sendTradeBatch();
+        // (2026-11-23 review P3) 不在此处立即 flush：100ms 批处理定时器负责
+        // 发送（sendTradeBatch 自带空批守卫）。旧的逐笔立即发送让定时器
+        // 永远只发得出空批，批处理形同虚设。
       }
     }
     return;
@@ -602,6 +610,19 @@ function handleMessage(data: unknown): void {
   }
 
   if (msg.type === 'PONG') {
+    // (2026-11-23 review P2-7) RTT 采样：后端把 PING 帧携带的 ts 原样带回，
+    // 以 Date.now() 粗粒度计算往返耗时；负值/超时样本视为无效丢弃。
+    const ts = Number(msg.ts);
+    if (Number.isFinite(ts) && ts > 0) {
+      const rtt = Date.now() - ts;
+      if (rtt >= 0 && rtt < 60000) {
+        lastRttMs = rtt;
+        latencyHistory.push(rtt);
+        if (latencyHistory.length > MAX_LATENCY_SAMPLES) latencyHistory.shift();
+        allLatencySamples.push(rtt);
+        if (allLatencySamples.length > MAX_ALL_LATENCY_SAMPLES) allLatencySamples.shift();
+      }
+    }
     return;
   }
 }
@@ -727,6 +748,7 @@ async function reconnectWithRetainedData(symbol: string): Promise<void> {
   lastMessageTime = 0;
   messageTimestamps = [];
   latencyHistory = [];
+  lastRttMs = 0; // (2026-11-23 review P2-7)
   
   sendConnectionStatus();
   
@@ -843,7 +865,9 @@ function startHeartbeat(): void {
   heartbeatTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(JSON.stringify({ action: 'PING' }));
+        // (2026-11-23 review P2-7) PING 携带发送时间戳，后端 PONG 原样带回
+        // 用于 RTT 采样（见 handleMessage 的 PONG 分支）。
+        ws.send(JSON.stringify({ action: 'PING', ts: Date.now() }));
       } catch {}
       const timeSinceLastMessage = performance.now() - lastMessageTime;
       
@@ -966,9 +990,10 @@ function disconnect(): void {
   lastReconnectAttemptTime = 0;
   messageTimestamps = [];
   latencyHistory = [];
-  
+  lastRttMs = 0; // (2026-11-23 review P2-7)
+
   sendConnectionStatus();
-  
+
   log('info', 'ws', 'ws.manual_disconnect', {});
 }
 

@@ -9,7 +9,6 @@ from typing import Optional, List
 class Settings(BaseModel):
     app_name: str = "Schwab & Alpaca Trader Hub"
     version: str = "1.1.0"
-    debug: bool = True
     port: int = 8000
     host: str = "127.0.0.1"
 
@@ -37,7 +36,10 @@ class Settings(BaseModel):
     schwab_app_key: Optional[str] = Field(default_factory=lambda: os.getenv("SCHWAB_APP_KEY"))
     schwab_app_secret: Optional[str] = Field(default_factory=lambda: os.getenv("SCHWAB_APP_SECRET"))
     schwab_callback_url: str = "https://127.0.0.1:8182/"
-    schwab_token_path: str = "token.json"
+    # Relative-CWD default used to drop token.json into whatever directory
+    # the process started in — including the source tree, where it risked a
+    # git commit. Anchor it to the state dir instead (2026-11-23 review).
+    schwab_token_path: str = "~/.schwab-trader/token.json"
 
     # Access control for the trading API. The single-user terminal requires
     # the token entered in the browser (or a server-issued session cookie)

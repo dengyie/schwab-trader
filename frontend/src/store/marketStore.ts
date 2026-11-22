@@ -20,7 +20,7 @@ import { useI18n } from '../i18n';
 import { formatMessage } from '../i18n';
 import { useWalletStore } from './walletStore';
 import { useTradingStore } from './tradingStore';
-import { getToken, clearToken, createPolledGetter } from '../services/apiClient';
+import { getToken, clearToken, createPolledGetter, apiJson } from '../services/apiClient';
 
 // ===== Store State =====
 interface MarketState {
@@ -276,54 +276,40 @@ export function calculateConfidence(
 }
 
 export const useMarketStore = create<MarketState>()(
-  subscribeWithSelector((set, get) => ({
-    // Initial state
-    connectionStatus: initialConnectionStatus,
-    dataConfidence: getInitialDataConfidence(),
-    marketClock: null,
-    activeSymbol: null,
-    networkHealth: null,
-    orderBook: null,
-    metrics: null,
-    recentTrades: [],
-    latestTrade: null,
-    latestBar: null,
-    logs: [],
-    worker: null,
+  subscribeWithSelector((set, get) => {
+    /**
+     * (2026-11-23 review P3) worker 创建逻辑提取为内部函数：onerror 把
+     * worker 引用置空后，下次 subscribe 通过这里重建，而不是永远拿着一个
+     * 死掉的 worker。
+     */
+    const createWorker = (): Worker | null => {
+      try {
+        const worker = new Worker(
+          new URL('../worker/marketDataWorker.ts', import.meta.url),
+          { type: 'module' }
+        );
 
-    // Subscribe to a symbol
-    subscribe: (symbol: string) => {
-      let { worker } = get();
+        worker.onerror = (error) => {
+          console.error('Worker error:', error);
+          const t = useI18n.getState().t;
+          // 脚本级错误后 terminate 并置空引用：引用留着，worker 若仍在
+          // 运行会继续向 store 推送陈旧消息；置空让下次 subscribe 重建。
+          worker.terminate();
+          set({
+            worker: null,
+            connectionStatus: {
+              ...get().connectionStatus,
+              state: 'disconnected',
+            },
+            dataConfidence: {
+              ...get().dataConfidence,
+              level: 'stale',
+              reason: t.dataConfidence.workerInitFailed,
+            },
+          });
+        };
 
-      // Record the selection immediately: in-flight messages for the previous
-      // symbol must be identifiable even if the worker itself fails to start.
-      set({ activeSymbol: symbol });
-
-      // Create worker if not exists
-      if (!worker) {
-        try {
-          worker = new Worker(
-            new URL('../worker/marketDataWorker.ts', import.meta.url),
-            { type: 'module' }
-          );
-
-          worker.onerror = (error) => {
-            console.error('Worker error:', error);
-            const t = useI18n.getState().t;
-            set({
-              connectionStatus: {
-                ...get().connectionStatus,
-                state: 'disconnected',
-              },
-              dataConfidence: {
-                ...get().dataConfidence,
-                level: 'stale',
-                reason: t.dataConfidence.workerInitFailed,
-              },
-            });
-          };
-
-          worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+        worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
             const { type, payload } = event.data;
             const state = get();
 
@@ -438,131 +424,181 @@ export const useMarketStore = create<MarketState>()(
           };
 
           set({ worker });
-        } catch (err) {
-          console.error('Failed to create Worker:', err);
-          const t = useI18n.getState().t;
-          set({
-            connectionStatus: {
-              ...initialConnectionStatus,
-              state: 'disconnected',
-            },
-            dataConfidence: {
-              ...getInitialDataConfidence(),
-              level: 'stale',
-              reason: t.dataConfidence.workerCreateFailed,
-            },
-          });
-          return;
-        }
+        return worker;
+      } catch (err) {
+        console.error('Failed to create Worker:', err);
+        const t = useI18n.getState().t;
+        set({
+          connectionStatus: {
+            ...initialConnectionStatus,
+            state: 'disconnected',
+          },
+          dataConfidence: {
+            ...getInitialDataConfidence(),
+            level: 'stale',
+            reason: t.dataConfidence.workerCreateFailed,
+          },
+        });
+        return null;
       }
+    };
 
-      // Send subscribe message
-      worker.postMessage({
-        type: 'SUBSCRIBE',
-        payload: { symbol, streams: ['depth', 'trade'], token: getToken() },
-        timestamp: performance.now(),
-      });
+    return {
+      // Initial state
+      connectionStatus: initialConnectionStatus,
+      dataConfidence: getInitialDataConfidence(),
+      marketClock: null,
+      activeSymbol: null,
+      networkHealth: null,
+      orderBook: null,
+      metrics: null,
+      recentTrades: [],
+      latestTrade: null,
+      latestBar: null,
+      logs: [],
+      worker: null,
 
-      // 重置滞后计数器
-      consecutiveLevelCounts = {
-        live: 0,
-        degraded: 0,
-        resyncing: 0,
-        stale: 0,
-        closed: 0,
-      };
+      // Subscribe to a symbol
+      subscribe: (symbol: string) => {
+        let { worker } = get();
 
-      // Reset state
-      const t = useI18n.getState().t;
-      const marketClock = get().marketClock;
-      set({
-        orderBook: null,
-        metrics: null,
-        recentTrades: [],
-        latestTrade: null,
-        connectionStatus: {
-          ...initialConnectionStatus,
-          state: 'connecting',
-        },
-        dataConfidence: {
-          ...getInitialDataConfidence(),
-          level: marketClock?.is_open === false ? 'closed' : 'stale',
-          reason: marketClock?.is_open === false
-            ? t.dataConfidence.marketClosed
-            : t.dataConfidence.establishingConnection,
-        },
-      });
-    },
+        // Record the selection immediately: in-flight messages for the previous
+        // symbol must be identifiable even if the worker itself fails to start.
+        set({ activeSymbol: symbol });
 
-    // Unsubscribe
-    unsubscribe: () => {
-      const { worker } = get();
-      
-      if (worker) {
+        // (2026-11-23 review P3) worker 未创建或已被 onerror 置空时在此重建，
+        // 旧实现一旦出错永远是同一个死 worker。
+        if (!worker) {
+          worker = createWorker();
+          if (!worker) return;
+        }
+
+        // Send subscribe message
         worker.postMessage({
-          type: 'UNSUBSCRIBE',
-          payload: {},
+          type: 'SUBSCRIBE',
+          payload: { symbol, streams: ['depth', 'trade'], token: getToken() },
           timestamp: performance.now(),
         });
-      }
 
-      set({
-        activeSymbol: null,
-        orderBook: null,
-        metrics: null,
-        recentTrades: [],
-        latestTrade: null,
-        connectionStatus: initialConnectionStatus,
-        dataConfidence: getInitialDataConfidence(),
-        networkHealth: null,
-      });
-    },
+        // 重置滞后计数器
+        consecutiveLevelCounts = {
+          live: 0,
+          degraded: 0,
+          resyncing: 0,
+          stale: 0,
+          closed: 0,
+        };
 
-    // 后台标签页降载：连接掐掉但 activeSymbol 保留（UI 仍显示当前标的），
-    // 置信度标 closed——这是"用户不在看"，不是"喂流坏了"。
-    pauseFeed: () => {
-      const { worker } = get();
-      if (worker && get().activeSymbol) {
-        worker.postMessage({ type: 'PAUSE', payload: {}, timestamp: performance.now() });
-      }
-    },
+        // Reset state
+        const t = useI18n.getState().t;
+        const marketClock = get().marketClock;
+        set({
+          orderBook: null,
+          metrics: null,
+          recentTrades: [],
+          latestTrade: null,
+          connectionStatus: {
+            ...initialConnectionStatus,
+            state: 'connecting',
+          },
+          dataConfidence: {
+            ...getInitialDataConfidence(),
+            level: marketClock?.is_open === false ? 'closed' : 'stale',
+            reason: marketClock?.is_open === false
+              ? t.dataConfidence.marketClosed
+              : t.dataConfidence.establishingConnection,
+          },
+        });
+      },
 
-    resumeFeed: () => {
-      const { worker, activeSymbol } = get();
-      if (worker && activeSymbol) {
-        worker.postMessage({ type: 'RESUME', payload: {}, timestamp: performance.now() });
-      }
-    },
+      // Unsubscribe
+      unsubscribe: () => {
+        const { worker } = get();
 
-    // Clear logs
-    clearLogs: () => {
-      set({ logs: [] });
-    },
+        if (worker) {
+          worker.postMessage({
+            type: 'UNSUBSCRIBE',
+            payload: {},
+            timestamp: performance.now(),
+          });
+        }
 
-    /**
-     * Poll the broker session clock. Cheap (30s cache on the backend side too),
-     * but it decides whether "no ticks" means "market closed" or "feed broken".
-     * A failed fetch keeps the previous answer: an unknown clock must not
-     * silently relabel a closed market as degraded.
-     */
-    fetchMarketClock: async () => {
-      const clock = await getMarketClock();
-      if (!clock || clock.is_open === null) return;
-      if (get().marketClock?.is_open === clock.is_open) return;
+        set({
+          activeSymbol: null,
+          orderBook: null,
+          metrics: null,
+          recentTrades: [],
+          latestTrade: null,
+          connectionStatus: initialConnectionStatus,
+          dataConfidence: getInitialDataConfidence(),
+          networkHealth: null,
+        });
+      },
 
-      set({ marketClock: clock });
-      // Session state changed: recompute confidence immediately instead of
-      // waiting for the next heartbeat.
-      set((state) => ({
-        dataConfidence: calculateConfidence(
-          state.connectionStatus,
-          state.orderBook,
-          state.dataConfidence,
-          clock
-        ),
-      }));
-    },
-  }))
+      // 后台标签页降载：连接掐掉但 activeSymbol 保留（UI 仍显示当前标的），
+      // 置信度标 closed——这是"用户不在看"，不是"喂流坏了"。
+      pauseFeed: () => {
+        const { worker } = get();
+        if (worker && get().activeSymbol) {
+          worker.postMessage({ type: 'PAUSE', payload: {}, timestamp: performance.now() });
+        }
+      },
+
+      resumeFeed: () => {
+        const { worker, activeSymbol } = get();
+        if (worker && activeSymbol) {
+          worker.postMessage({ type: 'RESUME', payload: {}, timestamp: performance.now() });
+        }
+      },
+
+      // Clear logs
+      clearLogs: () => {
+        set({ logs: [] });
+      },
+
+      /**
+       * Poll the broker session clock. Cheap (30s cache on the backend side too),
+       * but it decides whether "no ticks" means "market closed" or "feed broken".
+       * A failed fetch keeps the previous answer: an unknown clock must not
+       * silently relabel a closed market as degraded.
+       */
+      fetchMarketClock: async () => {
+        // Symbol-aware session clock (2026-11-23 review P1): the polled getter
+        // hit /market/clock WITHOUT a market param, so the backend always
+        // answered with the US clock — while viewing 0700.HK the whole app was
+        // told "market closed" during the HK session, confidence went 'closed'
+        // and every automation gate blocked. Route the poll at the ACTIVE
+        // symbol's market (the backend derives the market from the symbol).
+        const active = get().activeSymbol;
+        const wantsUs = !active;
+        const url = wantsUs ? '/market/clock' : `/market/clock?symbol=${encodeURIComponent(active)}`;
+        let clock: MarketClock | null = null;
+        if (wantsUs) {
+          clock = await getMarketClock();
+        } else {
+          try {
+            clock = await apiJson<MarketClock>(url);
+          } catch {
+            clock = null;
+          }
+        }
+        if (!clock || clock.is_open === null) return;
+        if (get().marketClock?.is_open === clock.is_open) return;
+
+        set({ marketClock: clock });
+        // Session state changed: recompute confidence immediately instead of
+        // waiting for the next heartbeat.
+        set((state) => ({
+          dataConfidence: calculateConfidence(
+            state.connectionStatus,
+            state.orderBook,
+            state.dataConfidence,
+            clock
+          ),
+        }));
+      },
+    };
+  })
 );
 
 // ===== Selectors =====

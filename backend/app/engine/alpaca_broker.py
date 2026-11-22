@@ -136,7 +136,10 @@ class AlpacaPaperBroker(BaseBroker):
                 return [o.model_copy(deep=True) for o in self.cached_orders.values()]
 
         try:
-            resp = self.client.get(f"{self.base_url}/orders", params={"status": "all", "limit": 50})
+            resp = self.client.get(f"{self.base_url}/orders", params={"status": "all", "limit": 500})
+            # 500 is the venue maximum: at 50, the 60s-window client reconcile
+            # treated every older fill as nonexistent and DELETEd the local
+            # rows — history vanished past 50 orders (2026-11-23 review).
             resp.raise_for_status()
             orders_data = resp.json()
             domain_orders = [AlpacaDataAdapter.parse_order_to_domain(o) for o in orders_data]
@@ -322,12 +325,21 @@ class AlpacaPaperBroker(BaseBroker):
         return []
 
     def reset(self, initial_capital: float = 100000.0) -> None:
-        """Cancel all open orders and close positions via Alpaca REST."""
+        """Cancel all open orders and close positions via Alpaca REST.
+
+        A venue-side failure must not look like a successful wipe: the old
+        bare `except: pass` cleared the LOCAL book while venue orders could
+        still fill, silently desyncing the two ledgers (2026-11-23 review).
+        """
+        import logging as _logging
         try:
             self.client.delete(f"{self.base_url}/orders")
             self.client.delete(f"{self.base_url}/positions")
-        except Exception:
-            pass
+        except Exception as exc:
+            _logging.getLogger(__name__).error(
+                "Alpaca reset could not wipe venue orders/positions: %s — "
+                "the venue book may still hold live state", exc,
+            )
         with self._state_lock:
             self.cached_orders.clear()
             self.cached_portfolio = None

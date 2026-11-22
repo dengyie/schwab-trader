@@ -74,6 +74,9 @@ _SCAN_TIMEOUT_SECONDS = 30.0
 _ET = ZoneInfo("America/New_York")
 
 _cache_lock = threading.Lock()
+# Serialises duckdb execute+fetchall on the implicit default connection —
+# see _load_daily_bars for the cross-symbol result-binding race.
+_duckdb_query_lock = threading.Lock()
 _frame_cache: Dict[str, Tuple[float, List[Bar]]] = {}
 _cooldown: Dict[str, float] = {}
 _last_error: str = ""
@@ -116,21 +119,31 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
 
     Raises on upstream failure so the caller can distinguish "no such symbol"
     (empty list) from "cannot reach the dataset" (exception + cooldown).
+
+    duckdb's module-level ``execute``/``fetchall`` pair is stateful on the
+    implicit default connection: between the two calls, "last result" is
+    connection-global. Two scanner threads running concurrently (the bounded
+    scan below deliberately runs outside the cache lock) could interleave
+    ``execute(A) → execute(B) → fetchall()`` and hand symbol A symbol B's
+    rows — which then live in the 24h frame cache (2026-11-23 review P1).
+    Serialising the query+fetch pair makes the result binding exclusive;
+    scans remain concurrent with cache reads, which never touch duckdb.
     """
     # Imported lazily: duckdb is a heavy binary wheel and the fallback must
     # not tax boot or the test loop for work most sessions never do.
     import duckdb
 
     sym = symbol.upper()
-    rows = duckdb.execute(
-        f"""
-        SELECT report_date, open, high, low, close, volume
-        FROM '{_DATASET_URL}'
-        WHERE symbol = ?
-        ORDER BY report_date
-        """,
-        [sym],
-    ).fetchall()
+    with _duckdb_query_lock:
+        rows = duckdb.execute(
+            f"""
+            SELECT report_date, open, high, low, close, volume
+            FROM '{_DATASET_URL}'
+            WHERE symbol = ?
+            ORDER BY report_date
+            """,
+            [sym],
+        ).fetchall()
     return _rows_to_bars(rows)
 
 
@@ -195,6 +208,9 @@ def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
         if len(_frame_cache) > _MAX_CACHED_SYMBOLS:
             oldest = min(_frame_cache, key=lambda k: _frame_cache[k][0])
             _frame_cache.pop(oldest, None)
+        # A stale last_error from a previous transient failure must not
+        # outlive the success that contradicts it (2026-11-23 review P3).
+        _last_error = ""
     return list(all_bars), time.time()
 
 

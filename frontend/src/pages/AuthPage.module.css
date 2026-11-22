@@ -349,120 +349,12 @@
   color: var(--success-500);
 }
 
-.systemStatus {
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 16px;
-  padding: var(--space-4);
-}
+/* (2026-11-23 review P3) 伪造的 "Real-Time Engine Status" 状态灯区块连同
+   systemStatus / statusHeader / dot / mobileStatusDot 等样式一并删除。 */
 
-.statusHeader {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  font-size: 11px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.5);
-  margin-bottom: var(--space-4);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.statusGrid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: var(--space-4);
-}
-
-.statusItem {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--danger-500);
-  flex-shrink: 0;
-}
-
-.dot.ok {
-  background: var(--success-500);
-  box-shadow: 0 0 8px var(--success-500);
-}
-
-.dot.pending {
-  background: var(--warning-500);
-  animation: blink 1s infinite;
-}
-
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-.statusInfo {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.statusLabel {
-  font-size: 10px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.4);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.statusValue {
-  font-size: 12px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.7);
-}
-
-/* Mobile Footer - System Status & Security */
+/* Mobile Footer - Security & Language */
 .mobileFooter {
   display: none;
-}
-
-.mobileSystemStatus {
-  display: flex;
-  justify-content: center;
-  gap: var(--space-6);
-  margin-bottom: var(--space-4);
-}
-
-.mobileStatusItem {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.mobileStatusDot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--danger-500);
-  animation: pulse 2s infinite;
-}
-
-.mobileStatusDot.ok {
-  background: var(--success-500);
-  animation: none;
-}
-
-.mobileStatusDot.pending {
-  background: var(--warning-500);
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
 }
 
 .mobileSecurityBadges {
@@ -683,11 +575,6 @@
     margin-top: auto;
     padding-top: var(--space-4);
     border-top: 1px solid rgba(255, 255, 255, 0.05);
-  }
-
-  .mobileSystemStatus {
-    gap: var(--space-5);
-    margin-bottom: var(--space-3);
   }
 
   .mobileSecurityBadges {

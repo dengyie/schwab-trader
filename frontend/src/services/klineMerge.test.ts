@@ -63,6 +63,20 @@ describe('keepHistoryAheadOfWindow', () => {
     expect(keepHistoryAheadOfWindow([bar(2100)], freshWindow)).toEqual(freshWindow);
   });
 
+  it('returns the previous reference when the poll is content-identical (chart skip contract)', () => {
+    // 2026-11-23 P2: the 60s poller re-parses the same bars into a NEW
+    // array every cycle; keepHistoryAheadOfWindow must hand back the
+    // ORIGINAL reference so the chart's [klines] effects skip their full
+    // setData + indicator recompute. A revised middle bar must still be
+    // caught (full OHLCV compare).
+    const prev = [bar(2000), bar(2100), bar(2200)];
+    const same = [bar(2000), bar(2100), bar(2200)];
+    expect(keepHistoryAheadOfWindow(prev, same)).toBe(prev);
+
+    const revised = [bar(2000), { ...bar(2100), close: 999 }, bar(2200)];
+    expect(keepHistoryAheadOfWindow(prev, revised)).not.toBe(prev);
+  });
+
   it('preserves history even when the fresh window is empty (upstream hiccup)', () => {
     // The poller returned an empty body: the paged history must survive,
     // not be wiped by the transient empty response.

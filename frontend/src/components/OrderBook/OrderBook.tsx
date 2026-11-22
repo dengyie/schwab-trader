@@ -57,6 +57,9 @@ function formatPrice(price: string): string {
 
 function formatQuantity(qty: string): string {
   const num = parseFloat(qty);
+  // (2026-11-23 review P3) 数量缺失/为 0 时显示 '—'：worker 不再伪造 1 手，
+  // 未知数量如实显示为空位而不是一手假挂单。
+  if (!Number.isFinite(num) || num <= 0) return '—';
   if (num >= 1000) return num.toFixed(2);
   if (num >= 1) return num.toFixed(4);
   return num.toFixed(5);

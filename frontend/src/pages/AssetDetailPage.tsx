@@ -11,7 +11,7 @@ import { useMarketStore, selectMarketClock } from '../store/marketStore';
 import { useI18n } from '../i18n';
 import { Icon, IconName } from '../components/Icon';
 import { Sparkline } from '../components/Chart/Sparkline';
-import { formatMoney } from '../utils/money';
+import { formatMoney, usdValue } from '../utils/money';
 import { apiFetch } from '../services/apiClient';
 import type { Position } from '../types/trading';
 import styles from './AssetDetailPage.module.css';
@@ -564,10 +564,15 @@ export function AssetDetailPage() {
     return () => { cancelled = true; };
   }, [equityLoading, equityHistory, timeRange]);
 
-  const usdPerUnit = useCallback(
-    (currency?: string) => fxRates[(currency || 'USD').toUpperCase()] ?? 1,
-    [fxRates],
-  );
+  // (2026-11-23 review P2-4) 缺汇率的非 USD 币种返回 NaN，绝不静默按 1:1
+  // 定价（旧 `?? 1` 把已修过的 1:1 bug 又引入回来）。累加/展示处用
+  // Number.isFinite 过滤，未定价金额按 0 计并退出聚合。
+  const usdPerUnit = useCallback((currency?: string) => {
+    const code = (currency || 'USD').toUpperCase();
+    const rate = fxRates[code];
+    if (typeof rate === 'number' && rate > 0) return rate;
+    return code === 'USD' ? 1 : NaN;
+  }, [fxRates]);
 
   // Helper to get position
   const getPosition = useCallback((symbol: string) => {
@@ -626,7 +631,10 @@ export function AssetDetailPage() {
       const qty = new Decimal(pos.quantity || 0);
       if (!qty.gt(0)) continue;
       const currency = (pos.currency || 'USD').toUpperCase();
-      const fx = usdPerUnit(currency);
+      // (2026-11-23 review P2-4) 缺汇率的持仓按"未定价"处理（0 参与 USD
+      // 聚合），NaN 会污染 totals 的逐行累加；券商快照自带 USD 值时不受影响。
+      const fxRaw = usdPerUnit(currency);
+      const fx = Number.isFinite(fxRaw) ? new Decimal(fxRaw) : new Decimal(0);
       const priceNative = new Decimal(pos.currentPrice || pos.avgEntryPrice || 0);
       const avgNative = new Decimal(pos.avgEntryPrice || 0);
       const valueUsd = pos.marketValueUsd
@@ -744,8 +752,14 @@ export function AssetDetailPage() {
       .flatMap(o => o.fills.map(f => ({ fill: f, currency: o.currency })))
       .filter(({ fill }) => fill.time > oneDayAgo)
       .reduce((sum, { fill, currency }) => {
-        const fx = currency ? usdPerUnit(currency) : 1;
-        return sum + parseFloat(fill.price) * parseFloat(fill.quantity) * fx;
+        // (2026-11-23 review P2-4) 换算走共享 money.usdValue：缺汇率的成交
+        // 得到 NaN，按"未定价"过滤（计 0），绝不按 1:1 折算进 USD 成交额。
+        const v = usdValue(
+          parseFloat(fill.price) * parseFloat(fill.quantity),
+          currency,
+          fxRates,
+        );
+        return sum + (Number.isFinite(v) ? v : 0);
       }, 0);
     
     // Win rate is account-level FIFO over closed lots (performanceMetrics), and
@@ -771,7 +785,7 @@ export function AssetDetailPage() {
       hasClosedTrades,
       bestAsset,
     };
-  }, [orders, triggers, positionList, assetList, getPosition, usdPerUnit, performanceMetrics]);
+  }, [orders, triggers, positionList, assetList, getPosition, fxRates, performanceMetrics]);
 
   // Recent activity
   const recentActivity = useMemo(() => {

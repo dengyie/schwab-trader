@@ -2,12 +2,15 @@
 Alpaca Data and Trading Protocol Adapter.
 Translates Alpaca REST and WebSocket streaming messages into internal domain models.
 """
+import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from app.models.trading import (
     Quote, Bar, Trade, Order, OrderSide, OrderType, OrderStatus, TimeInForce,
     Portfolio, Position, utc_now
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_alpaca_timestamp(ts_val: Any) -> datetime:
@@ -43,12 +46,22 @@ def _parse_alpaca_timestamp(ts_val: Any) -> datetime:
                 frac, tz = frac_and_tz.split("+")
                 frac = frac[:6].ljust(6, "0")
                 clean_str = f"{sec}.{frac}+{tz}"
+            elif "-" in frac_and_tz:
+                # Symmetric with the "+" branch: a negative UTC offset
+                # (Alpaca does not send it today, but a naive downstream
+                # proxy might) used to have its "-05:00" swallowed as
+                # fraction digits and the timestamp silently parsed as UTC
+                # (2026-11-23 review P3).
+                frac, tz = frac_and_tz.split("-", 1)
+                frac = frac[:6].ljust(6, "0")
+                clean_str = f"{sec}.{frac}-{tz}"
             else:
                 frac = frac_and_tz[:6].ljust(6, "0")
                 clean_str = f"{sec}.{frac}"
         try:
             return datetime.fromisoformat(clean_str).astimezone(timezone.utc)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Unparseable Alpaca timestamp %r: %s — using now()", ts_val, exc)
             return utc_now()
     return utc_now()
 
@@ -122,23 +135,6 @@ class AlpacaDataAdapter:
                 volume=volume,
                 timestamp=ts
             )
-        except Exception:
-            return None
-
-    @staticmethod
-    def parse_stream_trade(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Parses Alpaca IEX/SIP stream trade message (T='t').
-        Example:
-        {"T": "t", "S": "SPY", "p": 753.49, "s": 100, "t": "2026-11-02T19:48:19Z"}
-        """
-        try:
-            return {
-                "symbol": item.get("S", "").upper(),
-                "price": float(item.get("p", 0.0)),
-                "size": int(item.get("s", 0)),
-                "timestamp": _parse_alpaca_timestamp(item.get("t"))
-            }
         except Exception:
             return None
 
@@ -310,7 +306,19 @@ class AlpacaDataAdapter:
         """
         Maps Alpaca /v2/account and /v2/positions to unified domain Portfolio model.
         """
-        cash = float(account_json.get("cash", 100000.0))
+        raw_cash = account_json.get("cash")
+        if raw_cash is None:
+            # A missing cash field used to fabricate a $100,000 balance out of
+            # thin air — an error page or partial response would have looked
+            # like a funded account (2026-11-23 review P2). Fail loudly; the
+            # broker layer falls back to the last known-good snapshot.
+            raise ValueError(
+                "Alpaca account payload missing 'cash' field — not fabricating a balance"
+            )
+        try:
+            cash = float(raw_cash)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Alpaca account 'cash' is not numeric: {raw_cash!r}") from exc
         portfolio = Portfolio(
             cash=round(cash, 2),
             initial_capital=100000.0,
@@ -390,8 +398,16 @@ class AlpacaDataAdapter:
 
         # Venue TIF round-trips (a GTC protective stop must not present
         # itself as DAY); trail distance lands on the domain model so the
-        # UI can show what the venue is actually trailing by.
+        # UI can show what the venue is actually trailing by. An unknown TIF
+        # (IOC/FOK from a future venue change) is logged, not silently
+        # rewritten to DAY — read-side identity matters as much as the
+        # submit-side raise (2026-11-23 review P3).
         tif_str = (order_json.get("time_in_force") or "day").upper()
+        if tif_str not in ("DAY", "GTC", "EXT", "OPG", "CLS"):
+            logger.warning(
+                "Unknown Alpaca time_in_force %r for %s — mapping to DAY",
+                tif_str, order_json.get("symbol"),
+            )
         tif = TimeInForce.GTC if tif_str == "GTC" else (
             TimeInForce.EXT if tif_str == "EXT" else TimeInForce.DAY
         )

@@ -31,9 +31,11 @@ class ModelFeatureExporter:
     def extract_features(bars: List[Bar]) -> Dict[str, List[float]]:
         """
         Calculates core technical factors without heavyweight external C-dependencies:
-        - SMA_20, EMA_12, EMA_26
-        - RSI_14
-        - Volatility (20-period log return std)
+        - closes (raw)
+        - sma_20 (simple mean of the trailing 20 closes)
+        - rsi_14 (Cutler variant: simple means, NOT Wilder-smoothed — consumers
+          comparing against Wilder RSI should expect small deviations)
+        - returns (log returns)
         """
         if not bars:
             return {}
@@ -98,7 +100,13 @@ class ModelFeatureExporter:
         Generates a clean, rich structured observation dictionary for LLM Agent prompt input.
         """
         features = ModelFeatureExporter.extract_features(recent_bars[-30:]) if recent_bars else {}
-        latest_close = recent_bars[-1].close if recent_bars else (quote.last if quote else 0.0)
+        # last == 0 is the adapter's "unknown" sentinel (no IEX print yet):
+        # publishing 0.0 as a price made the Agent read "SPY trades at $0"
+        # (2026-11-23 review). Fall through to the bar close, else None.
+        latest_close = (
+            recent_bars[-1].close if recent_bars
+            else (quote.last if quote and quote.last > 0 else None)
+        )
         latest_rsi = features.get("rsi_14", [-1])[-1] if features.get("rsi_14") else None
         latest_sma = features.get("sma_20", [-1])[-1] if features.get("sma_20") else None
 
@@ -107,7 +115,7 @@ class ModelFeatureExporter:
             "real_time_quote": {
                 "bid": quote.bid if quote else None,
                 "ask": quote.ask if quote else None,
-                "last": quote.last if quote else latest_close,
+                "last": quote.last if quote and quote.last > 0 else latest_close,
                 # No two-sided book means no observable spread. Reporting
                 # 0 - 0 = 0 would read as a perfectly tight market.
                 "spread": (
@@ -124,8 +132,8 @@ class ModelFeatureExporter:
                 "sma_20": latest_sma,
                 "trend": (
                     "BULLISH"
-                    if (latest_sma and latest_close > latest_sma)
-                    else "BEARISH" if (latest_sma and latest_close < latest_sma) else "NEUTRAL"
+                    if (latest_sma and latest_close and latest_close > latest_sma)
+                    else "BEARISH" if (latest_sma and latest_close and latest_close < latest_sma) else "NEUTRAL"
                 )
             },
             "current_position": {

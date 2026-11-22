@@ -317,7 +317,9 @@ export const enUS: Locale = {
     invalidStopLimitPrice: 'Invalid stop limit price',
     invalidTrailingValue: 'Invalid trailing value',
     insufficientBalance: 'Insufficient balance',
+    tpslArmsOnFill: 'TP/SL activates automatically once the order fills',
     resyncingBlock: 'Data feed is resyncing — order blocked, try again in a moment',
+    marketsLoading: 'Market list still loading — retry shortly',
     venueMirrorHint: 'Resting at the broker — monitored 24/7 (GTC)',
     localMirrorHint: 'Trailing stop evaluated on this device',
     // Multi-market

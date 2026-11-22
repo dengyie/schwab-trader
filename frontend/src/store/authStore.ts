@@ -117,6 +117,14 @@ export const useAuthStore = create<AuthState>()(
         import('./notificationStore').then(({ useNotificationStore }) => {
           useNotificationStore.getState().clear();
         });
+        // (2026-11-23 review P3) 自选与市场注册表同样是本浏览器的会话痕迹：
+        // 上一用户的收藏/置顶/市场汇率不应泄漏给下一个登录者。
+        import('./watchlistStore').then(({ useWatchlistStore }) => {
+          useWatchlistStore.getState().reset();
+        });
+        import('./marketsStore').then(({ useMarketsStore }) => {
+          useMarketsStore.getState().reset();
+        });
 
         set({
           user: null,

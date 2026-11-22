@@ -215,8 +215,14 @@ describe('reconcileOrders', () => {
     const merged = reconcileOrders([conditional, ocoLimit, freshPending, stalePending], []);
 
     expect(merged.map((o) => o.clientOrderId).sort()).toEqual(
-      ['auto_1', 'inflight', 'oco_1'].sort()
+      ['auto_1', 'inflight', 'oco_1', 'stale'].sort()
     );
+    // 2026-11-23 P1-3: a grace-expired unsent order must surface as an
+    // explicit rejected record, not vanish silently — the old contract
+    // encoded the exact bug that made triggered stops disappear.
+    const stale = merged.find((o) => o.clientOrderId === 'stale');
+    expect(stale?.status).toBe('rejected');
+    expect(stale?.rejectReason).toContain('never appeared');
   });
 });
 

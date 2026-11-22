@@ -262,10 +262,8 @@ def resolve_symbol(
     if not base:
         return None
 
-    if suffix is not None:
-        market_code = _SUFFIX_MARKET.get(suffix)
-        if market_code is None:
-            return None
+    if suffix is not None and suffix in _SUFFIX_MARKET:
+        market_code = _SUFFIX_MARKET[suffix]
         if not base.isalnum():
             return None
         if market_code == "HK":
@@ -279,6 +277,13 @@ def resolve_symbol(
         if not base.isdigit():
             return None
         return SymbolRef(_canonical_cn(base, suffix), MARKETS.require("CN"))
+    # An unknown suffix ("BRK.B" class-share dots) falls through to the
+    # bare-US shape check below with the full text: Yahoo's own convention
+    # is BRK-B, but users type the dot, and the letters+dots branch was
+    # previously unreachable for dotted input because of the early split
+    # (2026-11-23 review P3). The market hint below still wins for
+    # non-US markets, so "600519" + market=CN is unaffected.
+    base, suffix = text, None
 
     # No suffix: the market hint decides how a numeric code is interpreted.
     hinted = MARKETS.get(market)
@@ -331,13 +336,28 @@ _HK_TICKS: tuple[tuple[float, float], ...] = (
 )
 
 # TSE tick table for domestic common stocks: (upper bound exclusive, tick).
+# Source: JPX "Trading Rules of Domestic Stocks" tick-size table (standard
+# "Other Issues" schedule, jpx.co.jp/english/equities/trading/domestic/07.html).
+# The previous copy drifted above ¥50,000 (50 where the schedule says 100,
+# 100 where 500/1,000 belong, 1,000 above ¥3M vs 5,000/10,000/50,000/100,000),
+# which both rejected legal limit prices for high-priced names and let
+# sub-grid prices into the book (2026-11-23 review P1-6). Note: TOPIX 500 /
+# 1000 constituents trade on finer sub-tables (e.g. ≤¥3,000 → ¥0.5) — the
+# catalog does not carry index membership, so the standard table applies to
+# every JP name for now. JPX moves to a liquidity-based schedule on
+# 2027-03-01: revisit this table then.
 _JP_TICKS: tuple[tuple[float, float], ...] = (
     (3000.0, 1.0),
     (5000.0, 5.0),
     (30000.0, 10.0),
-    (100000.0, 50.0),
-    (3000000.0, 100.0),
-    (float("inf"), 1000.0),
+    (50000.0, 50.0),
+    (300000.0, 100.0),
+    (500000.0, 500.0),
+    (3000000.0, 1000.0),
+    (5000000.0, 5000.0),
+    (30000000.0, 10000.0),
+    (50000000.0, 50000.0),
+    (float("inf"), 100000.0),
 )
 
 

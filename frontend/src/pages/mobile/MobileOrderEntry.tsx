@@ -104,7 +104,10 @@ export function MobileOrderEntry({
       toast.warning(t.dataConfidence?.closedDesc || 'Market closed');
       return;
     }
-    if (!quantity || parseFloat(quantity) <= 0) {
+    // Number.isFinite guards (2026-11-23 review P2): Infinity/NaN slipped
+    // through the `<= 0` checks (same fix as the desktop OrderEntry).
+    const qtyNum = parseFloat(quantity);
+    if (!quantity || !Number.isFinite(qtyNum) || qtyNum <= 0 || qtyNum > 1e9) {
       toast.warning(t.orderEntry?.invalidAmount || 'Invalid amount');
       return;
     }
@@ -116,7 +119,8 @@ export function MobileOrderEntry({
         return;
       }
     }
-    if (type === 'limit' && (!price || parseFloat(price) <= 0)) {
+    const limitNum = price ? parseFloat(price) : NaN;
+    if (type === 'limit' && (!price || !Number.isFinite(limitNum) || limitNum <= 0 || limitNum > 1e9)) {
       toast.warning(t.orderEntry?.invalidPrice || 'Invalid price');
       return;
     }

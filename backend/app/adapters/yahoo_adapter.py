@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple, Dict
 from zoneinfo import ZoneInfo
 import httpx
@@ -285,10 +285,14 @@ class YahooFinanceAdapter:
                 raw_bars.append(
                     Bar(
                         time=int(t),
-                        open=round(float(o), 2),
-                        high=round(float(h), 2),
-                        low=round(float(l), 2),
-                        close=round(float(c), 2),
+                        # 4 decimals, matching the defeatbeta source and the
+                        # sub-penny US tick (0.0001) + HK 0.001 tick: rounding
+                        # Yahoo to 2 places silently mangled sub-dollar and
+                        # low-priced HK names (2026-11-23 review P3).
+                        open=round(float(o), 4),
+                        high=round(float(h), 4),
+                        low=round(float(l), 4),
+                        close=round(float(c), 4),
                         volume=float(v)
                     )
                 )
@@ -299,7 +303,8 @@ class YahooFinanceAdapter:
             # exchange's own session rather than to UTC midnight.
             if tf_key == "4h" and raw_bars:
                 return cls._aggregate_bars(
-                    raw_bars, bucket_seconds=14400, tz=tz or ET
+                    raw_bars, bucket_seconds=14400, tz=tz or ET,
+                    session_open_seconds=cls._market_open_seconds(tz or ET),
                 )
 
             return raw_bars
@@ -343,6 +348,21 @@ class YahooFinanceAdapter:
             return bars
 
         last = bars[-1]
+        # Weekly/monthly spacing (7/30 nominal days vs real calendar weeks and
+        # months, plus DST-shifted weeks) never sits on the naive modulo grid,
+        # so the grid test degenerates to "always off-grid" and a genuine flat
+        # month (suspension) got deleted with it (2026-11-23 review). For
+        # these buckets the precise forming test is temporal: the tail is
+        # forming only while wall-clock time is still inside its bucket.
+        if interval in ("1wk", "1mo"):
+            now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+            forming = last.time + step > now_ts
+            is_flat = (
+                last.open == last.high == last.low == last.close
+            )
+            if forming and is_flat:
+                return bars[:-1]
+            return bars
         if (last.time - bars[-2].time) % step == 0:
             return bars
         if last.open != last.high or last.open != last.low or last.open != last.close:
@@ -351,15 +371,37 @@ class YahooFinanceAdapter:
         return bars[:-1]
 
     @staticmethod
+    def _market_open_seconds(tz: Optional[ZoneInfo]) -> Optional[int]:
+        """Local-midnight offset of the session open for the market whose
+        timezone matches ``tz``; None when no catalog market matches."""
+        try:
+            from app.core.markets import MARKETS
+
+            zone = str(tz)
+            for market in MARKETS.all():
+                if market.timezone == zone and market.sessions:
+                    first = market.sessions[0].start
+                    return first.hour * 3600 + first.minute * 60 + first.second
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def _aggregate_bars(
-        bars: List[Bar], bucket_seconds: int = 14400, tz: Optional[ZoneInfo] = None
+        bars: List[Bar], bucket_seconds: int = 14400, tz: Optional[ZoneInfo] = None,
+        session_open_seconds: Optional[int] = None,
     ) -> List[Bar]:
         """
         Aggregates 1h bars into 4h bars aligned to the exchange's trading day.
 
-        Buckets are anchored to the first traded hour of each local trading day
-        instead of UTC midnight, so candles never merge two trading days and
-        boundary bars line up with the local session open.
+        Buckets are anchored to each bar's local wall clock relative to the
+        session open (when the market is known), not to a running per-day
+        sequence: Yahoo nulls out individual hourly prints routinely, and the
+        old sequence-based bucketing shifted EVERY later bucket of the day
+        after one dropped bar — 10:30 missing turned bucket0 into a 4.5-hour
+        candle (2026-11-23 review). A bar that prints just before the open
+        (auction edges) clamps into the first bucket. Without a known market
+        the day's own sequence is kept as a fallback.
         """
         if not bars:
             return []
@@ -372,10 +414,15 @@ class YahooFinanceAdapter:
         for b in bars:
             dt = datetime.fromtimestamp(b.time, tz=local_tz)
             day_key = dt.strftime("%Y-%m-%d")
-            seq = seq_per_day.get(day_key, 0)
-            bucket_key = f"{day_key}/{seq // bars_per_bucket}"
+            if session_open_seconds is not None:
+                secs = dt.hour * 3600 + dt.minute * 60 + dt.second
+                bucket_idx = max(0, (secs - session_open_seconds) // bucket_seconds)
+                bucket_key = f"{day_key}/{bucket_idx}"
+            else:
+                seq = seq_per_day.get(day_key, 0)
+                bucket_key = f"{day_key}/{seq // bars_per_bucket}"
             buckets.setdefault(bucket_key, []).append(b)
-            seq_per_day[day_key] = seq + 1
+            seq_per_day[day_key] = seq_per_day.get(day_key, 0) + 1
 
         aggregated: List[Bar] = []
         for chunk in buckets.values():

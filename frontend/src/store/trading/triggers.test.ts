@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { PaperOrder, Position } from '../../types/trading';
+import type { PaperOrder } from '../../types/trading';
 import {
-  evaluatePositionTpsl,
   evaluateTrailingStop,
   shouldTriggerConditional,
   shouldTriggerLimit,
@@ -108,25 +107,5 @@ describe('trailing stops', () => {
   });
 });
 
-describe('position TP/SL', () => {
-  const base: Position = {
-    symbol: 'SPY',
-    side: 'long',
-    quantity: '10',
-    avgEntryPrice: '100',
-    unrealizedPnl: '0',
-    realizedPnl: '0',
-    updatedAt: 1,
-  };
-
-  it('detects take profit and stop loss', () => {
-    const position = { ...base, takeProfitPrice: '120', stopLossPrice: '90' };
-    expect(evaluatePositionTpsl(position, '121')).toBe('take_profit');
-    expect(evaluatePositionTpsl(position, '89')).toBe('stop_loss');
-    expect(evaluatePositionTpsl(position, '100')).toBeNull();
-  });
-
-  it('does nothing for a flat or unset position', () => {
-    expect(evaluatePositionTpsl(base, '80')).toBeNull();
-  });
-});
+// (2026-11-23 review P3) 'position TP/SL' 测试块随 evaluatePositionTpsl 一并
+// 删除：position 级 TP/SL 机制已废弃，保护全部走 automationStore triggers。

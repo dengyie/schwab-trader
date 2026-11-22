@@ -12,6 +12,8 @@ function formatPrice(price: number): string {
 }
 
 function formatQuantity(qty: number): string {
+  // (2026-11-23 review P3) 数量缺失/为 0 时显示 '—'：worker 不再伪造 1 手。
+  if (!Number.isFinite(qty) || qty <= 0) return '—';
   if (qty >= 1000) return qty.toFixed(2);
   if (qty >= 1) return qty.toFixed(4);
   return qty.toFixed(5);

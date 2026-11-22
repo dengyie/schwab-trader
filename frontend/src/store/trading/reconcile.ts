@@ -298,6 +298,25 @@ export function reconcileOrders(
     next.push(order);
   }
 
+  // Grace expired without a backend row: the POST never landed. The old code
+  // silently DROPPED these rows — a triggered stop that died with the
+  // connection vanished from the UI after 60s with no terminal state, no
+  // retry and no second notification, while the user believed it was armed
+  // (2026-11-23 review P1-3). Demote to an explicit rejected record so the
+  // failure is visible and actionable.
+  for (const order of previous) {
+    if (order.status !== 'pending') continue;
+    if (order.backendId || isConditionalOrder(order.type)) continue;
+    if (now - order.createdAt < PENDING_SUBMIT_GRACE_MS) continue;
+    if (next.some((candidate) => candidate.clientOrderId === order.clientOrderId)) continue;
+    next.push({
+      ...order,
+      status: 'rejected',
+      rejectReason: 'Submit unconfirmed — connection lost and the order never appeared on the broker',
+      updatedAt: now,
+    });
+  }
+
   return next
     .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
     .slice(0, MAX_ORDERS);
