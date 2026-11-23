@@ -44,6 +44,29 @@ class YahooFinanceAdapter:
 
     _shared_client: Optional[httpx.Client] = None
 
+    _KNOWN_YAHOO_SUFFIXES = {"HK", "T", "SS", "SH", "SZ"}
+
+    @staticmethod
+    def _yahoo_symbol(symbol: str) -> str:
+        """Map a trading symbol to Yahoo's URL convention.
+
+        US class shares are typed with a dot (``BRK.B``) but Yahoo's URL
+        form is ``BRK-B``; the slash legacy form (``RDS/A``) maps the same
+        way. Exchange suffixes Yahoo itself uses (``7203.T``, ``0700.HK``,
+        ``600519.SS``) must survive untouched — a blanket dot-to-dash broke
+        them (caught by test). Without the mapping the dotted US input
+        passed symbol resolution, then 404'd on every Yahoo fetch — and the
+        virtual broker happily rested an order no quote would ever reach
+        (2026-11-23 second review P2-A).
+        """
+        text = symbol.upper().replace("/", "-")
+        base, _, suffix = text.rpartition(".")
+        if base and suffix not in YahooFinanceAdapter._KNOWN_YAHOO_SUFFIXES:
+            # A trailing dot that isn't a known exchange suffix is a US
+            # class-share separator (BRK.B, BF.B).
+            return f"{base}-{suffix}"
+        return text
+
     @classmethod
     def get_client(cls) -> httpx.Client:
         # Reuse the pooled client unless it is gone or was closed. ``is_closed``
@@ -153,7 +176,7 @@ class YahooFinanceAdapter:
         volume, currency, exchange timezone) or ``None`` when the symbol is
         unknown or the provider is unreachable. No price is ever invented.
         """
-        sym = symbol.upper().replace("/", "-")
+        sym = cls._yahoo_symbol(symbol)
         try:
             cli = client or cls.get_client()
             resp = cli.get(
@@ -194,7 +217,7 @@ class YahooFinanceAdapter:
         period1: Optional[int] = None,
         period2: Optional[int] = None,
     ) -> List[Bar]:
-        sym = symbol.upper().replace("/", "-")
+        sym = cls._yahoo_symbol(symbol)
         tf_key = timeframe.lower()
         if tf_key not in TIMEFRAME_SECONDS:
             # Never silently substitute another interval for an unknown key.
@@ -431,8 +454,8 @@ class YahooFinanceAdapter:
                 Bar(
                     time=chunk[0].time,
                     open=chunk[0].open,
-                    high=round(max(b.high for b in chunk), 2),
-                    low=round(min(b.low for b in chunk), 2),
+                    high=round(max(b.high for b in chunk), 4),
+                    low=round(min(b.low for b in chunk), 4),
                     close=chunk[-1].close,
                     volume=round(sum(b.volume for b in chunk), 2)
                 )

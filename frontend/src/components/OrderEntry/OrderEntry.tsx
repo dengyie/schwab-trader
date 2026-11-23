@@ -292,7 +292,15 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // In-flight lock: the ref is declared-and-checked but was never SET
+    // before (2026-11-23 second review P1 — dead guard, double-click still
+    // produced two orders with distinct client_order_ids that backend
+    // idempotency cannot dedupe). createOrder is fully synchronous, so the
+    // whole submit occupies one event-loop turn; holding the flag across
+    // that turn plus a macrotask gap closes the rapid-double-click window.
     if (submittingRef.current) return;
+    submittingRef.current = true;
+    setTimeout(() => { submittingRef.current = false; }, 0);
     if (dataConfidence.level === 'stale') { toast.warning(t.dataConfidence.staleDesc); return; }
     // 收盘时市价单无法成交；限价/条件单会被券商挂起等下次开盘
     if (dataConfidence.level === 'closed' && type === 'market' && orderCategory === 'spot') {
@@ -401,16 +409,24 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
       }
       
     } else if (orderCategory === 'oco') {
-      // OCO order
-      if (!ocoLimitPrice || parseFloat(ocoLimitPrice) <= 0) {
+      // OCO order — finite/range guards must match the spot path. parseFloat
+      // of "1e999" is Infinity and `Infinity <= 0` is false, so the old
+      // bare `<= 0` check let Infinity through to createOCOOrder, which
+      // toasted success before JSON.stringify turned it into null (backend
+      // 422) — the exact failure spot orders were hardened against
+      // (2026-11-23 second review P2-B).
+      const ocoLimit = parseFloat(ocoLimitPrice);
+      if (!ocoLimitPrice || !Number.isFinite(ocoLimit) || ocoLimit <= 0 || ocoLimit > 1e9) {
         toast.warning(t.orderEntry?.invalidLimitPrice || 'Invalid limit price');
         return;
       }
-      if (!ocoStopPrice || parseFloat(ocoStopPrice) <= 0) {
+      const ocoStop = parseFloat(ocoStopPrice);
+      if (!ocoStopPrice || !Number.isFinite(ocoStop) || ocoStop <= 0 || ocoStop > 1e9) {
         toast.warning(t.orderEntry?.invalidStopPrice || 'Invalid stop price');
         return;
       }
-      if (!ocoStopLimitPrice || parseFloat(ocoStopLimitPrice) <= 0) {
+      const ocoStopLimit = parseFloat(ocoStopLimitPrice);
+      if (!ocoStopLimitPrice || !Number.isFinite(ocoStopLimit) || ocoStopLimit <= 0 || ocoStopLimit > 1e9) {
         toast.warning(t.orderEntry?.invalidStopLimitPrice || 'Invalid stop limit price');
         return;
       }

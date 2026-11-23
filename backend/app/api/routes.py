@@ -722,7 +722,13 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
 
     @router.post("/portfolio/reset", dependencies=[Depends(require_auth)])
     def reset_portfolio(req: ResetRequest):
-        broker.reset(req.initial_capital)
+        try:
+            broker.reset(req.initial_capital)
+        except RuntimeError as exc:
+            # Venue wipe failed — broker.reset left the local book intact;
+            # surface the failure instead of a false 200 "reset" (2026-11-23
+            # second review P3-3).
+            raise HTTPException(status_code=502, detail=f"Reset failed: {exc}")
         return {
             "status": "reset",
             "initial_capital": req.initial_capital,

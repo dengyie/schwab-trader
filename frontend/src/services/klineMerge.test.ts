@@ -77,6 +77,24 @@ describe('keepHistoryAheadOfWindow', () => {
     expect(keepHistoryAheadOfWindow(prev, revised)).not.toBe(prev);
   });
 
+  it('keeps the previous reference with paged history when the poll is identical', () => {
+    // 2026-11-23 second review P2-D: the identical-poll short-circuit only
+    // covered the NO-paged-history branch. Once the user has paged back,
+    // the [...older, ...window] path allocated a fresh array every poll and
+    // the chart re-ran setData + O(n×period) indicator recompute — the
+    // steady-state case, i.e. exactly where the optimization matters most.
+    const older = [bar(1000), bar(1100)];
+    const windowBars = [bar(2000), bar(2100), bar(2200)];
+    const prev = [...older, ...windowBars];
+    const freshWindow = windowBars.map(b => ({ ...b })); // 60s poll: new array, same content
+    const merged = keepHistoryAheadOfWindow(prev, freshWindow);
+    expect(merged).toBe(prev);
+
+    // A revised bar in the polled window must still produce a new ref.
+    const revisedWindow = [windowBars[0], { ...windowBars[1], close: 777 }, windowBars[2]];
+    expect(keepHistoryAheadOfWindow(prev, revisedWindow)).not.toBe(prev);
+  });
+
   it('preserves history even when the fresh window is empty (upstream hiccup)', () => {
     // The poller returned an empty body: the paged history must survive,
     // not be wiped by the transient empty response.

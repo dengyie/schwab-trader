@@ -156,12 +156,16 @@ export function MobileOrderEntry({
       onSuccess?.();
     } else if (order && 'blocked' in order) {
       // 商店拒单要报真实原因，不能一律甩"余额不足"（2026-11-16 review）。
+      // invalid_params / markets_loading 与桌面端同步补齐（2026-11-23
+      // second review P2-B）：移动端此前落进兜底"余额不足"，误导排查方向。
       const blockToast: Record<string, string | undefined> = {
         data_confidence: t.orderEntry?.resyncingBlock,
         invalid_quantity: t.orderEntry?.invalidAmount,
+        invalid_params: t.orderEntry?.invalidPrice,
         missing_price: t.orderEntry?.invalidPrice,
         missing_trigger: t.orderEntry?.invalidTriggerPrice,
         lot_floor_zero: t.orderEntry?.lotError,
+        markets_loading: t.orderEntry?.marketsLoading,
       };
       toast.warning(blockToast[order.blocked] || t.orderEntry?.invalidAmount || 'Order could not be created');
       trigger('error');

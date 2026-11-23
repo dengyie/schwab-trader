@@ -33,10 +33,22 @@ class WebSocketManager:
         # (2026-11-23 review P1-4). Runs only on the event loop thread; no
         # lock needed.
         self._symbol_refs: Dict[str, int] = {}
+        # Feed-level release hook, wired by main.py (_release_feed_symbols).
+        # The broadcast path (_send_many) ALSO drops sockets, so the release
+        # must live here rather than only in the endpoint's exception
+        # handlers — a socket dropped mid-broadcast is already popped, and
+        # the endpoint's later disconnect() would return an empty set,
+        # leaking its symbols into the feed again (2026-11-23 second review
+        # P1-2). main.py assigns a callable at import time; a bare manager
+        # (tests) simply skips the feed release.
+        self.on_last_watcher_left = None
 
-    def symbols_without_watchers(self) -> Set[str]:
-        """Symbols this manager still counts as watched (internal helper)."""
-        return {sym for sym, refs in self._symbol_refs.items() if refs > 0}
+    def _notify_released(self, released: Set[str]) -> None:
+        if released and self.on_last_watcher_left:
+            try:
+                self.on_last_watcher_left(released)
+            except Exception as exc:
+                logger.warning("Feed release hook failed for %s: %s", released, exc)
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -72,9 +84,12 @@ class WebSocketManager:
     def disconnect(self, websocket: WebSocket) -> Set[str]:
         """Drop a socket and release its symbol references.
 
-        Returns the symbols whose LAST watcher this socket was — the caller
-        must deactivate those at the feed level (skipping symbols that hold
-        resting virtual orders, which the resting-order loop owns).
+        Returns the symbols whose LAST watcher this socket was — also passed
+        to the on_last_watcher_left hook so every leave path (endpoint
+        handlers AND the broadcast drop path in _send_many) reaches the
+        feed-level release. Callers may use the return value directly; they
+        must NOT re-run the feed release themselves or the hook would
+        double-fire.
         """
         symbols = self.active_connections.pop(websocket, set())
         self._authenticated.discard(websocket)
@@ -86,6 +101,7 @@ class WebSocketManager:
                 released.add(sym)
             else:
                 self._symbol_refs[sym] = refs - 1
+        self._notify_released(released)
         return released
 
     def subscribe(self, websocket: WebSocket, symbol: str) -> None:
@@ -97,7 +113,11 @@ class WebSocketManager:
                 self._symbol_refs[sym] = self._symbol_refs.get(sym, 0) + 1
 
     def unsubscribe(self, websocket: WebSocket, symbol: str) -> bool:
-        """Drop one watcher. Returns True when the last watcher left."""
+        """Drop one watcher. Returns True when the last watcher left.
+
+        The feed release for a true return goes through the
+        on_last_watcher_left hook (fired here), not the caller.
+        """
         if websocket in self.active_connections:
             sym = symbol.upper()
             symbols = self.active_connections[websocket]
@@ -106,6 +126,7 @@ class WebSocketManager:
                 refs = self._symbol_refs.get(sym, 0)
                 if refs <= 1:
                     self._symbol_refs.pop(sym, None)
+                    self._notify_released({sym})
                     return True
                 self._symbol_refs[sym] = refs - 1
         return False

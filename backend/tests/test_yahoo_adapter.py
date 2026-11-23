@@ -411,3 +411,15 @@ def test_span_days_match_the_measured_yahoo_ceiling():
     # near "now".
     assert TIMEFRAME_SPAN_DAYS["15m"] == 59
     assert TIMEFRAME_SPAN_DAYS["5m"] == 59
+
+
+def test_yahoo_symbol_dot_class_share_maps_to_yahoo_convention():
+    # BRK.B resolved through markets.py (dot input accepted) must still hit
+    # Yahoo's BRK-B URL — before the mapping the dotted form passed
+    # resolution, then 404'd on every fetch while the virtual broker rested
+    # an order no quote would ever reach (2026-11-23 second review P2-A).
+    assert YahooFinanceAdapter._yahoo_symbol("BRK.B") == "BRK-B"
+    assert YahooFinanceAdapter._yahoo_symbol("brk.b") == "BRK-B"
+    assert YahooFinanceAdapter._yahoo_symbol("BRK-B") == "BRK-B"  # already Yahoo form
+    assert YahooFinanceAdapter._yahoo_symbol("7203.T") == "7203.T"  # suffix dot is Yahoo's own
+    assert YahooFinanceAdapter._yahoo_symbol("RDS/A") == "RDS-A"  # legacy slash form

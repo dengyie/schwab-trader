@@ -327,9 +327,11 @@ class AlpacaPaperBroker(BaseBroker):
     def reset(self, initial_capital: float = 100000.0) -> None:
         """Cancel all open orders and close positions via Alpaca REST.
 
-        A venue-side failure must not look like a successful wipe: the old
-        bare `except: pass` cleared the LOCAL book while venue orders could
-        still fill, silently desyncing the two ledgers (2026-11-23 review).
+        A venue-side failure must NOT look like a successful wipe: abort
+        before touching the local cache, so a failed wipe leaves both books
+        intact and the caller surfaces 502 (2026-11-23 review; the log-only
+        follow-up still cleared the local book and desynced the two ledgers
+        — 2026-11-23 second review P3-3).
         """
         import logging as _logging
         try:
@@ -340,6 +342,7 @@ class AlpacaPaperBroker(BaseBroker):
                 "Alpaca reset could not wipe venue orders/positions: %s — "
                 "the venue book may still hold live state", exc,
             )
+            raise RuntimeError("Venue reset failed; local book left intact") from exc
         with self._state_lock:
             self.cached_orders.clear()
             self.cached_portfolio = None

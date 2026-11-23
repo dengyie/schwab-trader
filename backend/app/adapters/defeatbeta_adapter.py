@@ -74,9 +74,6 @@ _SCAN_TIMEOUT_SECONDS = 30.0
 _ET = ZoneInfo("America/New_York")
 
 _cache_lock = threading.Lock()
-# Serialises duckdb execute+fetchall on the implicit default connection —
-# see _load_daily_bars for the cross-symbol result-binding race.
-_duckdb_query_lock = threading.Lock()
 _frame_cache: Dict[str, Tuple[float, List[Bar]]] = {}
 _cooldown: Dict[str, float] = {}
 _last_error: str = ""
@@ -120,22 +117,25 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
     Raises on upstream failure so the caller can distinguish "no such symbol"
     (empty list) from "cannot reach the dataset" (exception + cooldown).
 
-    duckdb's module-level ``execute``/``fetchall`` pair is stateful on the
-    implicit default connection: between the two calls, "last result" is
-    connection-global. Two scanner threads running concurrently (the bounded
-    scan below deliberately runs outside the cache lock) could interleave
-    ``execute(A) → execute(B) → fetchall()`` and hand symbol A symbol B's
-    rows — which then live in the 24h frame cache (2026-11-23 review P1).
-    Serialising the query+fetch pair makes the result binding exclusive;
-    scans remain concurrent with cache reads, which never touch duckdb.
+    Runs on its OWN duckdb connection. The first fix used the module-level
+    default connection under a global lock to stop cross-symbol result
+    binding (2026-11-23 review P1), but the lock was held across the whole
+    2-7s httpfs scan — and duckdb 1.5.x has no http timeout, so one hung
+    HuggingFace connection held the lock forever and every OTHER symbol's
+    fallback timed out on lock acquisition without ever querying (2026-11-23
+    second review P2-E). A per-query connection binds results privately, so
+    no cross-symbol race exists and no global serialization is needed; a
+    hung scan now strands only its own connection, which the OS reaps with
+    the process.
     """
     # Imported lazily: duckdb is a heavy binary wheel and the fallback must
     # not tax boot or the test loop for work most sessions never do.
     import duckdb
 
     sym = symbol.upper()
-    with _duckdb_query_lock:
-        rows = duckdb.execute(
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
             f"""
             SELECT report_date, open, high, low, close, volume
             FROM '{_DATASET_URL}'
@@ -144,6 +144,8 @@ def _load_daily_bars(symbol: str) -> List[Bar]:
             """,
             [sym],
         ).fetchall()
+    finally:
+        con.close()
     return _rows_to_bars(rows)
 
 

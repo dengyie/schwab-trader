@@ -61,5 +61,25 @@ export function keepHistoryAheadOfWindow(series: KlineData[], window: KlineData[
   const cutoff = window[0].time;
   const older = series.filter(k => k.time < cutoff);
   if (!older.length) return window;
+  // With paged history ahead, the old [...older, ...window] always allocated
+  // a fresh array — even for an identical poll — re-triggering the chart's
+  // setData + indicator recompute every 60s (2026-11-23 second review P2-D).
+  // older is a prefix of series by construction (filter < cutoff), so only
+  // the window suffix needs the full OHLCV check.
+  const offset = older.length;
+  const identical =
+    series.length === offset + window.length &&
+    window.every((w, i) => {
+      const k = series[offset + i];
+      return (
+        k.time === w.time &&
+        k.open === w.open &&
+        k.high === w.high &&
+        k.low === w.low &&
+        k.close === w.close &&
+        k.volume === w.volume
+      );
+    });
+  if (identical) return series;
   return [...older, ...window];
 }

@@ -683,12 +683,23 @@ export const useTradingStore = create<TradingState>()(
               return { blocked: 'data_confidence' };
             }
 
-            if (!(parseFloat(limitPrice) > 0) || !(parseFloat(stopPrice) > 0) || !(parseFloat(stopLimitPrice) > 0)) {
+            // Number.isFinite + range required: parseFloat("1e999") = Infinity
+            // passes the old `> 0` check and serialises to JSON null → backend
+            // 422 AFTER the UI's success toast (2026-11-23 second review P2-B).
+            const finitePositive = (value: string) => {
+              const n = parseFloat(value);
+              return Number.isFinite(n) && n > 0 && n <= 1e9;
+            };
+            if (!finitePositive(limitPrice) || !finitePositive(stopPrice) || !finitePositive(stopLimitPrice)) {
               return { blocked: 'invalid_params' };
             }
 
             const lot = Math.max(1, Math.floor(useMarketsStore.getState().lotSizeFor(symbol)));
-            const execQuantity = Math.floor(parseFloat(quantity) / lot) * lot;
+            const qtyNum = parseFloat(quantity);
+            if (!Number.isFinite(qtyNum) || qtyNum <= 0 || qtyNum > 1e9) {
+              return { blocked: 'invalid_params' };
+            }
+            const execQuantity = Math.floor(qtyNum / lot) * lot;
             if (!(execQuantity > 0)) return { blocked: 'invalid_params' };
 
             // Prices and sizing are validated by the broker when the winning

@@ -313,6 +313,10 @@ export const useAutomationStore = create<AutomationState>()(
         }),
         onRehydrateStorage: () => (state) => {
           if (state) {
+            // 'triggered' is a pre-async reservation; a reload in that window
+            // used to strand the trigger forever (processTriggers only sees
+            // armed/blocked). Repair it before the engine starts evaluating.
+            state.triggers = normalizeRehydratedTriggers(state.triggers);
             // Rehydrated armed triggers only run inside an authenticated
             // session: after a logout (or a 401 mid-session) an auto-started
             // engine would resume firing someone else's stop-losses into
@@ -326,6 +330,33 @@ export const useAutomationStore = create<AutomationState>()(
     )
   )
 );
+
+// ===== Rehydrate Normalization =====
+
+/**
+ * Repair triggers persisted mid-execution (2026-11-23 second review P2-C).
+ *
+ * 'triggered' is a synchronous reservation set right before the async
+ * execute hop; a tab close in that window persists the reservation and the
+ * terminal write never happens. processTriggers only evaluates
+ * armed/blocked, so without revival the rehydrated trigger can NEVER fire
+ * again — a stop-loss silently dead after a reload. Repeating triggers go
+ * back to armed; one-shots are demoted to failed (their single execution
+ * was already consumed — re-arming would double-fire on an unknown fill
+ * state). Exported for tests; pure so onRehydrateStorage can map over the
+ * rehydrated array without touching live subscriptions.
+ */
+export function normalizeRehydratedTriggers(triggers: Trigger[]): Trigger[] {
+  return triggers.map((t) => {
+    if (t.status !== 'triggered') return t;
+    return {
+      ...t,
+      status: (t.repeat ? 'armed' : 'failed') as TriggerStatus,
+      statusReason: 'Recovered from interrupted execution on rehydrate',
+      updatedAt: Date.now(),
+    };
+  });
+}
 
 // ===== Execution Logic =====
 

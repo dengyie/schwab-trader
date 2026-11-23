@@ -1260,6 +1260,14 @@ class AlpacaMarketFeedService:
             if sym in self._core_symbols or sym not in self.symbols:
                 return
             self.symbols.discard(sym)
+            # The per-symbol warm timestamp is only meaningful while the
+            # symbol is live; without this pop the dict grows one float per
+            # distinct dynamically-subscribed symbol forever (2026-11-23
+            # second review Nit). getattr-defensive: __new__-built test
+            # instances carry no instance dict.
+            warm = getattr(self, "_per_symbol_warm_ts", None)
+            if warm is not None:
+                warm.pop(sym, None)
             self._queue_control(("remove", sym))
 
     @staticmethod
@@ -1538,16 +1546,21 @@ class AlpacaMarketFeedService:
                                     # OLDER than the tail is a late/replayed
                                     # venue frame — appending it would corrupt
                                     # the sequence every consumer assumes is
-                                    # ordered (2026-11-23 review P3).
+                                    # ordered (2026-11-23 review P3). The
+                                    # broadcast must follow the same verdict:
+                                    # a rejected stale frame still pushed to
+                                    # listeners flickered the chart's live
+                                    # price to an old print (2026-11-23
+                                    # second review P3).
                                     if bars and bar.time <= bars[-1].time:
                                         if bar.time == bars[-1].time:
                                             bars[-1] = bar
+                                            notify_listeners(self.bar_listeners, "bar", sym, bar)
                                     else:
                                         bars.append(bar)
-                                    if len(bars) > 500:
-                                        bars.pop(0)
-
-                                    notify_listeners(self.bar_listeners, "bar", sym, bar)
+                                        if len(bars) > 500:
+                                            bars.pop(0)
+                                        notify_listeners(self.bar_listeners, "bar", sym, bar)
 
             except asyncio.CancelledError:
                 break
