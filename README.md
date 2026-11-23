@@ -10,7 +10,7 @@
 [![Frontend](https://img.shields.io/badge/Frontend-React_18_%7C_TypeScript_%7C_Vite-61DAFB.svg?style=flat-square&logo=react&logoColor=white)](frontend/)
 [![Charts](https://img.shields.io/badge/Charts-TradingView_Lightweight_Charts-blue.svg?style=flat-square)](https://tradingview.github.io/lightweight-charts/)
 [![Architecture](https://img.shields.io/badge/Architecture-Full--Duplex_WebSocket_%7C_Virtual_Ledger-orange.svg?style=flat-square)](backend/)
-[![Tests](https://img.shields.io/badge/tests-477%20passed-brightgreen.svg?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-504%20passed-brightgreen.svg?style=flat-square)]()
 
 [English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Features](#core-features) · [Architecture](#system-architecture) · [Quick Start](#quick-start) · [Trading & Quant](#paper-trading--quant-model-integration) · [Testing](#testing--quality-assurance)
 
