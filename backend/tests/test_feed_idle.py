@@ -165,6 +165,33 @@ def test_decorate_quote_is_the_public_entry_for_the_broadcast_path():
     assert raw.prev_close is None
 
 
+def test_multi_market_feed_decorates_us_quotes_for_the_broadcast_path():
+    """The wrapper main.py quotes through must expose decorate_quote too.
+
+    2026-11-23: the perf refactor added AlpacaMarketFeedService.decorate_quote
+    but left MultiMarketFeed (the object main actually wires) without it, so
+    every websocket quote broadcast raised AttributeError and the front-end
+    live quotes silently disappeared while the error log filled up.
+    """
+    from app.engine.multi_market_feed import MultiMarketFeed
+    from app.models.trading import Quote
+
+    decorated = object()
+    raw = Quote(symbol="SPY", bid=0.0, ask=0.0, last=753.49)
+
+    class UsFeed:
+        def decorate_quote(self, quote):
+            assert quote is raw
+            return decorated
+
+    class IntlFeed:
+        def decorate_quote(self, quote):
+            raise AssertionError("intl quotes must not be decorated by the US path")
+
+    feed = MultiMarketFeed(UsFeed(), IntlFeed())
+    assert feed.decorate_quote(raw) is decorated
+
+
 def test_is_market_open_explicit_now_is_never_cached():
     """Determinism: callers passing ``now`` (tests, clock rendering) bypass the TTL cache."""
     from datetime import datetime, timezone

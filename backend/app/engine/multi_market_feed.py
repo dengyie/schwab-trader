@@ -39,6 +39,19 @@ class MultiMarketFeed:
         return ref.symbol, self._intl
 
     # -- quotes -----------------------------------------------------------
+    def decorate_quote(self, quote: Optional[Quote]) -> Optional[Quote]:
+        """Broadcast-path decoration entry point (see main.on_feed_quote).
+
+        Only the US (Alpaca) feed attaches consolidated daily context; the
+        Yahoo feed has no daily-stats sweep to decorate with. Delegating here
+        keeps the wrapper main.py quotes through wire-compatible with the
+        bare Alpaca feed it replaced (2026-11-23 fix: broadcasts crashed with
+        AttributeError when websocket clients were connected).
+        """
+        if hasattr(self._us, "decorate_quote"):
+            return self._us.decorate_quote(quote)
+        return quote
+
     def get_latest_quote(self, symbol: str) -> Optional[Quote]:
         canonical, feed = self._route(symbol)
         if feed is None:
