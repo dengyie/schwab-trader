@@ -329,6 +329,7 @@ export const enUS: Locale = {
     priceBandError: 'Price is outside the allowed daily band',
     tickError: 'Price does not match the venue tick size',
     unsupportedOnMarket: 'Not supported on this market',
+    buyingPower: 'Buying power',
   },
 
   // Open Orders
@@ -489,6 +490,9 @@ export const enUS: Locale = {
   // Toast
   toast: {
     orderSubmitted: 'Order submitted',
+    insufficientBuyingPower: 'Insufficient buying power: order total {total} exceeds buying power {power}',
+    marginWarning: 'Order uses margin ({total} > cash {cash}); execution depends on buying power {power}',
+    shortSellWarning: 'Sell quantity exceeds holdings: the excess opens a short (Alpaca margin supports it, the virtual ledger rejects at fill)',
     orderQueued: 'Order submitted, will take effect after the next open',
     orderQueuedForOpen: 'Order submitted, will take effect after the next open: {time}',
     orderFilled: 'Order filled',

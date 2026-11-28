@@ -36,6 +36,9 @@ interface NotificationState {
   }) => void;
   
   remove: (id: string) => void;
+  /** Withdraw every toast carrying this key — e.g. retract the optimistic
+   * "order submitted" toast once the venue rejects the order (F5). */
+  removeByKey: (key: ToastKey) => void;
   clear: () => void;
 }
 
@@ -118,6 +121,12 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     }));
   },
 
+  removeByKey: (key) => {
+    set((state) => ({
+      toasts: state.toasts.filter((t) => t.key !== key),
+    }));
+  },
+
   clear: () => {
     set({
       toasts: [],
@@ -140,6 +149,9 @@ export const notification = {
   
   info: (key: ToastKey, message: string, priority: ToastPriority = 'low', duration?: number) =>
     useNotificationStore.getState().add({ key, type: 'info', priority, message, duration }),
+
+  removeByKey: (key: ToastKey) =>
+    useNotificationStore.getState().removeByKey(key),
 };
 
 

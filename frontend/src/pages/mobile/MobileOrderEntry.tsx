@@ -6,6 +6,7 @@ import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
 import { useI18n, formatMessage } from '../../i18n';
 import { formatClockMoment } from '../../utils/timeFormat';
 import { toast } from '../../components/Toast';
+import { notification, type ToastKey } from '../../store/notificationStore';
 import { Icon } from '../../components/Icon';
 import { useHapticFeedback } from '../../hooks/useHapticFeedback';
 import type { OrderSide, OrderType } from '../../types/trading';
@@ -48,6 +49,11 @@ export function MobileOrderEntry({
   const lotSize = Math.max(1, useMarketsStore.getState().lotSizeFor(symbol));
   const baseBalance = balances.find(b => b.asset === baseAsset);
   const quoteBalance = balances.find(b => b.asset === quoteAsset) || balances.find(b => b.asset === 'USD');
+  // F2 (2026-11-28 GUI test): venue purchasing power — Alpaca margin ≈ 2x
+  // cash (RegT); falls back to cash when the field hasn't synced yet.
+  const buyingPower = useWalletStore((s) => s.brokerMetrics?.buyingPower
+    ?? s.brokerMetrics?.cash
+    ?? parseFloat(quoteBalance?.available || '0'));
 
   // Sync price from orderbook
   useEffect(() => {
@@ -65,25 +71,27 @@ export function MobileOrderEntry({
     if (type === 'limit' && price && quantity) {
       const p = parseFloat(price);
       const q = parseFloat(quantity);
-      return !isNaN(p) && !isNaN(q) ? (p * q).toFixed(2) : '0';
+      // F7 (2026-11-28 GUI test): NaN/negative must render as $0.
+      return Number.isFinite(p) && Number.isFinite(q) && p * q >= 0 ? (p * q).toFixed(2) : '0';
     } else if (type === 'market' && quantity && metrics) {
       const q = parseFloat(quantity);
       const mid = parseFloat(metrics.mid);
-      return !isNaN(q) && !isNaN(mid) ? (mid * q).toFixed(2) : '0';
+      return Number.isFinite(q) && Number.isFinite(mid) && mid * q >= 0 ? (mid * q).toFixed(2) : '0';
     }
     return '0';
   }, [price, quantity, type, metrics]);
 
   const getMaxQuantity = useCallback(() => {
     if (side === 'buy' && quoteBalance && metrics) {
-      const av = parseFloat(quoteBalance.available);
+      // F2：口径改为券商购买力（保证金账户 ≈ 2x cash），未同步时回退 cash。
+      const av = buyingPower;
       const p = type === 'limit' && price ? parseFloat(price) : parseFloat(metrics.mid);
       return p > 0 ? av / p : 0;
     } else if (side === 'sell' && baseBalance) {
       return parseFloat(baseBalance.available);
     }
     return 0;
-  }, [side, type, price, quoteBalance, baseBalance, metrics]);
+  }, [side, type, price, quoteBalance, baseBalance, metrics, buyingPower]);
 
   const updateQuantityFromPercent = useCallback((pct: number) => {
     const max = getMaxQuantity();
@@ -124,6 +132,41 @@ export function MobileOrderEntry({
       toast.warning(t.orderEntry?.invalidPrice || 'Invalid price');
       return;
     }
+    // F2 (2026-11-28 GUI test): tiered buying-power check, same policy as
+    // the desktop OrderEntry — hard-block above buying power, warn on margin.
+    const costUsd = (() => {
+      const p = type === 'limit' ? parseFloat(price) : parseFloat(metrics?.mid || '0');
+      const q = parseFloat(quantity);
+      return Number.isFinite(p) && Number.isFinite(q) ? p * q : 0;
+    })();
+    if (side === 'buy' && costUsd > 0) {
+      if (costUsd > buyingPower + 1e-6) {
+        toast.error(
+          formatMessage(t.toast?.insufficientBuyingPower || '购买力不足：订单总额 {total} 超过购买力 {power}', {
+            total: `${costUsd.toFixed(2)}`,
+            power: `${buyingPower.toFixed(2)}`,
+          }),
+        );
+        return;
+      }
+      const cashAvail = parseFloat(quoteBalance?.available || '0');
+      if (costUsd > cashAvail + 1e-6) {
+        toast.warning(
+          formatMessage(t.toast?.marginWarning || '订单将动用保证金（总额 {total} > 现金 {cash}），成交依赖购买力 {power}', {
+            total: `${costUsd.toFixed(2)}`,
+            cash: `${cashAvail.toFixed(2)}`,
+            power: `${buyingPower.toFixed(2)}`,
+          }),
+        );
+      }
+    }
+    // F1 (2026-11-28 GUI test): warn on naked short, don't block.
+    if (side === 'sell' && baseBalance) {
+      const held = parseFloat(baseBalance.available);
+      if (Number.isFinite(qtyNum) && qtyNum > held + 1e-9) {
+        toast.warning(t.toast?.shortSellWarning || '卖出数量超过持仓：超出部分将做空（Alpaca 保证金账户支持，虚拟账本成交时会拒绝）');
+      }
+    }
 
     const order = createOrder({
       symbol,
@@ -148,7 +191,9 @@ export function MobileOrderEntry({
           6000,
         );
       } else {
-        toast.success(t.toast?.orderSubmitted || 'Order submitted');
+        // F5 (2026-11-28 GUI test): keyed toast so tradingStore can withdraw
+        // it on venue rejection (matches the desktop OrderEntry).
+        notification.success(`order:submit:${order.clientOrderId}` as ToastKey, t.toast?.orderSubmitted || 'Order submitted');
       }
       trigger('success');
       setQuantity('');

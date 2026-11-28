@@ -708,6 +708,7 @@ def create_api_router(broker: BaseBroker, feed: Any) -> APIRouter:
             "initial_capital": p.initial_capital,
             "market_value": p.market_value,
             "total_equity": p.total_equity,
+            "buying_power": p.buying_power,
             "realized_pnl": p.realized_pnl,
             "unrealized_pnl": p.unrealized_pnl,
             "total_pnl": p.total_pnl,

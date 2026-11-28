@@ -319,11 +319,20 @@ class AlpacaDataAdapter:
             cash = float(raw_cash)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Alpaca account 'cash' is not numeric: {raw_cash!r}") from exc
+        # RegT margin buying power from the venue (≈2x cash on a paper margin
+        # account); cash accounts report it equal to cash. Missing → fall back
+        # to cash so clients never see 0 purchasing power on a funded account.
+        raw_bp = account_json.get("buying_power")
+        try:
+            buying_power = float(raw_bp) if raw_bp is not None else cash
+        except (TypeError, ValueError):
+            buying_power = cash
         portfolio = Portfolio(
             cash=round(cash, 2),
             initial_capital=100000.0,
             positions={},
-            realized_pnl=0.0
+            realized_pnl=0.0,
+            buying_power=round(max(buying_power, cash), 2),
         )
 
         for p in positions_json:

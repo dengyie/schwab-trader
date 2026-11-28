@@ -388,6 +388,10 @@ export const useTradingStore = create<TradingState>()(
 
             if (!res.ok) {
               const reason = await rejectionReason(res);
+              // F5 (2026-11-28 GUI test): retract the optimistic "submitted"
+              // toast keyed to this clientOrderId, otherwise both toasts hang
+              // around and the user reads success+reject as a double fill.
+              notification.removeByKey(`order:submit:${order.clientOrderId}`);
               notification.error(`order:reject:${order.clientOrderId}`, `ORDER_REJECTED: ${reason}`);
               markRejected(order.clientOrderId, reason);
               return;

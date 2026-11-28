@@ -196,6 +196,40 @@ class VirtualMatchingEngine(BaseBroker):
             order = self.orders.get(order_id)
             return order.model_copy(deep=True) if order is not None else None
 
+    def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
+        """Flat synthetic equity curve for the virtual ledger.
+
+        The venue ledger records no time series, so the curve is the current
+        total_equity sampled on the same period/timeframe grid Alpaca uses —
+        honest as long as no trades happened, which is exactly the state in
+        which the merged /assets chart would otherwise show only the US
+        account (START $100k vs card $200k mismatch, 2026-11-28 GUI test).
+        """
+        equity = self.ledger.get_portfolio().total_equity
+        if equity <= 0:
+            return None
+        seconds = self._equity_history_period_seconds(period)
+        step = self._equity_history_step_seconds(timeframe)
+        if seconds <= 0 or step <= 0:
+            return None
+        now = int(time.time())
+        count = max(2, min(int(seconds // step) + 1, 400))
+        points = [
+            {"time": now - (count - 1 - i) * step, "equity": equity}
+            for i in range(count)
+        ]
+        return {"points": points, "base_value": equity}
+
+    @staticmethod
+    def _equity_history_period_seconds(period: str) -> int:
+        table = {"1W": 7, "1M": 30, "3M": 90, "1A": 365, "ALL": 730}
+        return int(table.get(period.upper(), 30) * 86400)
+
+    @staticmethod
+    def _equity_history_step_seconds(timeframe: str) -> int:
+        table = {"5MIN": 300, "15MIN": 900, "1H": 3600, "1D": 86400}
+        return int(table.get(timeframe.upper(), 86400))
+
     # -- lifecycle --------------------------------------------------------
     def reset(self, initial_capital: float = 100000.0) -> None:
         with self._book_lock:

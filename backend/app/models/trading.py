@@ -172,6 +172,9 @@ class Portfolio(BaseModel):
     initial_capital: float = 10000.0
     positions: Dict[str, Position] = Field(default_factory=dict)
     realized_pnl: float = 0.0
+    # Margin purchasing power as reported by the venue (cash accounts: equal
+    # to cash). Merged portfolios sum it; clients use it for order checks.
+    buying_power: float = 0.0
     # USD per unit of each held currency, stamped before serialization so the
     # client can render converted totals consistently with the server.
     fx_rates: Dict[str, float] = Field(default_factory=lambda: {"USD": 1.0})

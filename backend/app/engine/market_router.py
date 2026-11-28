@@ -9,7 +9,7 @@ API and websocket never need to know how many brokers are behind `broker`.
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from app.core.markets import MARKETS, market_clock, resolve_symbol
 from app.models.trading import (
@@ -70,6 +70,10 @@ class MarketRouterBroker(BaseBroker):
             initial_capital=sum(p.initial_capital for p in portfolios),
             positions={},
             realized_pnl=sum(p.realized_pnl for p in portfolios),
+            # Sum of venue purchasing powers: the Alpaca margin account
+            # contributes its RegT buying power, cash-only ledgers contribute
+            # their cash (Portfolio.buying_power defaults to 0 when unset).
+            buying_power=sum(max(p.buying_power, p.cash) for p in portfolios),
             fx_rates=dict(portfolios[0].fx_rates),
         )
         for portfolio in portfolios:
@@ -214,5 +218,52 @@ class MarketRouterBroker(BaseBroker):
         return market_clock(market_def)
 
     def get_equity_history(self, period: str = "1M", timeframe: str = "1D") -> Optional[dict]:
-        """Equity curve comes from the venue that holds the account (US)."""
-        return self._us.get_equity_history(period=period, timeframe=timeframe)
+        """Merged equity curve across both ledgers.
+
+        The /assets card sums both accounts, so the curve must too —
+        forwarding only the US venue used to chart $100k under a $200k card
+        (2026-11-28 GUI test F6). Venues report on different grids (Alpaca:
+        ET trading days; virtual ledger: now-based steps), so per-timestamp
+        summing on raw stamps never overlaps and stays at $100k — each curve
+        is therefore resampled onto the union grid by carry-forward before
+        summing. A venue without history falls back to the other one, and
+        both None stays None (explicit empty state, never a fabricated curve).
+        """
+        curves = []
+        for broker in self._all_brokers():
+            try:
+                curves.append(broker.get_equity_history(period=period, timeframe=timeframe))
+            except Exception as exc:
+                logger.warning("Equity history failed for %s: %s", type(broker).__name__, exc)
+        valid = [c for c in curves if c and c.get("points")]
+        if not valid:
+            return None
+        if len(valid) == 1:
+            return {**valid[0], "points": [dict(p) for p in valid[0]["points"]]}
+
+        # Union grid: every timestamp any venue reported, ascending.
+        grid = sorted({float(p["time"]) for c in valid for p in c["points"]})
+
+        def resample(points: list) -> Dict[float, float]:
+            """Carry each venue's last known equity forward across the grid."""
+            out: Dict[float, float] = {}
+            idx = 0
+            last: Optional[float] = None
+            for ts in grid:
+                while idx < len(points) and float(points[idx]["time"]) <= ts:
+                    last = float(points[idx]["equity"])
+                    idx += 1
+                if last is not None:
+                    out[ts] = last
+            return out
+
+        resampled = [resample(c["points"]) for c in valid]
+        base_sum = round(sum(float(c.get("base_value") or 0.0) for c in valid), 2)
+        points = [
+            {"time": ts, "equity": round(sum(r[ts] for r in resampled if ts in r), 2)}
+            for ts in grid
+        ]
+        # Timestamps a venue never reached (its series starts later) are only
+        # summed over the venues that cover them — the earliest stretch shows
+        # the venues that already had history rather than a fabricated zero.
+        return {"points": points, "base_value": base_sum}

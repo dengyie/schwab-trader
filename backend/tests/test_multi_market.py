@@ -231,8 +231,9 @@ class TestRouter:
         assert router.get_market_clock("XX") is None
 
     def test_equity_history_forwards_to_us_book(self, fx):
-        # The curve belongs to the venue holding the account (US), never the
-        # virtual international ledger.
+        # F6 (2026-11-28 GUI test): the /assets card sums BOTH ledgers, so the
+        # curve must too. Venues report on different grids, so curves are
+        # resampled onto the union grid by carry-forward before summing.
         class _Recording:
             def __init__(self):
                 self.calls = []
@@ -243,9 +244,57 @@ class TestRouter:
 
         us_recorder, intl_recorder = _Recording(), _Recording()
         router = MarketRouterBroker(us_recorder, intl_recorder)  # type: ignore[arg-type]
-        assert router.get_equity_history(period="1W", timeframe="5Min") is not None
+        merged = router.get_equity_history(period="1W", timeframe="5Min")
+        assert merged is not None
         assert us_recorder.calls == [("1W", "5Min")]
-        assert intl_recorder.calls == []
+        assert intl_recorder.calls == [("1W", "5Min")]
+        # Both venues report equity 2.0 at t=1 → merged to 4.0.
+        assert merged["points"] == [{"time": 1, "equity": 4.0}]
+        assert merged["base_value"] == 4.0
+
+    def test_equity_history_merges_disjoint_grids(self, fx):
+        # Alpaca reports on ET trading days, the virtual ledger on now-based
+        # steps: raw per-timestamp summing never overlaps and the chart stays
+        # at $100k under a $200k card. Carry-forward onto the union grid must
+        # produce $200k wherever both venues have reported at least once.
+        class _UsBook:
+            def get_equity_history(self, period="1M", timeframe="1D"):
+                return {
+                    "points": [{"time": 100, "equity": 100.0}, {"time": 300, "equity": 110.0}],
+                    "base_value": 100.0,
+                }
+
+        class _VirtualBook:
+            def get_equity_history(self, period="1M", timeframe="1D"):
+                return {
+                    "points": [{"time": 200, "equity": 100.0}, {"time": 400, "equity": 100.0}],
+                    "base_value": 100.0,
+                }
+
+        router = MarketRouterBroker(_UsBook(), _VirtualBook())  # type: ignore[arg-type]
+        merged = router.get_equity_history()
+        assert merged is not None
+        assert [p["time"] for p in merged["points"]] == [100, 200, 300, 400]
+        assert [p["equity"] for p in merged["points"]] == [100.0, 200.0, 210.0, 210.0]
+        assert merged["base_value"] == 200.0
+
+    def test_equity_history_falls_back_when_one_side_is_none(self, fx):
+        # A venue without history must not zero the merged curve: the other
+        # side's curve passes through unchanged; both None stays None.
+        class _UsBook:
+            def get_equity_history(self, period="1M", timeframe="1D"):
+                return {"points": [{"time": 1, "equity": 100.0}], "base_value": 100.0}
+
+        class _NoHistory:
+            def get_equity_history(self, period="1M", timeframe="1D"):
+                return None
+
+        router = MarketRouterBroker(_UsBook(), _NoHistory())  # type: ignore[arg-type]
+        merged = router.get_equity_history()
+        assert merged == {"points": [{"time": 1, "equity": 100.0}], "base_value": 100.0}
+
+        empty_router = MarketRouterBroker(_NoHistory(), _NoHistory())  # type: ignore[arg-type]
+        assert empty_router.get_equity_history() is None
 
 
 class TestFxService:

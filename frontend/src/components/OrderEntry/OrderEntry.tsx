@@ -4,6 +4,7 @@ import { useTradingStore, selectFocusMode } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useMarketsStore, marketCodeOfSymbol } from '../../store/marketsStore';
+import { notification, type ToastKey } from '../../store/notificationStore';
 import { currencySymbol, roundToTick } from '../../utils/money';
 import { formatClockMoment } from '../../utils/timeFormat';
 import { useI18n, formatMessage } from '../../i18n';
@@ -122,6 +123,12 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const priceDecimals = marketDef?.decimals ?? 2;
   const baseBalance = balances.find(b => b.asset === baseAsset);
   const quoteBalance = balances.find(b => b.asset === quoteAsset);
+  // F2 (2026-11-28 GUI test): venue purchasing power — for the Alpaca margin
+  // account this is ~2x cash (RegT). Fall back to cash when the field hasn't
+  // synced yet (older backend / cash-only venue).
+  const buyingPower = useWalletStore((s) => s.brokerMetrics?.buyingPower
+    ?? s.brokerMetrics?.cash
+    ?? parseFloat(quoteBalance?.available || '0'));
   const priceLimitPct = useMarketsStore((s) => s.priceLimitPctFor(symbol));
   const marketClock = marketDef?.clock;
   const marketClosed = marketClock ? !marketClock.is_open : false;
@@ -201,7 +208,9 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     if (priceForCalc && quantity) {
       const p = parseFloat(priceForCalc);
       const q = parseFloat(quantity);
-      setTotal(!isNaN(p) && !isNaN(q) ? (p * q).toFixed(2) : '0');
+      // F7 (2026-11-28 GUI test): parseFloat("abc") is NaN and parseFloat
+      // ("-1") is negative — both must render as $0, not "NaN" or a debt.
+      setTotal(Number.isFinite(p) && Number.isFinite(q) && p * q >= 0 ? (p * q).toFixed(2) : '0');
     } else {
       setTotal('0');
     }
@@ -210,15 +219,15 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const getMaxQuantity = useCallback(() => {
     if (side === 'buy' && (quoteBalance || (isForeignMarket && balances?.length))) {
       // 外币买入：账户现金始终以 USD 记账，购买力按汇率折算成当地币种。
-      const source = quoteBalance || balances.find((b) => b.asset === 'USD');
-      const usdAv = parseFloat(source?.available || '0');
+      // F2：口径改为券商购买力（保证金账户 ≈ 2x cash），未同步时回退 cash。
+      const usdAv = buyingPower;
       const rate = isForeignMarket ? useMarketsStore.getState().usdPerUnit(quoteAsset) : 1;
       const av = rate > 0 ? usdAv / rate : usdAv;
       const p = type === 'limit' && price ? parseFloat(price) : parseFloat(metrics?.mid || '0');
       return p > 0 ? av / p : 0;
     } else if (side === 'sell' && baseBalance) return parseFloat(baseBalance.available);
     return 0;
-  }, [side, type, price, quoteBalance, baseBalance, metrics, isForeignMarket, quoteAsset, balances]);
+  }, [side, type, price, quoteBalance, baseBalance, metrics, isForeignMarket, quoteAsset, balances, buyingPower]);
 
   const updateQuantityFromPercent = useCallback((pct: number) => {
     const max = getMaxQuantity();
@@ -233,7 +242,9 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   useEffect(() => {
     const max = getMaxQuantity();
     if (max > 0 && quantity) {
-      const pct = Math.round((parseFloat(quantity) / max) * 100);
+      const q = parseFloat(quantity);
+      // F7: non-numeric input must read as %, not NaN%.
+      const pct = Number.isFinite(q) ? Math.round((q / max) * 100) : 0;
       setQuantityPercent(Math.min(100, Math.max(0, pct)));
     } else setQuantityPercent(0);
   }, [quantity, getMaxQuantity]);
@@ -328,6 +339,48 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
     if (quantityNotLot(quantity)) {
       toast.warning(t.orderEntry.lotError || `Quantity must be a multiple of ${lotSize}`);
       return;
+    }
+    // F2 (2026-11-28 GUI test): tiered buying-power check. Hard-block only
+    // when the venue couldn't fill it at all; cash < total ≤ buying power is
+    // legitimate RegT margin — warn and let it through.
+    const costUsd = (() => {
+      const effectivePrice = orderCategory === 'spot'
+        ? (type === 'limit' ? parseFloat(price) : parseFloat(metrics?.mid || '0'))
+        : parseFloat(limitPrice || triggerPrice || ocoLimitPrice || '0');
+      const q = parseFloat(quantity);
+      return Number.isFinite(effectivePrice) && Number.isFinite(q) ? effectivePrice * q : 0;
+    })();
+    if (side === 'buy' && costUsd > 0) {
+      if (costUsd > buyingPower + 1e-6) {
+        toast.error(
+          (t.toast.insufficientBuyingPower || '购买力不足：订单总额 {total} 超过购买力 {power}')
+            .replace('{total}', `${currencySymbol(quoteAsset)}${costUsd.toFixed(2)}`)
+            .replace('{power}', `${currencySymbol(quoteAsset)}${buyingPower.toFixed(2)}`),
+        );
+        return;
+      }
+      const cashAvail = parseFloat(quoteBalance?.available || '0');
+      if (costUsd > cashAvail + 1e-6) {
+        // margin territory
+        toast.warning(
+          (t.toast.marginWarning || '订单将动用保证金（总额 {total} > 现金 {cash}），成交依赖购买力 {power}')
+            .replace('{total}', `${currencySymbol(quoteAsset)}${costUsd.toFixed(2)}`)
+            .replace('{cash}', `${currencySymbol(quoteAsset)}${parseFloat(quoteBalance?.available || '0').toFixed(2)}`)
+            .replace('{power}', `${currencySymbol(quoteAsset)}${buyingPower.toFixed(2)}`),
+        );
+      }
+    }
+    // F1 (2026-11-28 GUI test): naked short is accepted by the Alpaca margin
+    // account but hard-rejected at fill time by the virtual ledger — warn,
+    // don't block.
+    if (side === 'sell' && baseBalance) {
+      const held = parseFloat(baseBalance.available);
+      const q = parseFloat(quantity);
+      if (Number.isFinite(q) && q > held + 1e-9) {
+        toast.warning(
+          (t.toast.shortSellWarning || '卖出数量超过持仓：超出部分将做空（Alpaca 保证金账户支持，虚拟账本成交时会拒绝）'),
+        );
+      }
     }
     // OCO / 追踪止损是本地撮合特性，外币市场由后端虚拟引擎记账，不支持。
     if (isForeignMarket && (orderCategory === 'oco' || type === 'trailing_stop')) {
@@ -453,7 +506,15 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
           6000,
         );
       } else {
-        toast.success(t.toast.orderSubmitted);
+        // F5 (2026-11-28 GUI test): key the optimistic success toast to the
+        // order's clientOrderId so tradingStore's reject handler can withdraw
+        // it (notification.removeByKey) — the legacy Date.now() key made the
+        // success toast unretractable and left success+reject pairs on screen.
+        // OCO carries a group id instead of a per-leg clientOrderId.
+        const submitKey: ToastKey = 'ocoGroupId' in order && order.ocoGroupId
+          ? `oco:${order.ocoGroupId}:created`
+          : `order:submit:${(order as { clientOrderId: string }).clientOrderId}`;
+        notification.success(submitKey, t.toast.orderSubmitted);
       }
       // Reset form
       setQuantity(''); 
@@ -819,15 +880,29 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
             {side === 'buy'
               ? isForeignMarket
                 ? (() => {
-                    const usd = balances.find((b) => b.asset === 'USD');
                     const rate = useMarketsStore.getState().usdPerUnit(quoteAsset);
-                    const native = rate > 0 ? parseFloat(usd?.available || '0') / rate : 0;
+                    const native = rate > 0 ? buyingPower / rate : 0;
                     return `≈${currencySymbol(quoteAsset)}${native.toFixed(priceDecimals)}`;
                   })()
-                : `${parseFloat(quoteBalance?.available ?? '0').toFixed(2)} USD`
+                : `${buyingPower.toFixed(2)} USD`
               : `${parseFloat(baseBalance?.available ?? '0').toFixed(6)} ${baseAsset}`}
           </span>
         </div>
+        {/* F2: venue purchasing power — margin accounts can spend beyond cash. */}
+        {side === 'buy' && buyingPower > parseFloat(quoteBalance?.available || '0') && (
+          <div className={styles.balanceRow}>
+            <span className={styles.balanceLabel}>{t.orderEntry.buyingPower || '购买力'}</span>
+            <span className={`${styles.balanceValue} tabular-nums`}>
+              {isForeignMarket
+                ? (() => {
+                    const rate = useMarketsStore.getState().usdPerUnit(quoteAsset);
+                    const native = rate > 0 ? buyingPower / rate : 0;
+                    return `≈${currencySymbol(quoteAsset)}${native.toFixed(priceDecimals)}`;
+                  })()
+                : `${currencySymbol(quoteAsset)}${buyingPower.toFixed(2)}`}
+            </span>
+          </div>
+        )}
 
         {/* Data Confidence Warning */}
         {dataConfidence.level !== 'live' && (

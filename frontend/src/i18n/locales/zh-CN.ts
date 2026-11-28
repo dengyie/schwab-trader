@@ -328,6 +328,7 @@ export const zhCN = {
     priceBandError: '价格超出当日涨跌停区间',
     tickError: '价格不符合该市场的最小跳动单位',
     unsupportedOnMarket: '该市场暂不支持此订单类型',
+    buyingPower: '购买力',
   },
 
   // 挂单列表
@@ -488,6 +489,9 @@ export const zhCN = {
   // Toast 消息
   toast: {
     orderSubmitted: '订单已提交',
+    insufficientBuyingPower: '购买力不足：订单总额 {total} 超过购买力 {power}',
+    marginWarning: '订单将动用保证金（总额 {total} > 现金 {cash}），成交依赖购买力 {power}',
+    shortSellWarning: '卖出数量超过持仓：超出部分将做空（Alpaca 保证金账户支持，虚拟账本成交时会拒绝）',
     orderQueued: '订单已提交，将在下次开盘后生效',
     orderQueuedForOpen: '订单已提交，将在下次开盘后生效：{time}',
     orderFilled: '订单已完全成交',

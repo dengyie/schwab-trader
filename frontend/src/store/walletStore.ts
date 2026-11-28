@@ -56,6 +56,8 @@ export interface BrokerMetrics {
   initialCapital: number | null;
   /** 券商口径的总收益百分比（已按初始资金计算）。 */
   totalPnlPct: number | null;
+  /** 保证金购买力（cash 账户等于 cash）；未同步时为 null，消费方回退 cash。 */
+  buyingPower: number | null;
 }
 
 /**
@@ -72,6 +74,9 @@ export interface BrokerPortfolio {
   realized_pnl?: number;
   initial_capital?: number;
   total_pnl_pct?: number;
+  /** Venue margin purchasing power (cash accounts: = cash). Optional for
+   * older backend payloads; consumers fall back to cash. */
+  buying_power?: number;
   positions?: Record<string, any>;
 }
 
@@ -302,6 +307,7 @@ export const useWalletStore = create<WalletState>()(
               realizedPnl: data.realized_pnl ?? null,
               initialCapital: data.initial_capital ?? null,
               totalPnlPct: data.total_pnl_pct ?? null,
+              buyingPower: data.buying_power ?? null,
             },
           });
         },
