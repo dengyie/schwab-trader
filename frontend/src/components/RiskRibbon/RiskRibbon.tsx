@@ -1,6 +1,6 @@
 import { useMemo, useEffect } from 'react';
 import { useWalletStore, selectBalances, resolveAccountTotals } from '../../store/walletStore';
-import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
+import { useMarketStore, selectActiveSymbol, selectMetrics } from '../../store/marketStore';
 import { useI18n } from '../../i18n';
 import { Icon } from '../Icon';
 import styles from './RiskRibbon.module.css';
@@ -27,20 +27,23 @@ export function RiskRibbon({ compact = false, full = false }: RiskRibbonProps) {
   const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const performanceMetrics = useWalletStore((state) => state.performanceMetrics);
   const updatePerformanceMetrics = useWalletStore((state) => state.updatePerformanceMetrics);
+  // The perf-price effect only needs the symbol + mid scalars; the risk
+  // computation needs microVolatility, so the whole metrics object stays here
+  // but orderBook is narrowed to its symbol.
   const metrics = useMarketStore(selectMetrics);
-  const orderBook = useMarketStore(selectOrderBook);
+  const orderBookSymbol = useMarketStore(selectActiveSymbol);
 
   // 定期更新绩效指标
   useEffect(() => {
     if (!metrics) return;
 
     const prices: Record<string, string> = {};
-    if (metrics.mid && orderBook?.symbol) {
-      prices[orderBook.symbol] = metrics.mid;
+    if (metrics.mid && orderBookSymbol) {
+      prices[orderBookSymbol] = metrics.mid;
     }
 
     updatePerformanceMetrics(prices);
-  }, [metrics, orderBook?.symbol, updatePerformanceMetrics]);
+  }, [metrics, orderBookSymbol, updatePerformanceMetrics]);
 
   // Every figure below describes the whole account, never the symbol on screen:
   // mixing a selected-symbol position with account-level win rate made the

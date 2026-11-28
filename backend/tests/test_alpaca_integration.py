@@ -680,3 +680,107 @@ def test_stop_limit_and_trailing_payload_shapes(monkeypatch):
             symbol="SPY", side=OrderSide.SELL, order_type=OrderType.STOP,
             quantity=1, price=89.0, stop_price=90.0, time_in_force="fok",
         )
+
+
+# -- cached order bounds & fill dedup (2026-11-28 perf review B2) -----------
+
+def test_cached_orders_prune_terminal_but_keep_live_and_side_tables_in_sync():
+    """The venue cache used to grow with every submitted/cancelled order.
+    Pruning drops only the oldest terminal orders, never a live one, and the
+    dedup trackers must never retain a key that isn't in the cache: an orphan
+    tracker would decide whether a reappearing order gets a fill broadcast.
+    """
+    from app.engine.alpaca_broker import MAX_CACHED_ORDERS
+    from app.models.trading import utc_now
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    base = utc_now()
+    from datetime import timedelta
+
+    with broker._state_lock:
+        # A few live orders must survive regardless of age.
+        for i in range(3):
+            oid = f"live-{i}"
+            broker.cached_orders[oid] = Order(
+                order_id=oid, symbol="SPY", side=OrderSide.BUY,
+                order_type=OrderType.LIMIT, quantity=100, price=1.0,
+                status=OrderStatus.PENDING,
+                created_at=base - timedelta(days=10),
+            )
+        # Far more terminal orders than the cap.
+        for i in range(MAX_CACHED_ORDERS + 100):
+            oid = f"done-{i}"
+            broker.cached_orders[oid] = Order(
+                order_id=oid, symbol="SPY", side=OrderSide.BUY,
+                order_type=OrderType.MARKET, quantity=100,
+                status=OrderStatus.FILLED,
+                created_at=base - timedelta(minutes=MAX_CACHED_ORDERS + 100 - i),
+            )
+        broker._last_order_status = {
+            oid: o.status for oid, o in broker.cached_orders.items()
+        }
+        broker._last_filled_qty = {
+            oid: o.filled_quantity for oid, o in broker.cached_orders.items()
+        }
+        broker._last_order_status["orphan"] = OrderStatus.FILLED
+        broker._last_filled_qty["orphan"] = 5
+
+        broker._prune_cached_orders()
+
+        assert len(broker.cached_orders) <= MAX_CACHED_ORDERS
+        for i in range(3):
+            assert f"live-{i}" in broker.cached_orders
+        # Only the newest terminal orders remain.
+        assert "done-0" not in broker.cached_orders
+        assert f"done-{MAX_CACHED_ORDERS + 99}" in broker.cached_orders
+        assert set(broker._last_order_status) == set(broker.cached_orders)
+        assert set(broker._last_filled_qty) == set(broker.cached_orders)
+
+
+def test_pruned_order_reappearing_does_not_rebroadcast_a_fill():
+    """An order evicted from the cache and tracker comes back on a venue poll.
+    It must NOT re-emit an old fill: the user saw that trade already, and a
+    duplicate ORDER_FILLED would double-count it in the UI.
+    """
+    from app.engine.alpaca_broker import MAX_CACHED_ORDERS
+    from app.models.trading import utc_now
+    from datetime import timedelta
+
+    broker = AlpacaPaperBroker(api_key="K", api_secret="S")
+    fills = []
+    broker.register_fill_listener(lambda trade, order: fills.append((trade, order)))
+    oid = "old-fill"
+    base = utc_now()
+    order = Order(
+        order_id=oid, symbol="SPY", side=OrderSide.BUY,
+        order_type=OrderType.MARKET, quantity=100,
+        status=OrderStatus.FILLED, filled_quantity=100,
+        filled_avg_price=500.0,
+        created_at=base - timedelta(days=1),
+    )
+
+    with broker._state_lock:
+        # Fill the window past the cap with newer terminal orders so the
+        # oldest one (our target) is the eviction victim.
+        broker.cached_orders[oid] = order
+        for i in range(MAX_CACHED_ORDERS):
+            newer_oid = f"newer-{i}"
+            broker.cached_orders[newer_oid] = Order(
+                order_id=newer_oid, symbol="SPY", side=OrderSide.BUY,
+                order_type=OrderType.MARKET, quantity=100,
+                status=OrderStatus.FILLED,
+                created_at=base - timedelta(minutes=MAX_CACHED_ORDERS - i),
+            )
+        broker._last_order_status = {
+            key: OrderStatus.FILLED for key in broker.cached_orders
+        }
+        broker._last_filled_qty = {key: 100 for key in broker.cached_orders}
+
+        broker._prune_cached_orders()
+        assert oid not in broker.cached_orders
+        assert oid not in broker._last_order_status
+        assert oid not in broker._last_filled_qty
+
+        broker._detect_fill(order)  # venue reappears with the same old fill
+
+    assert fills == []

@@ -16,6 +16,14 @@ from app.engine.base_broker import BaseBroker
 from app.core.config import settings
 
 
+# A venue returns at most 500 orders per poll; keep the same window locally so
+# cached_orders / fill trackers cannot grow with every order ever submitted.
+MAX_CACHED_ORDERS = 500
+TERMINAL_ORDER_STATUSES = frozenset(
+    {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
+)
+
+
 class AlpacaPaperBroker(BaseBroker):
     """
     Broker implementation delegating execution and account bookkeeping
@@ -76,6 +84,53 @@ class AlpacaPaperBroker(BaseBroker):
         # Fill detection state: last observed filled quantity per order
         self._last_order_status: Dict[str, OrderStatus] = {}
         self._last_filled_qty: Dict[str, int] = {}
+
+    def _prune_cached_orders(self) -> None:
+        """Bound the local venue cache and its fill-detection side tables.
+
+        Caller must hold ``_state_lock``. The venue itself returns at most 500
+        rows, but submitted/cancelled orders were added to the local dict
+        forever; over a long-running account that made every TTL-hit copy and
+        every restart-free status lookup walk an ever-growing book.
+
+        Live orders are never evicted; terminal orders are trimmed
+        oldest-first to stay inside the window. Side-table rows whose order
+        no longer exists in the cache (venue-poll eviction from a previous
+        prune) are dropped too — their only purpose is dedup against the
+        cache, so an orphan row would only suppress a real fill broadcast
+        if the order ever reappeared.
+        """
+        if len(self.cached_orders) <= MAX_CACHED_ORDERS:
+            self._last_order_status = {
+                oid: st for oid, st in self._last_order_status.items()
+                if oid in self.cached_orders
+            }
+            self._last_filled_qty = {
+                oid: qty for oid, qty in self._last_filled_qty.items()
+                if oid in self.cached_orders
+            }
+            return
+        terminal = sorted(
+            (
+                o for o in self.cached_orders.values()
+                if o.status in TERMINAL_ORDER_STATUSES
+            ),
+            key=lambda o: (o.created_at, o.updated_at),
+        )
+        live = len(self.cached_orders) - len(terminal)
+        # Keep every live order plus the newest terminal slice that fits.
+        keep_terminal = max(MAX_CACHED_ORDERS - live, 0)
+        victims = terminal[: max(len(terminal) - keep_terminal, 0)]
+        for order in victims:
+            self.cached_orders.pop(order.order_id, None)
+        self._last_order_status = {
+            oid: st for oid, st in self._last_order_status.items()
+            if oid in self.cached_orders
+        }
+        self._last_filled_qty = {
+            oid: qty for oid, qty in self._last_filled_qty.items()
+            if oid in self.cached_orders
+        }
 
     def register_fill_listener(self, listener: Callable[[Trade, Order], None]) -> None:
         self.fill_listeners.append(listener)
@@ -147,6 +202,7 @@ class AlpacaPaperBroker(BaseBroker):
                 for o in domain_orders:
                     self._detect_fill(o)
                     self.cached_orders[o.order_id] = o
+                self._prune_cached_orders()
                 self._orders_cached_at = now
             # Same copy contract as the TTL-hit and error paths: callers may
             # hold the list across an await, so it must not alias the cache.
@@ -193,6 +249,7 @@ class AlpacaPaperBroker(BaseBroker):
                 ord_obj = AlpacaDataAdapter.parse_order_to_domain(resp.json())
                 with self._state_lock:
                     self.cached_orders[ord_obj.order_id] = ord_obj
+                    self._prune_cached_orders()
                 return ord_obj.model_copy(deep=True)
         except Exception:
             pass
@@ -271,6 +328,7 @@ class AlpacaPaperBroker(BaseBroker):
                 # Prime fill tracking; any filled quantity reported later is a new fill.
                 self._last_order_status[order.order_id] = order.status
                 self._last_filled_qty[order.order_id] = 0
+                self._prune_cached_orders()
                 # Invalidate caches to reflect new trade immediately
                 self._portfolio_cached_at = 0.0
                 self._orders_cached_at = 0.0

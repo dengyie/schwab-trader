@@ -177,6 +177,24 @@ def _load_daily_bars_bounded(symbol: str) -> List[Bar]:
     return value  # type: ignore[return-value]
 
 
+def _prune_expired_cooldowns(now: float) -> None:
+    """Drop cooldowns whose window has already passed. Caller holds _cache_lock.
+
+    A cooldown only matters while it can still gate a retry: once expired it
+    is dead weight, and a long-lived process that probes many dead symbols
+    would otherwise grow one dict entry per distinct failure forever. Pruning
+    happens when a NEW failure arms (bounded work, one dict scan per failure)
+    rather than on a timer, and under the same lock that guards every other
+    access, so no reader can observe a half-pruned map.
+    """
+    expired = [
+        key for key, armed_at in _cooldown.items()
+        if now - armed_at >= _DEFEATBETA_COOLDOWN_SECONDS
+    ]
+    for key in expired:
+        _cooldown.pop(key, None)
+
+
 def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
     """Full split-adjusted US daily history for ``symbol``, oldest first.
 
@@ -201,7 +219,11 @@ def fetch_daily_history(symbol: str) -> Optional[Tuple[List[Bar], float]]:
         all_bars = _load_daily_bars_bounded(key)
     except Exception as exc:
         with _cache_lock:
-            _cooldown[key] = time.time()
+            now = time.time()
+            # Prune BEFORE arming: the new entry is the only one that must
+            # survive, and pruning first keeps it from being visited.
+            _prune_expired_cooldowns(now)
+            _cooldown[key] = now
             _last_error = str(exc)[:200]
         logger.warning("DefeatBeta daily fetch failed for %s: %s", key, exc)
         return None

@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import logging
-from typing import Dict, Set, Any, List
+from typing import Dict, Set, Any, List, Optional
 from fastapi import WebSocket
 
 logger = logging.getLogger("websocket_manager")
@@ -101,6 +101,11 @@ class WebSocketManager:
                 released.add(sym)
             else:
                 self._symbol_refs[sym] = refs - 1
+        # A symbol nobody watches can never pass the conflation gate again, so
+        # its throttle stamp is dead weight — drop it with the last watcher
+        # instead of accumulating one float per ever-quoted symbol.
+        for sym in released:
+            self.last_broadcast_ts.pop(sym, None)
         self._notify_released(released)
         return released
 
@@ -126,6 +131,7 @@ class WebSocketManager:
                 refs = self._symbol_refs.get(sym, 0)
                 if refs <= 1:
                     self._symbol_refs.pop(sym, None)
+                    self.last_broadcast_ts.pop(sym, None)
                     self._notify_released({sym})
                     return True
                 self._symbol_refs[sym] = refs - 1
@@ -165,27 +171,93 @@ class WebSocketManager:
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         """Broadcast message to all connected clients immediately."""
-        await self._send_many(json.dumps(message), self._targets())
+        payload = self._encode(message)
+        if payload is None:
+            return
+        await self._send_many(payload, self._targets())
 
-    async def broadcast_quote(self, quote_dict: Dict[str, Any], force: bool = False) -> None:
-        """Broadcast quote with conflation (max 25 FPS per symbol for UI smoothness)."""
-        symbol = quote_dict.get("symbol", "").upper()
+    def _symbol_of(self, message: Any) -> str:
+        """Symbol of a Pydantic model or a legacy plain dict, uppercased."""
+        if isinstance(message, dict):
+            sym = message.get("symbol", "")
+        else:
+            sym = getattr(message, "symbol", "")
+        return (sym or "").upper()
+
+    def _encode(self, data: Any) -> Optional[str]:
+        """One JSON encode of a Pydantic model or a plain dict, never raising.
+
+        Models serialize with ``model_dump_json`` — the single-pass encoder.
+        A failure (an exotic value the model cannot render) must not take the
+        tick path down, so it degrades to a dropped broadcast with a log line.
+        """
+        try:
+            if isinstance(data, dict):
+                return json.dumps(data)
+            return data.model_dump_json()
+        except Exception as exc:
+            logger.warning("Broadcast encode failed for %s: %s", type(data).__name__, exc)
+            return None
+
+    def _envelope(self, msg_type: str, data: Any) -> Optional[str]:
+        """Encode the {type, data} envelope exactly once.
+
+        The body serializes directly (``model_dump_json`` for models — no
+        intermediate dict — or ``json.dumps`` for dicts) and the envelope is
+        concatenated around the pre-encoded text, so the payload never goes
+        through a second conversion pass. Both parts are valid JSON texts and
+        ``msg_type`` is a caller-owned literal, so the result parses exactly
+        like the wire schema clients already consume.
+        """
+        body = self._encode(data)
+        if body is None:
+            return None
+        return '{"type": "%s", "data": %s}' % (msg_type, body)
+
+    async def broadcast_quote(self, quote: Any, force: bool = False) -> None:
+        """Broadcast quote with conflation (max 25 FPS per symbol for UI smoothness).
+
+        Accepts a Pydantic Quote or a legacy plain dict. Target selection and
+        the conflation gate both run BEFORE the encode: a tick nobody can
+        receive must not pay for ``model_dump_json``, and it must not leave a
+        throttle stamp behind for a symbol nobody watches (that stamp would
+        otherwise linger forever — one dict entry per ever-quoted symbol).
+        """
+        symbol = self._symbol_of(quote)
+        targets = self._targets(symbol)
+        if not targets:
+            return
         now = time.time()
         if not force and symbol in self.last_broadcast_ts:
             if (now - self.last_broadcast_ts[symbol]) < self.throttle_sec:
                 return  # Conflate sub-40ms high-frequency ticks
 
         self.last_broadcast_ts[symbol] = now
-        payload = json.dumps({"type": "QUOTE_UPDATE", "data": quote_dict})
-        await self._send_many(payload, self._targets(symbol))
+        payload = self._envelope("QUOTE_UPDATE", quote)
+        if payload is None:
+            return
+        await self._send_many(payload, targets)
 
-    async def broadcast_trade(self, trade_dict: Dict[str, Any]) -> None:
+    async def broadcast_trade(self, trade: Any) -> None:
         """Broadcast a real executed trade (not a quote) to symbol subscribers."""
-        symbol = trade_dict.get("symbol", "").upper()
-        payload = json.dumps({"type": "TRADE_UPDATE", "data": trade_dict})
-        await self._send_many(payload, self._targets(symbol))
+        symbol = self._symbol_of(trade)
+        targets = self._targets(symbol)
+        if not targets:
+            return
+        payload = self._envelope("TRADE_UPDATE", trade)
+        if payload is None:
+            return
+        await self._send_many(payload, targets)
 
-    async def broadcast_bar(self, symbol: str, bar_dict: Dict[str, Any]) -> None:
+    async def broadcast_bar(self, symbol: str, bar: Any) -> None:
         sym = symbol.upper()
-        payload = json.dumps({"type": "BAR_UPDATE", "symbol": sym, "data": bar_dict})
-        await self._send_many(payload, self._targets(sym))
+        targets = self._targets(sym)
+        if not targets:
+            return
+        body = self._encode(bar)
+        if body is None:
+            return
+        payload = '{"type": "BAR_UPDATE", "symbol": %s, "data": %s}' % (
+            json.dumps(sym), body,
+        )
+        await self._send_many(payload, targets)

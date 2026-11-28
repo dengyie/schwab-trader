@@ -193,19 +193,19 @@ def on_feed_quote(quote: Quote) -> None:
     if not ws_manager.has_subscribers():
         return
     decorated = feed.decorate_quote(quote) or quote
-    _schedule_coro(ws_manager.broadcast_quote(decorated.model_dump(mode="json")))
+    _schedule_coro(ws_manager.broadcast_quote(decorated))
 
 
 def on_feed_bar(symbol: str, bar: Bar) -> None:
     if not ws_manager.has_subscribers():
         return
-    _schedule_coro(ws_manager.broadcast_bar(symbol, bar.model_dump(mode="json")))
+    _schedule_coro(ws_manager.broadcast_bar(symbol, bar))
 
 
 def on_feed_trade(trade: Trade) -> None:
     if not ws_manager.has_subscribers():
         return
-    _schedule_coro(ws_manager.broadcast_trade(trade.model_dump(mode="json")))
+    _schedule_coro(ws_manager.broadcast_trade(trade))
 
 
 async def _broadcast_order_filled(trade: Trade, order: Order) -> None:
@@ -317,6 +317,10 @@ async def lifespan(app: FastAPI):
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
     await feed.stop()
+    # Flush the virtual book's debounced dirty state before the process ends:
+    # the 1s coalescing sweeper is a daemon thread, so without this explicit
+    # flush the last second of book changes would never reach the snapshot.
+    virtual_engine.shutdown_flush()
 
 
 app = FastAPI(

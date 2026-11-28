@@ -895,6 +895,100 @@ class TestVirtualBookPersistence:
         engine.on_quote(quote("0700.HK", 401.0, prev_close=395.0))
         assert (tmp_path / "book.json").exists()
 
+    def test_quote_ticks_without_fills_cause_zero_saves(self, fx, tmp_path, monkeypatch):
+        """A resting limit order is never touched by a quote that doesn't cross it;
+        the book is never marked dirty, so the store is never called.
+        """
+        engine = self._engine(fx, tmp_path)
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=0.5)
+        # The rest of the burst is just the submit's own flush.
+        engine._flush()
+
+        saves = {"n": 0}
+        real_save = engine._store.save
+
+        def counting_save(snapshot):
+            saves["n"] += 1
+            return real_save(snapshot)
+
+        monkeypatch.setattr(engine._store, "save", counting_save)
+
+        # 30 ticks, none of them cross the resting limit (0.5), so zero fills.
+        for i in range(30):
+            engine.on_quote(quote("0700.HK", 400.0 + i * 0.01, prev_close=395.0))
+
+        assert saves["n"] == 0
+
+    def test_many_fills_in_one_on_quote_produce_exactly_one_save(self, fx, tmp_path, monkeypatch):
+        """Several orders resting on opposite sides of the book all match when
+        a single quote arrives; the boundary flush in on_quote coalesces them
+        into exactly one snapshot.
+        """
+        engine = self._engine(fx, tmp_path)
+        engine.on_quote(quote("0700.HK", 101.0, prev_close=101.0))
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=100.0)
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=100.0)
+        engine.submit_order("0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=100.0)
+        engine._flush()
+
+        saves = {"n": 0}
+        real_save = engine._store.save
+
+        def counting_save(snapshot):
+            saves["n"] += 1
+            return real_save(snapshot)
+
+        monkeypatch.setattr(engine._store, "save", counting_save)
+
+        # One tick crosses all three resting limits — all three fill at once.
+        engine.on_quote(quote("0700.HK", 100.0, prev_close=100.0))
+
+        assert saves["n"] == 1
+
+    def test_terminal_orders_are_pruned_to_a_bounded_window(
+        self, fx, tmp_path
+    ):
+        """Old terminal orders drop; every resting order survives the cap.
+
+        Snapshot size and get_orders copies used to grow with the account's
+        lifetime trade count; now they stay bounded at MAX_TERMINAL_ORDERS
+        terminal orders (frontend reconcile keeps the same window).
+        """
+        from app.engine.matching_engine import MAX_TERMINAL_ORDERS
+
+        engine = self._engine(fx, tmp_path)
+        # Cheap quote so hundreds of board-lot fills (100 shares each) fit in
+        # cash; push well past the strict bound to exercise pruning.
+        engine.on_quote(quote("0700.HK", 1.0, prev_close=1.0))
+
+        # Fill many tiny market orders; each fills immediately against the
+        # cached quote, so each becomes terminal at once.
+        bought = MAX_TERMINAL_ORDERS * 3
+        for _ in range(bought):
+            engine.submit_order("0700.HK", OrderSide.BUY, OrderType.MARKET, 100)
+
+        # Strict bound: active + MAX_TERMINAL_ORDERS = 0 + 500.
+        assert len(engine.orders) <= MAX_TERMINAL_ORDERS
+        assert engine.get_position("0700.HK").quantity == bought * 100
+
+        # Resting orders are never pruned, no matter how many fills follow.
+        # A buy limit below the last price stays pending.
+        resting = engine.submit_order(
+            "0700.HK", OrderSide.BUY, OrderType.LIMIT, 100, price=0.5
+        )
+        for _ in range(bought):
+            engine.submit_order("0700.HK", OrderSide.SELL, OrderType.MARKET, 100)
+        restored = engine.get_order(resting.order_id)
+        assert restored is not None
+        assert restored.status == OrderStatus.PENDING
+
+        # Snapshot on disk is bounded too.
+        import json
+
+        raw = json.loads((tmp_path / "book.json").read_text(encoding="utf-8"))
+        # 1 resting + MAX_TERMINAL_ORDERS terminal.
+        assert len(raw["orders"]) <= MAX_TERMINAL_ORDERS + 1
+
 
 class TestBookConcurrency:
     """The feed thread and FastAPI's threadpool touch the same book."""

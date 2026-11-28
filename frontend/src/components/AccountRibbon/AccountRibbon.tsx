@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import Decimal from 'decimal.js';
 import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
-import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
+import { useMarketStore, selectActiveSymbol, selectMid } from '../../store/marketStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 import { useI18n } from '../../i18n';
 import { Icon } from '../Icon';
@@ -22,12 +22,14 @@ export function AccountRibbon() {
   const balances = useWalletStore(selectBalances);
   const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const positions = useTradingStore((state) => state.positions);
-  const metrics = useMarketStore(selectMetrics);
-  const orderBook = useMarketStore(selectOrderBook);
+  // Scalar projections: the ribbon only marks the selected symbol at its mid —
+  // the whole orderBook/metrics objects change on every tick.
+  const orderBookSymbol = useMarketStore(selectActiveSymbol);
+  const mid = useMarketStore(selectMid);
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
 
-  const currentSymbol = orderBook?.symbol || selectedSymbol;
-  const currentSymbolMidPrice = metrics ? new Decimal(metrics.mid) : new Decimal(0);
+  const currentSymbol = orderBookSymbol || selectedSymbol;
+  const currentSymbolMidPrice = mid !== undefined ? new Decimal(mid) : new Decimal(0);
 
   const accountMetrics = useMemo((): AccountMetrics => {
     const usdBalance = balances.find(b => b.asset === 'USD');

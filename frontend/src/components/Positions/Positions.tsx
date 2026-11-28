@@ -2,7 +2,7 @@ import { useState } from 'react';
 import Decimal from 'decimal.js';
 import { useTradingStore } from '../../store/tradingStore';
 import { useWalletStore, selectBalances, resolveAccountTotals } from '../../store/walletStore';
-import { useMarketStore, selectMetrics, selectOrderBook } from '../../store/marketStore';
+import { useMarketStore, selectActiveSymbol, selectMid } from '../../store/marketStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
 
 // Helper to get price from watchlist
@@ -68,8 +68,10 @@ export function Positions() {
   const brokerMetrics = useWalletStore((state) => state.brokerMetrics);
   const positions = useTradingStore((state) => state.positions);
   const createOrder = useTradingStore((state) => state.createOrder);
-  const metrics = useMarketStore(selectMetrics);
-  const orderBook = useMarketStore(selectOrderBook);
+  // Scalar projections: closing a position only prices it at the current
+  // symbol's mid — the whole orderBook/metrics objects change every tick.
+  const mid = useMarketStore(selectMid);
+  const orderBookSymbol = useMarketStore(selectActiveSymbol);
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
   const setSelectedSymbol = useWatchlistStore((state) => state.setSelectedSymbol);
   const symbolPrices = useWatchlistStore(selectSymbolPrices);
@@ -89,8 +91,8 @@ export function Positions() {
     quantity: string;
   } | null>(null);
 
-  const currentSymbolMidPrice = metrics ? new Decimal(metrics.mid) : new Decimal(0);
-  const currentSymbol = orderBook?.symbol || selectedSymbol;
+  const currentSymbolMidPrice = mid !== undefined ? new Decimal(mid) : new Decimal(0);
+  const currentSymbol = orderBookSymbol || selectedSymbol;
   
   const usdtBalance = balances.find(b => b.asset === 'USD' || b.asset === 'USDT');
 
@@ -190,8 +192,8 @@ export function Positions() {
         }
       }, 2000);
     } else {
-      if (metrics) {
-        const order = createOrder({ symbol, side: 'sell', type: 'market', quantity }, metrics.mid);
+      if (mid !== undefined && mid !== '') {
+        const order = createOrder({ symbol, side: 'sell', type: 'market', quantity }, mid);
         if (order) toast.success(t.positions?.closeOrderSubmitted || 'Close order submitted');
         else toast.error(t.orderEntry?.insufficientBalance || 'Insufficient balance');
       } else {

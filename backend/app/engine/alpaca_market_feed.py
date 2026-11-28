@@ -1268,6 +1268,15 @@ class AlpacaMarketFeedService:
             warm = getattr(self, "_per_symbol_warm_ts", None)
             if warm is not None:
                 warm.pop(sym, None)
+            # Same lifecycle for the tick fan-out's emit stamp: it gates the
+            # 40ms conflation for a symbol only while that symbol streams, so
+            # on deactivate it is dropped with the subscription. Safe against
+            # the tick loop: the listener loop touches this dict per-tick via
+            # single-key get/set (never iterates it), and a dict pop is
+            # atomic under the GIL, so no torn state is possible.
+            emit = getattr(self, "_last_quote_emit", None)
+            if emit is not None:
+                emit.pop(sym, None)
             self._queue_control(("remove", sym))
 
     @staticmethod
@@ -1626,7 +1635,7 @@ class AlpacaMarketFeedService:
                 # while nobody is connected — but not indefinitely: on an
                 # always-on server that would leave the day range frozen.
                 now = time.time()
-                if self._has_chart_subscribers() or now - last_idle_sweep > IDLE_SWEEP_SECONDS:
+                if self._has_chart_subscribers() or now - last_idle_sweep > self.IDLE_SWEEP_SECONDS:
                     last_idle_sweep = now
                     try:
                         await asyncio.to_thread(self.refresh_daily_stats)
@@ -1640,8 +1649,17 @@ class AlpacaMarketFeedService:
                 with self._sub_control_lock:
                     watched = tuple(self.symbols)
                 for sym in watched:
-                    q = self._decorate_daily(self.latest_quotes.get(sym))
-                    if q:
+                    q = self.latest_quotes.get(sym)
+                    if q is not None:
+                        # Forward the RAW cached quote. The old sweep decorated
+                        # every watched symbol every 15s (a model_copy plus two
+                        # is_market_open round trips each) even with nobody
+                        # connected. main.on_feed_quote routes this to the
+                        # broker/matching engine on the raw fields it needs and
+                        # decorates ONCE behind its own subscriber gate for the
+                        # wire — so dropping the decoration here costs neither
+                        # execution nor mark-to-market, and the notify must keep
+                        # running while the UI is idle.
                         notify_listeners(self.quote_listeners, "resync-quote", q)
             except asyncio.CancelledError:
                 break

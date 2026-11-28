@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { useMarketStore, selectOrderBook, selectMetrics, selectBestBid, selectBestAsk, selectDataConfidence } from '../../store/marketStore';
+import { useMarketStore, selectActiveSymbol, selectMid, selectSlippageEst, selectBestBid, selectBestAsk, selectDataConfidence } from '../../store/marketStore';
 import { useTradingStore, selectFocusMode } from '../../store/tradingStore';
 import { useWalletStore, selectBalances } from '../../store/walletStore';
 import { useWatchlistStore, selectSelectedSymbol } from '../../store/watchlistStore';
@@ -90,8 +90,12 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const [trailingValue, setTrailingValue] = useState('');
   const [trailingActivationPrice, setTrailingActivationPrice] = useState('');
   
-  const orderBook = useMarketStore(selectOrderBook);
-  const metrics = useMarketStore(selectMetrics);
+  // Scalar projections only: subscribing to the whole orderBook/metrics
+  // objects re-rendered this form on every tick that moved any sibling field.
+  const orderBookSymbol = useMarketStore(selectActiveSymbol);
+  const mid = useMarketStore(selectMid);
+  const slippageEstRaw = useMarketStore(selectSlippageEst);
+  const metrics = mid !== undefined ? { mid, slippageEst: slippageEstRaw } : null;
   const bestBid = useMarketStore(selectBestBid);
   const bestAsk = useMarketStore(selectBestAsk);
   const dataConfidence = useMarketStore(selectDataConfidence);
@@ -110,7 +114,7 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   const activeInputRef = useRef<'price' | 'quantity' | 'tp' | 'sl' | 'trigger' | 'limit' | null>(null);
 
   const selectedSymbol = useWatchlistStore(selectSelectedSymbol);
-  const symbol = selectedSymbol || orderBook?.symbol || 'SPY';
+  const symbol = selectedSymbol || orderBookSymbol || 'SPY';
   const baseAsset = symbol.replace('/USD', '').replace('USDT', '');
 
   // 多市场：币种、每手、最小跳动、涨跌停、交易时段全部来自市场注册表。
@@ -587,7 +591,7 @@ export function OrderEntry({ priceFromOrderBook, sideFromOrderBook, compact: _co
   // 收盘时盘口是冻结快照，滑点预估没有意义
   const slippageEst = dataConfidence.level === 'closed'
     ? '—'
-    : (metrics?.slippageEst && metrics.slippageEst !== 'N/A' ? `${metrics.slippageEst}bp` : '—');
+    : (slippageEstRaw && slippageEstRaw !== 'N/A' ? `${slippageEstRaw}bp` : '—');
   const feeValue = total !== '0' ? (parseFloat(total) * 0.001).toFixed(2) : '0';
 
   // Get order type label

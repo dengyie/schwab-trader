@@ -612,6 +612,13 @@ export const selectRecentTrades = (state: MarketState) => state.recentTrades;
 export const selectLogs = (state: MarketState) => state.logs;
 export const selectBestBid = (state: MarketState) => state.orderBook?.bids[0];
 export const selectBestAsk = (state: MarketState) => state.orderBook?.asks[0];
+// Scalar projections: components that only need one field of orderBook or
+// metrics must not re-render on every tick that touches a sibling field —
+// orderBook/metrics get a fresh object per ORDERBOOK_UPDATE, so the whole
+// object as a selector value is an every-tick subscription.
+export const selectActiveSymbol = (state: MarketState) => state.orderBook?.symbol;
+export const selectMid = (state: MarketState) => state.metrics?.mid;
+export const selectSlippageEst = (state: MarketState) => state.metrics?.slippageEst;
 export const selectCanTrade = (state: MarketState) => state.dataConfidence.canTrade;
 export const selectCanTrustMetrics = (state: MarketState) => state.dataConfidence.canTrustMetrics;
 

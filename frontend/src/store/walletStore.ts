@@ -109,6 +109,35 @@ export function resolveAccountTotals(
   };
 }
 
+/** Shared budget for the local ledger view, aligned with reconcile.ts MAX_ORDERS. */
+export const MAX_LEDGER_ENTRIES = 500;
+
+/**
+ * Bound the local ledger without touching any number the account depends on:
+ * balances are Decimal arithmetic on ``state.balances`` and are NEVER recomputed
+ * from ledger rows, and trade performance comes from executed orders (FIFO in
+ * performance.ts), so trimming the ledger is display/audit-metadata only.
+ *
+ * Kept unconditionally: every entry a PENDING deposit still needs for its
+ * dedup check (``confirmDeposit`` and ``onRehydrateStorage`` both scan the
+ * ledger for ``DEPOSIT`` rows by ``referenceId``) — dropping one would let a
+ * reloaded page double-credit a deposit that already landed. The rest of the
+ * budget goes to the most recent history, newest-first.
+ */
+export function retainLedgerWithHistory(
+  ledger: LedgerEntry[],
+  pendingDepositIds: Set<string>,
+  cap = MAX_LEDGER_ENTRIES,
+): LedgerEntry[] {
+  const pinned = ledger.filter((entry) => (
+    entry.type === 'DEPOSIT' && entry.referenceType === 'deposit' && pendingDepositIds.has(entry.referenceId)
+  ));
+  const pinnedIds = new Set(pinned.map((entry) => entry.entryId));
+  const history = ledger.filter((entry) => !pinnedIds.has(entry.entryId));
+  const historyBudget = Math.max(0, cap - pinned.length);
+  return [...pinned, ...history.slice(0, historyBudget)];
+}
+
 interface WalletState {
   account: Account | null;
   balances: WalletBalance[];
@@ -412,7 +441,12 @@ export const useWalletStore = create<WalletState>()(
           set({
             balances: newBalances,
             deposits: state.deposits.map(d => d.depositId === depositId ? { ...d, status: 'confirmed', confirmedAt: Date.now() } : d),
-            ledger: [entry, ...state.ledger]
+            // The entry just written is the newest; the pending-deposit dedup
+            // set shrinks by one as this deposit flips to confirmed.
+            ledger: retainLedgerWithHistory(
+              [entry, ...state.ledger],
+              new Set(state.deposits.filter(d => d.status === 'pending' && d.depositId !== depositId).map(d => d.depositId)),
+            ),
           });
         },
 
@@ -487,7 +521,15 @@ export const useWalletStore = create<WalletState>()(
             referenceType, referenceId, createdAt: Date.now()
           };
 
-          set({ balances: newBalances, ledger: [entry, ...state.ledger] });
+          set({
+            balances: newBalances,
+            // Newest entry first; pending-deposit dedup rows are pinned so a
+            // reload can never double-credit a deposit that already landed.
+            ledger: retainLedgerWithHistory(
+              [entry, ...state.ledger],
+              new Set(state.deposits.filter(d => d.status === 'pending').map(d => d.depositId)),
+            ),
+          });
           return true;
         },
 
@@ -517,7 +559,15 @@ export const useWalletStore = create<WalletState>()(
             referenceType, referenceId, createdAt: Date.now()
           };
 
-          set({ balances: newBalances, ledger: [entry, ...state.ledger] });
+          set({
+            balances: newBalances,
+            // Newest entry first; pending-deposit dedup rows are pinned so a
+            // reload can never double-credit a deposit that already landed.
+            ledger: retainLedgerWithHistory(
+              [entry, ...state.ledger],
+              new Set(state.deposits.filter(d => d.status === 'pending').map(d => d.depositId)),
+            ),
+          });
           return true;
         },
 
@@ -547,7 +597,15 @@ export const useWalletStore = create<WalletState>()(
             referenceType, referenceId, createdAt: Date.now()
           };
 
-          set({ balances: newBalances, ledger: [entry, ...state.ledger] });
+          set({
+            balances: newBalances,
+            // Newest entry first; pending-deposit dedup rows are pinned so a
+            // reload can never double-credit a deposit that already landed.
+            ledger: retainLedgerWithHistory(
+              [entry, ...state.ledger],
+              new Set(state.deposits.filter(d => d.status === 'pending').map(d => d.depositId)),
+            ),
+          });
           return true;
         },
 
@@ -573,7 +631,15 @@ export const useWalletStore = create<WalletState>()(
             referenceType, referenceId, createdAt: Date.now()
           };
 
-          set({ balances: newBalances, ledger: [entry, ...state.ledger] });
+          set({
+            balances: newBalances,
+            // Newest entry first; pending-deposit dedup rows are pinned so a
+            // reload can never double-credit a deposit that already landed.
+            ledger: retainLedgerWithHistory(
+              [entry, ...state.ledger],
+              new Set(state.deposits.filter(d => d.status === 'pending').map(d => d.depositId)),
+            ),
+          });
           return true;
         },
 
@@ -685,9 +751,33 @@ export const useWalletStore = create<WalletState>()(
               (b) => new Decimal(b.total ?? '0').gt(0),
             );
           }
+          // Hydration cap: an older build (or another tab) may have written
+          // more ledger history than today's budget allows.
+          if (Array.isArray(state.ledger)) {
+            state.ledger = retainLedgerWithHistory(
+              state.ledger,
+              new Set((state.deposits ?? []).filter(d => d.status === 'pending').map(d => d.depositId)),
+            );
+          }
           return state as unknown as WalletState;
         },
-        partialize: (s) => ({ account: s.account, balances: s.balances, ledgerLinked: s.ledgerLinked, paymentMethods: s.paymentMethods, cryptoAddresses: s.cryptoAddresses, deposits: s.deposits, withdraws: s.withdraws, ledger: s.ledger }),
+        partialize: (s) => ({
+          account: s.account,
+          balances: s.balances,
+          ledgerLinked: s.ledgerLinked,
+          paymentMethods: s.paymentMethods,
+          cryptoAddresses: s.cryptoAddresses,
+          deposits: s.deposits,
+          withdraws: s.withdraws,
+          // localStorage must not grow without bound on a long-lived account.
+          // Balances are persisted separately and never rebuilt from these
+          // rows, so trimming history here cannot move a number the account
+          // depends on; entries a pending deposit still needs are pinned.
+          ledger: retainLedgerWithHistory(
+            s.ledger,
+            new Set(s.deposits.filter(d => d.status === 'pending').map(d => d.depositId)),
+          ),
+        }),
         onRehydrateStorage: () => (s) => {
           if (s) {
             s._pendingTimers = new Map();

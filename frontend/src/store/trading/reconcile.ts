@@ -66,6 +66,32 @@ export interface BackendOrderRow {
 export const PENDING_SUBMIT_GRACE_MS = 60_000;
 export const MAX_ORDERS = 500;
 
+/**
+ * Statuses that still describe live client- or broker-side work: the order can
+ * still fill, still fire a trigger, or is still awaiting its submit/venue
+ * round-trip. Retention NEVER drops these — capping the list may only trim
+ * terminal history (filled / cancelled / rejected / expired).
+ */
+export const LIVE_ORDER_STATUSES: OrderStatus[] = ['pending', 'submitted', 'open', 'partial', 'triggered'];
+
+/**
+ * Shared retention rule for every place an order list is bounded (reconcile,
+ * persistence, hydration): keep ALL live orders first, then fill the remaining
+ * budget with the most recent terminal history. Returning everything sorted
+ * newest-first keeps the store's display order stable across callers.
+ */
+export function retainOrdersWithHistory(orders: PaperOrder[], cap = MAX_ORDERS): PaperOrder[] {
+  const byRecency = [...orders].sort(
+    (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt),
+  );
+  const live = byRecency.filter((order) => LIVE_ORDER_STATUSES.includes(order.status));
+  // Live orders are uncapped by design: dropping an armed stop or a pending
+  // submit to make room for old fills removes real protection to save memory.
+  const historyBudget = Math.max(0, cap - live.length);
+  const history = byRecency.filter((order) => !LIVE_ORDER_STATUSES.includes(order.status));
+  return [...live, ...history.slice(0, historyBudget)];
+}
+
 const BACKEND_STATUS: Record<string, OrderStatus> = {
   PENDING: 'pending',
   SUBMITTED: 'submitted',
@@ -317,22 +343,20 @@ export function reconcileOrders(
     });
   }
 
-  return next
-    .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
-    .slice(0, MAX_ORDERS);
+  return retainOrdersWithHistory(
+    next.sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt)),
+  );
 }
 
 // ---------------------------------------------------------------------------
 // OCO groups
 // ---------------------------------------------------------------------------
 
-const LIVE_STATUSES: OrderStatus[] = ['pending', 'submitted', 'open', 'partial', 'triggered'];
-
-/** Derive each OCO group's status from its two legs. */
+/** Derive each OCO group's status from its two legs, then apply OCO retention. */
 export function reconcileOcoGroups(groups: OCOOrder[], orders: PaperOrder[]): OCOOrder[] {
   const byId = new Map(orders.map((order) => [order.clientOrderId, order]));
 
-  return groups.map((group) => {
+  return retainOcoWithHistory(groups.map((group) => {
     const legs = [group.limitOrderId, group.stopOrderId]
       .map((id) => byId.get(id))
       .filter((order): order is PaperOrder => Boolean(order));
@@ -356,12 +380,33 @@ export function reconcileOcoGroups(groups: OCOOrder[], orders: PaperOrder[]): OC
     } else if (legs.some((leg) => leg.status === 'partial')) {
       status = 'partially_filled';
     } else if (group.status === 'triggered' || (
-      legs.some((leg) => LIVE_STATUSES.includes(leg.status)) &&
+      legs.some((leg) => LIVE_ORDER_STATUSES.includes(leg.status)) &&
       legs.some((leg) => leg.status === 'cancelled')
     )) {
       status = 'triggered';
     }
 
     return status === group.status ? group : { ...group, status, updatedAt: Date.now() };
-  });
+  }));
+}
+
+/** OCO statuses that still describe unresolved work on one or both legs. */
+export const LIVE_OCO_STATUSES: OCOOrder['status'][] = ['active', 'triggered', 'partially_filled'];
+
+/**
+ * Same retention contract as {@link retainOrdersWithHistory}, applied to OCO
+ * groups: every group with live work keeps its place uncapped, terminal
+ * groups (filled / cancelled) are kept by recency up to the shared budget.
+ * The legs themselves stay in the orders list under the MAX_ORDERS rule, so
+ * trimming a terminal group only drops the grouping metadata, never the
+ * fill or cost-basis history.
+ */
+export function retainOcoWithHistory(groups: OCOOrder[], cap = MAX_ORDERS): OCOOrder[] {
+  const byRecency = [...groups].sort(
+    (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt),
+  );
+  const live = byRecency.filter((group) => LIVE_OCO_STATUSES.includes(group.status));
+  const historyBudget = Math.max(0, cap - live.length);
+  const history = byRecency.filter((group) => !LIVE_OCO_STATUSES.includes(group.status));
+  return [...live, ...history.slice(0, historyBudget)];
 }

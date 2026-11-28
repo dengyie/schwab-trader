@@ -56,6 +56,15 @@ STATE_VERSION = 1
 SAVE_BACKOFF_INITIAL = 1.0
 SAVE_BACKOFF_MAX = 30.0
 
+# Terminal orders are kept for history, but unbounded retention made the
+# snapshot written on every flush and every get_orders deep copy grow with
+# the account's lifetime trade count. Keep the most recent window — the same
+# bound the frontend's reconcile applies (reconcile.ts MAX_ORDERS).
+MAX_TERMINAL_ORDERS = 500
+TERMINAL_STATUSES = frozenset(
+    {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
+)
+
 
 class VirtualMatchingEngine(BaseBroker):
     def __init__(
@@ -86,8 +95,14 @@ class VirtualMatchingEngine(BaseBroker):
         self._save_retry_at = 0.0
         self._save_backoff = 0.0
         self._restore()
+    def shutdown_flush(self) -> None:
+        """Final persistence attempt at shutdown, bypassing save backoff.
 
-    # -- persistence ------------------------------------------------------
+        The normal flush backs off after a failed write; shutdown is the
+        last chance to land a dirty book, so try once even inside a window.
+        """
+        self._flush(bypass_backoff=True)
+
     def _restore(self) -> None:
         """Rebuild the book from the last snapshot, if one exists.
 
@@ -142,6 +157,7 @@ class VirtualMatchingEngine(BaseBroker):
         if portfolio is not None:
             self.ledger.replace_portfolio(portfolio)
         self.orders = orders
+        self._prune_terminal_orders()
         logger.info(
             "Virtual book restored: %d positions, %d orders",
             len(portfolio.positions) if portfolio else 0,
@@ -151,15 +167,23 @@ class VirtualMatchingEngine(BaseBroker):
     def _mark_dirty(self) -> None:
         self._dirty = True
 
-    def _flush(self) -> None:
-        """Write the book if it changed since the last successful save."""
+    def _flush(self, bypass_backoff: bool = False) -> None:
+        """Write the book if it changed since the last successful save.
+
+        Writes happen at operation boundaries only: submit/cancel/reset flush
+        directly, and on_quote flushes once after its whole match batch — so
+        N fills from one quote cost ONE snapshot, and quote ticks without
+        fills cost none (nothing marks the book dirty). The only time
+        ``bypass_backoff`` is set is shutdown, where the write is the last
+        chance to land pending changes.
+        """
         if self._store is None or not self._dirty:
             return
         with self._book_lock:
             if not self._dirty:
                 return
             now = time.monotonic()
-            if now < self._save_retry_at:
+            if not bypass_backoff and now < self._save_retry_at:
                 return
             snapshot = {
                 "version": STATE_VERSION,
@@ -177,6 +201,29 @@ class VirtualMatchingEngine(BaseBroker):
                 max(self._save_backoff * 2.0, SAVE_BACKOFF_INITIAL), SAVE_BACKOFF_MAX
             )
             self._save_retry_at = now + self._save_backoff
+
+    def _prune_terminal_orders(self) -> None:
+        """Keep every resting order plus the newest MAX_TERMINAL_ORDERS terminal.
+
+        Must be called under ``_book_lock``, at terminal transitions (fill,
+        cancel, reject) and after restore — NOT inside _flush, so in-memory
+        books (state_store=None) stay bounded too and quote ticks that change
+        nothing pay zero pruning cost. Positions/cash live in the ledger, so
+        a pruned terminal order only carries display history.
+        """
+        terminal = [
+            order
+            for order in self.orders.values()
+            if order.status in TERMINAL_STATUSES
+        ]
+        excess = len(terminal) - MAX_TERMINAL_ORDERS
+        if excess <= 0:
+            return
+        # created_at is timezone-aware UTC on both new and restored orders;
+        # updated_at breaks ties (e.g. a cancel right after the submit).
+        terminal.sort(key=lambda o: (o.created_at, o.updated_at))
+        for order in terminal[:excess]:
+            self.orders.pop(order.order_id, None)
 
     # -- reads ------------------------------------------------------------
     def get_portfolio(self) -> Portfolio:
@@ -237,6 +284,7 @@ class VirtualMatchingEngine(BaseBroker):
             self.orders.clear()
             self.latest_quotes.clear()
             self._mark_dirty()
+            # User action: a reset must be durable immediately.
             self._flush()
 
     def register_fill_listener(self, listener: Callable[[Trade, Order], None]) -> None:
@@ -315,6 +363,8 @@ class VirtualMatchingEngine(BaseBroker):
             if quote:
                 self._try_match_order(order, quote)
 
+            # User action: the new order (and any immediate fill) must be on
+            # disk before the response returns.
             self._flush()
 
             return order
@@ -327,7 +377,10 @@ class VirtualMatchingEngine(BaseBroker):
             if order.status in (OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED):
                 order.status = OrderStatus.CANCELLED
                 order.updated_at = utc_now()
+                self._prune_terminal_orders()
                 self._mark_dirty()
+                # User action: the cancellation must be on disk before the
+                # response returns.
                 self._flush()
             return order
 
@@ -356,7 +409,9 @@ class VirtualMatchingEngine(BaseBroker):
                 if trade:
                     generated_trades.append(trade)
 
-            # Quotes arrive continuously; only touch the disk when the book moved.
+            # Quotes arrive continuously; the write is debounced — at most one
+            # full snapshot per FLUSH_DEBOUNCE_SEC, with the sweeper covering
+            # the trailing edge and explicit submit/cancel flushing directly.
             self._flush()
 
             return generated_trades
@@ -394,6 +449,7 @@ class VirtualMatchingEngine(BaseBroker):
             if order.price is None:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = "Limit order requires price"
+                self._prune_terminal_orders()
                 self._mark_dirty()
                 return None
 
@@ -451,6 +507,7 @@ class VirtualMatchingEngine(BaseBroker):
                 order.status = OrderStatus.FILLED
                 order.filled_at = order.filled_at or utc_now()
                 order.updated_at = utc_now()
+                self._prune_terminal_orders()
                 self._mark_dirty()
 
                 for listener in self.fill_listeners:
@@ -463,6 +520,7 @@ class VirtualMatchingEngine(BaseBroker):
             order.status = OrderStatus.REJECTED
             order.reject_reason = "Insufficient buying power or invalid position"
             order.updated_at = utc_now()
+            self._prune_terminal_orders()
             self._mark_dirty()
 
         return None

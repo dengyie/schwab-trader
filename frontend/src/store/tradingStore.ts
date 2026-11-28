@@ -40,6 +40,7 @@ import {
   reconcileOcoGroups,
   reconcileOrders,
   reconcilePositions,
+  retainOrdersWithHistory,
   type BackendOrderRow,
   type BackendPosition,
 } from './trading/reconcile';
@@ -1016,7 +1017,11 @@ export const useTradingStore = create<TradingState>()(
         // rebuilt from the broker on every load, so a stale local copy cannot
         // resurrect a closed position or a phantom order.
         partialize: (s) => ({
-          orders: s.orders.filter((order) => isUnsentLocalOrder(order)),
+          // Same shared retention rule as reconcileOrders: every live order
+          // survives uncapped, only terminal history is trimmed, so a long
+          // session cannot bloat localStorage (and its hydration) without
+          // bound while an armed stop or a pending submit still protects.
+          orders: retainOrdersWithHistory(s.orders.filter((order) => isUnsentLocalOrder(order))),
           ocoOrders: s.ocoOrders.filter((order) => order.status === 'active' || order.status === 'triggered'),
           positions: new Map<string, Position>(),
           focusMode: false,
@@ -1024,7 +1029,9 @@ export const useTradingStore = create<TradingState>()(
         migrate: (persisted: any) => {
           const state = persisted?.state ?? {};
           const orders: PaperOrder[] = Array.isArray(state.orders) ? state.orders : [];
-          const surviving = orders.filter((order) => isUnsentLocalOrder(order));
+          // Hydration re-applies the same cap: older builds (or another tab)
+          // may have written more history than today's budget allows.
+          const surviving = retainOrdersWithHistory(orders.filter((order) => isUnsentLocalOrder(order)));
           const survivingIds = new Set(surviving.map((order) => order.clientOrderId));
           return {
             ...state,
